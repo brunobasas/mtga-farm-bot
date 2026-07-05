@@ -2624,11 +2624,14 @@ class Controller(ControllerSecondary):
                 return
             attempt = self.__combat_recovery_attempts + 1
             bot_logger.log_info(
-                f"COMBAT_RECOVERY_ATTEMPT: {attempt}/2 forcing all_attack + submit (key={key})"
+                f"COMBAT_RECOVERY_ATTEMPT: {attempt}/2 forcing all_attack (key={key})"
             )
+            # Note: no forced submit_selection here. During DeclareAttack the
+            # bottom-right button is the attack button itself (all_attack
+            # double-clicks it); the submit/okay template search never matches
+            # there and its ~15s of image scanning starved the second attempt.
             attack_ok = self.all_attack()
-            submit_ok = self.submit_selection(reason=f"combat_recovery_attempt_{attempt}", force=True)
-            if not attack_ok and not submit_ok:
+            if not attack_ok:
                 bot_logger.log_error(
                     f"COMBAT_RECOVERY_DEFER: no combat click sent because arena_region is unavailable (key={key})."
                 )
@@ -5733,25 +5736,63 @@ class Controller(ControllerSecondary):
             )
             return False
         if pending_ids and ids.intersection(pending_ids):
+            bot_logger.log_info(
+                f"SelectN pause reason: pending ids {sorted(ids.intersection(pending_ids))} still in pending zone."
+            )
             return True
         if time.time() - ts < 3.0:
+            bot_logger.log_info("SelectN pause reason: pending request younger than 3s.")
             return True
         self.__clear_pending_select_n_state("SelectN auto-clear: pending window elapsed.")
         return False
+
+    def __clear_stale_target_wait_if_own_attack_prompt(self) -> bool:
+        # A pending DeclareAttackersReq is our own prompt to answer. Stale
+        # target-selection state (e.g. left over from an earlier cast) must not
+        # pause the decision loop here, otherwise the AI never declares attacks
+        # and only the bounded combat recovery clicks remain.
+        if not self.__attack_target_prompt_active():
+            return False
+        signal_ts = max(
+            float(self.__last_target_select_ts or 0.0),
+            float((self.__pending_target_select or {}).get("ts", 0.0) or 0.0),
+        )
+        if signal_ts > 0.0 and time.time() - signal_ts < 8.0:
+            # Fresh, genuine target selection — keep pausing.
+            return False
+        had_pending = self.__pending_target_select is not None
+        selecting = self.__is_selecting_targets()
+        if not had_pending and not selecting:
+            return False
+        if had_pending:
+            self.__pending_target_select = None
+        runtime_status.clear_intentional_wait()
+        bot_logger.log_info(
+            "Target selection auto-clear: own declare-attack prompt supersedes stale target state "
+            f"(had_pending={had_pending}, selecting_annotation={selecting})."
+        )
+        return True
 
     def __should_pause_for_targets(self) -> bool:
         if self.__should_pause_for_select_n():
             return True
         if self.__clear_stale_target_wait_if_safe_pass_window():
             return False
+        if self.__clear_stale_target_wait_if_own_attack_prompt():
+            return False
         if self.__pending_target_select is not None:
             if self.__last_submit_targets_ts and time.time() - self.__last_submit_targets_ts < self.__target_submit_cooldown_sec:
+                bot_logger.log_info("Target pause reason: submit cooldown active.")
                 return True
             if self.__is_selecting_targets():
+                bot_logger.log_info("Target pause reason: pending target select + selecting annotation.")
                 return True
             self.__clear_pending_target_select_state("Target selection auto-clear: prompt no longer active.")
             return False
-        return self.__is_selecting_targets()
+        selecting = self.__is_selecting_targets()
+        if selecting:
+            bot_logger.log_info("Target pause reason: PlayerSelectingTargets annotation without pending select.")
+        return selecting
 
     def __should_pause_for_pay_costs(self) -> bool:
         if not self.__pending_pay_costs_ts:
