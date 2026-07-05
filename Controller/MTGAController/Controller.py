@@ -256,6 +256,7 @@ class Controller(ControllerSecondary):
         self.__last_match_won: bool | None = None
         self.__last_seen_match_id: str | None = None
         self.__attack_target_required = False
+        self.__attack_target_attacker_ids: list[int] = []
         # MTGA system seat id for the local player (can be 1 or 2)
         self.__system_seat_id = None
         self.__last_target_select_source_id = None
@@ -2383,34 +2384,88 @@ class Controller(ControllerSecondary):
             return
         # Attack-target case (e.g. opponent planeswalker): a single click has no
         # feedback loop, so verify via turn info that the declare-attack prompt
-        # resolved and fan out over candidate points like the spell-target path.
+        # resolved and escalate through the known assignment flows.
+        deadline = time.time() + 16.0
+
+        def _wait_resolved(seconds: float) -> bool:
+            end = time.time() + seconds
+            while time.time() < end:
+                time.sleep(0.3)
+                if self._stop_requested or self._suppress_selections:
+                    return True
+                if not self.__attack_target_prompt_active():
+                    return True
+            return False
+
+        # Hold off combat recovery while this flow owns the mouse — its forced
+        # all_attack clicks could land mid-assignment.
+        self.__last_attack_submit_ts = time.time()
+        if _wait_resolved(1.2):
+            return
+        # MTGA may require selecting each attacker before its damage recipient
+        # can be chosen (log evidence: direct avatar clicks assigned nothing).
+        # Click the attacker on our battlefield via hover verification, then
+        # click the opponent avatar as its damage recipient.
+        for attacker_id in list(self.__attack_target_attacker_ids or []):
+            if time.time() > deadline or self._stop_requested or self._suppress_selections:
+                break
+            self.__last_attack_submit_ts = time.time()
+            try:
+                found = self.select_battlefield_permanent(attacker_id, clicks=1)
+            except Exception as e:
+                bot_logger.log_error(f"ATTACK_TARGET attacker select failed for {attacker_id}: {e}")
+                found = False
+            bot_logger.log_info(
+                f"ATTACK_TARGET attacker-first flow: attacker={attacker_id} found={found}"
+            )
+            time.sleep(0.4)
+            self.__click_opponent_avatar_with_offset((0, 0), "SELECT_OPPONENT_AVATAR_AFTER_ATTACKER")
+            self.__last_attack_submit_ts = time.time()
+            if _wait_resolved(1.0):
+                return
+        # All recipients may be assigned with MTGA waiting on the confirm
+        # button (flag is already cleared, so this cannot recurse).
+        if self.__attack_target_prompt_active():
+            self.all_attack()
+            self.__last_attack_submit_ts = time.time()
+            if _wait_resolved(1.0):
+                return
+        # Last resort: fan out over avatar candidate points.
         points = self.__get_avatar_retry_points()
-        deadline = time.time() + 7.0
         attempts = 0
         while time.time() < deadline:
-            time.sleep(0.5)
             if self._stop_requested or self._suppress_selections:
                 return
             if not self.__attack_target_prompt_active():
-                if attempts:
-                    bot_logger.log_info(
-                        f"SELECT_OPPONENT_AVATAR resolved after {attempts} retries."
-                    )
+                bot_logger.log_info(
+                    f"SELECT_OPPONENT_AVATAR resolved after {attempts} fan retries."
+                )
                 return
             if attempts >= len(points):
                 break
             x, y, label = points[attempts]
             attempts += 1
-            # Hold off combat recovery while this loop owns the mouse — its
-            # forced all_attack/submit could hit "Cancel" mid-target-selection.
             self.__last_attack_submit_ts = time.time()
             self.__click_opponent_avatar_at_screen(
                 x, y, label, f"SELECT_OPPONENT_AVATAR_RETRY_{attempts}", fast=True
             )
+            time.sleep(0.5)
         if self.__attack_target_prompt_active():
             bot_logger.log_info(
-                "SELECT_OPPONENT_AVATAR retries exhausted; combat recovery will force submit."
+                "SELECT_OPPONENT_AVATAR: all attack-target flows exhausted; capturing debug bundle."
             )
+            try:
+                current_pos = self.input.position()
+                self._write_hand_select_debug_bundle(
+                    reason="attack_target_flows_exhausted",
+                    card_id=target_id,
+                    scan_start=(0, 0),
+                    scan_end=(0, 0),
+                    current_pos=(current_pos.x, current_pos.y),
+                    current_hovered_id=None,
+                )
+            except Exception as e:
+                bot_logger.log_error(f"ATTACK_TARGET debug bundle failed: {e}")
 
     def __cancel_combat_recovery_timer(self) -> None:
         if self.__combat_recovery_timer is None:
@@ -3536,6 +3591,7 @@ class Controller(ControllerSecondary):
         self.__last_match_won = None
         self.__last_seen_match_id = None
         self.__attack_target_required = False
+        self.__attack_target_attacker_ids = []
         self._suppress_selections = False
         self.updated_game_state = GameState()
         self.__inst_id_grp_id_dict = {}
@@ -3568,6 +3624,7 @@ class Controller(ControllerSecondary):
         self.__has_mulled_keep = False
         self.__last_match_won = None
         self.__attack_target_required = False
+        self.__attack_target_attacker_ids = []
         self._suppress_selections = False
         self.updated_game_state = GameState()
         self.__inst_id_grp_id_dict = {}
@@ -5911,12 +5968,20 @@ class Controller(ControllerSecondary):
                 req = message.get("declareAttackersReq", {})
                 attackers = req.get("attackers", []) or req.get("qualifiedAttackers", [])
                 self.__attack_target_required = False
+                self.__attack_target_attacker_ids = [
+                    attacker.get("attackerInstanceId")
+                    for attacker in attackers
+                    if attacker.get("attackerInstanceId") is not None
+                ]
                 for attacker in attackers:
                     recipients = attacker.get("legalDamageRecipients", []) or []
                     for rec in recipients:
                         if rec.get("type") == "DamageRecType_PlanesWalker":
                             self.__attack_target_required = True
-                            bot_logger.log_info("DeclareAttackersReq: planeswalker target present")
+                            bot_logger.log_info(
+                                "DeclareAttackersReq: planeswalker target present "
+                                f"(attackers={self.__attack_target_attacker_ids})"
+                            )
                             break
                     if self.__attack_target_required:
                         break
