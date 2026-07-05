@@ -257,6 +257,7 @@ class Controller(ControllerSecondary):
         self.__last_seen_match_id: str | None = None
         self.__attack_target_required = False
         self.__attack_target_attacker_ids: list[int] = []
+        self.__attack_target_flow_lock = threading.Lock()
         # MTGA system seat id for the local player (can be 1 or 2)
         self.__system_seat_id = None
         self.__last_target_select_source_id = None
@@ -2365,26 +2366,40 @@ class Controller(ControllerSecondary):
     def select_target(self, target_id: int) -> None:
         was_attack_target = self.__attack_target_required
         self.__attack_target_required = False
-        target, source = self._resolve_opponent_avatar_base(force_reacquire=True)
-        bot_logger.log_info(
-            "SELECT_OPPONENT_AVATAR target: source={} arena={} raw={} mapped={} target_id={}".format(
-                source,
-                self._arena_region,
-                self.opponent_avatar_coors,
-                target,
-                target_id,
-            )
-        )
-        bot_logger.log_click(target[0], target[1], f"SELECT_OPPONENT_AVATAR (target_id={target_id})")
-        self.input.move_abs(target[0], target[1])
-        time.sleep(0.2)
-        self.input.left_click(1)
-        time.sleep(0.2)
         if not was_attack_target and not self.__attack_target_prompt_active():
+            # Spell-target case: single click on the resolved avatar position;
+            # the log-driven schedule handles verification and retries.
+            target, source = self._resolve_opponent_avatar_base(force_reacquire=True)
+            bot_logger.log_info(
+                "SELECT_OPPONENT_AVATAR target: source={} arena={} raw={} mapped={} target_id={}".format(
+                    source,
+                    self._arena_region,
+                    self.opponent_avatar_coors,
+                    target,
+                    target_id,
+                )
+            )
+            bot_logger.log_click(target[0], target[1], f"SELECT_OPPONENT_AVATAR (target_id={target_id})")
+            self.input.move_abs(target[0], target[1])
+            time.sleep(0.2)
+            self.input.left_click(1)
+            time.sleep(0.2)
             return
-        # Attack-target case (e.g. opponent planeswalker): a single click has no
-        # feedback loop, so verify via turn info that the declare-attack prompt
-        # resolved and escalate through the known assignment flows.
+        if not self.__attack_target_flow_lock.acquire(blocking=False):
+            bot_logger.log_info("ATTACK_TARGET flow already running; skipping duplicate invocation.")
+            return
+        try:
+            self.__run_attack_target_flow(target_id)
+        finally:
+            self.__attack_target_flow_lock.release()
+
+    def __run_attack_target_flow(self, target_id: int) -> None:
+        # Attack-target case (opponent planeswalker present). Log evidence from
+        # a real game: neither the calibrated avatar point nor the avatar grid
+        # fan assigned anything — what worked was clicking the ATTACKER on our
+        # battlefield and then pressing the attack button. So lead with that
+        # recipe; the avatar grid click in between is harmless and covers the
+        # case where MTGA shows an explicit recipient chooser.
         deadline = time.time() + 16.0
 
         def _wait_resolved(seconds: float) -> bool:
@@ -2397,42 +2412,45 @@ class Controller(ControllerSecondary):
                     return True
             return False
 
+        def _avatar_grid_click(tag: str) -> None:
+            points = self.__get_avatar_retry_points()
+            if points:
+                x, y, label = points[0]
+                self.__click_opponent_avatar_at_screen(x, y, label, tag, fast=True)
+
         # Hold off combat recovery while this flow owns the mouse — its forced
         # all_attack clicks could land mid-assignment.
         self.__last_attack_submit_ts = time.time()
-        if _wait_resolved(1.2):
+        if _wait_resolved(0.8):
             return
-        # MTGA may require selecting each attacker before its damage recipient
-        # can be chosen (log evidence: direct avatar clicks assigned nothing).
-        # Click the attacker on our battlefield via hover verification, then
-        # click the opponent avatar as its damage recipient.
-        for attacker_id in list(self.__attack_target_attacker_ids or []):
+        attacker_ids = list(self.__attack_target_attacker_ids or []) or [None]
+        for attacker_id in attacker_ids:
             if time.time() > deadline or self._stop_requested or self._suppress_selections:
                 break
             self.__last_attack_submit_ts = time.time()
-            try:
-                found = self.select_battlefield_permanent(attacker_id, clicks=1)
-            except Exception as e:
-                bot_logger.log_error(f"ATTACK_TARGET attacker select failed for {attacker_id}: {e}")
-                found = False
-            bot_logger.log_info(
-                f"ATTACK_TARGET attacker-first flow: attacker={attacker_id} found={found}"
-            )
-            time.sleep(0.4)
-            self.__click_opponent_avatar_with_offset((0, 0), "SELECT_OPPONENT_AVATAR_AFTER_ATTACKER")
+            if attacker_id is not None:
+                try:
+                    found = self.select_battlefield_permanent(attacker_id, clicks=1)
+                except Exception as e:
+                    bot_logger.log_error(f"ATTACK_TARGET attacker select failed for {attacker_id}: {e}")
+                    found = False
+                bot_logger.log_info(
+                    f"ATTACK_TARGET attacker-first flow: attacker={attacker_id} found={found}"
+                )
+                time.sleep(0.3)
+            _avatar_grid_click("SELECT_OPPONENT_AVATAR_AFTER_ATTACKER")
             self.__last_attack_submit_ts = time.time()
-            if _wait_resolved(1.0):
+            if _wait_resolved(0.8):
                 return
-        # All recipients may be assigned with MTGA waiting on the confirm
-        # button (flag is already cleared, so this cannot recurse).
-        if self.__attack_target_prompt_active():
+            # Confirm via the attack button (attack flag is already cleared, so
+            # all_attack cannot recurse back into this flow).
             self.all_attack()
             self.__last_attack_submit_ts = time.time()
             if _wait_resolved(1.0):
                 return
-        # Last resort: fan out over avatar candidate points.
+        # Last resort: fan out over the remaining avatar candidate points.
         points = self.__get_avatar_retry_points()
-        attempts = 0
+        attempts = 1  # point 0 was already used by the primary recipe
         while time.time() < deadline:
             if self._stop_requested or self._suppress_selections:
                 return
