@@ -63,7 +63,7 @@ No supported Python with tkinter was found.
 Supported macOS path:
   brew install python@3.13 python-tk@3.13
 
-Then run ./start_ui.command again.
+Then run ./start_macos.command again.
 Alternative: install Python 3.13 from python.org.
 EOF
     return
@@ -72,7 +72,7 @@ EOF
   cat <<'EOF'
 No supported Python with tkinter was found.
 
-Install Python 3.13 with tkinter support, then run ./start_ui.command again.
+Install Python 3.13 with tkinter support, then run ./start_macos.command again.
 Recommended: Python 3.13 from python.org.
 EOF
 }

@@ -35,20 +35,26 @@ Python dependencies are installed automatically by the launcher scripts:
 
 ## Quick Start
 
-Each platform has a launcher script that creates a virtual environment, installs dependencies, and starts the UI.
+Each platform has its own launcher script — named after the platform — that creates a virtual environment, installs dependencies, and starts the UI:
+
+| Platform | Launcher |
+|---|---|
+| Windows | `start_windows.bat` |
+| macOS | `start_macos.command` |
+| Linux | `start_linux.sh` |
 
 ### Windows
 
 1. Install Python 3.10+ from python.org (tick "Add python.exe to PATH").
-2. Double-click `start_ui.bat`.
+2. Double-click `start_windows.bat`.
 
 ### macOS
 
 1. Install Python 3.13 (recommended):
    - python.org installer, **or**
    - `brew install python@3.13 python-tk@3.13`
-2. Optional preflight check: `./doctor.command`
-3. Double-click `start_ui.command` (or run `./start_ui.command` in Terminal).
+2. Optional preflight check: `./doctor_macos.command`
+3. Double-click `start_macos.command` (or run `./start_macos.command` in Terminal).
 4. Grant permissions to the Terminal app **and** the Python binary inside `.venv-macos`:
    - `System Settings -> Privacy & Security -> Accessibility`
    - `System Settings -> Privacy & Security -> Screen Recording`
@@ -68,7 +74,7 @@ Each platform has a launcher script that creates a virtual environment, installs
 
    The launcher warns if any required package is missing and prints the exact install command for your distro.
 
-2. Run `./start_ui.sh`.
+2. Run `./start_linux.sh`.
 
 3. MTGA must run through Wine/Proton (Steam or Lutris). Under Wayland it goes through XWayland automatically.
 
