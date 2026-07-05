@@ -5560,6 +5560,12 @@ class Controller(ControllerSecondary):
                     (0.50, 0.10),  # Primary: top-center.
                     (0.42, 0.10), (0.58, 0.10),
                     (0.50, 0.16), (0.50, 0.22),
+                    # Mid-screen chooser plates: when the legal targets are two
+                    # similar entities (both players, or player vs planeswalker)
+                    # MTGA shows a pick-a-plate dialog near screen center and
+                    # avatar clicks assign nothing (log evidence: req with
+                    # targets [player1, player2] ignored 9 avatar-area clicks).
+                    (0.42, 0.46), (0.58, 0.46), (0.50, 0.52),
                     (0.35, 0.10), (0.65, 0.10),
                     (0.42, 0.16), (0.58, 0.16),
                     (0.35, 0.16), (0.65, 0.16),
@@ -5620,6 +5626,22 @@ class Controller(ControllerSecondary):
         y = int(base_target[1] + offset[1])
         self.__click_opponent_avatar_at_screen(x, y, f"{source}+offset{offset}", tag)
 
+    def __write_target_debug_bundle(self, reason: str) -> None:
+        # Screenshot + state dump so unresolved target prompts show us the
+        # actual UI (e.g. a mid-screen chooser) instead of guessing from logs.
+        try:
+            current_pos = self.input.position()
+            self._write_hand_select_debug_bundle(
+                reason=reason,
+                card_id=-1,
+                scan_start=(0, 0),
+                scan_end=(0, 0),
+                current_pos=(current_pos.x, current_pos.y),
+                current_hovered_id=None,
+            )
+        except Exception as e:
+            bot_logger.log_error(f"Target debug bundle failed: {e}")
+
     def __schedule_target_selection(self, source_id: int | None, reason: str) -> None:
         now = time.time()
         if self._suppress_selections or self._stop_requested:
@@ -5670,6 +5692,7 @@ class Controller(ControllerSecondary):
                         age, pending.get("attempts", 0)
                     )
                 )
+                self.__write_target_debug_bundle("spell_target_budget_elapsed")
                 return
             # Note: do NOT gate on __get_delay_timer_remaining here — that value
             # comes from the last GameStateMessage snapshot and does not tick
@@ -5688,6 +5711,7 @@ class Controller(ControllerSecondary):
                 bot_logger.log_info(
                     "Target retry abandoned: candidate points exhausted (attempts={})".format(attempts)
                 )
+                self.__write_target_debug_bundle("spell_target_points_exhausted")
                 return
             x, y, label = points[attempts]
             pending["attempts"] = attempts + 1
