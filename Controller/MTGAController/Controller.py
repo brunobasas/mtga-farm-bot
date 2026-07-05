@@ -2496,7 +2496,23 @@ class Controller(ControllerSecondary):
         self.__clear_target_wait_if_unblocked()
         return True
 
+    def __purge_selecting_targets_annotations(self) -> None:
+        # GRE never sends deletes for PlayerSelectingTargets annotations and
+        # the diff merge accumulates them, so without this purge a finished
+        # target selection pauses decisions for the rest of the game.
+        try:
+            removed = self.updated_game_state.remove_annotations_by_type(
+                "AnnotationType_PlayerSelectingTargets", self.__system_seat_id
+            )
+            if removed:
+                bot_logger.log_info(
+                    f"Purged {removed} stale PlayerSelectingTargets annotation(s) from game state."
+                )
+        except Exception as e:
+            bot_logger.log_error(f"Failed to purge PlayerSelectingTargets annotations: {e}")
+
     def __clear_pending_target_select_state(self, reason: str) -> bool:
+        self.__purge_selecting_targets_annotations()
         had_target_select = self.__pending_target_select is not None
         if not had_target_select:
             return False
@@ -5672,7 +5688,11 @@ class Controller(ControllerSecondary):
                 float(self.__last_target_select_ts or 0.0),
                 float((self.__pending_target_select or {}).get("ts", 0.0) or 0.0),
             )
-            if pending_message_count <= 0 and last_signal_ts > 0.0:
+            # Without an active SelectTargetsReq context the annotation cannot
+            # be answered by waiting, so clear it even while another prompt
+            # (e.g. DeclareBlockers) keeps pendingMessageCount above zero.
+            no_select_context = self.__pending_target_select is None
+            if (pending_message_count <= 0 or no_select_context) and last_signal_ts > 0.0:
                 signal_age = time.time() - last_signal_ts
                 if signal_age > 8.0:
                     self.__clear_pending_target_select_state(
@@ -5699,6 +5719,8 @@ class Controller(ControllerSecondary):
             return False
         if had_pending:
             self.__pending_target_select = None
+        if selecting:
+            self.__purge_selecting_targets_annotations()
         runtime_status.clear_intentional_wait()
         bot_logger.log_info(
             "Target selection auto-clear: safe own pass window with pendingMessageCount=0."
@@ -5823,6 +5845,8 @@ class Controller(ControllerSecondary):
             return False
         if had_pending:
             self.__pending_target_select = None
+        if selecting:
+            self.__purge_selecting_targets_annotations()
         runtime_status.clear_intentional_wait()
         bot_logger.log_info(
             "Target selection auto-clear: own declare-attack prompt supersedes stale target state "

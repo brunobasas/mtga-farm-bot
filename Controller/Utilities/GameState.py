@@ -60,6 +60,28 @@ class GameState(GameStateSecondary):
     def get_annotations(self) -> List[Dict]:
         return self.get_full_state()['annotations']
 
+    def remove_annotations_by_type(self, annotation_type: str, affector_id: int = None) -> int:
+        """Remove merged annotations of the given type (optionally limited to an
+        affector seat or annotations without affector). GRE never sends deletes
+        for transient annotations like PlayerSelectingTargets, so callers must
+        purge them once the corresponding interaction is finished."""
+        annotations = self.game_dict.get("annotations") or []
+        kept = []
+        removed = 0
+        for annotation in annotations:
+            if not isinstance(annotation, dict):
+                kept.append(annotation)
+                continue
+            types = annotation.get("type", []) or []
+            matches_affector = affector_id is None or annotation.get("affectorId") in (None, affector_id)
+            if annotation_type in types and matches_affector:
+                removed += 1
+                continue
+            kept.append(annotation)
+        if removed:
+            self.game_dict["annotations"] = kept
+        return removed
+
     def get_actions(self) -> List[Dict]:
         return self.get_full_state()['actions']
 
