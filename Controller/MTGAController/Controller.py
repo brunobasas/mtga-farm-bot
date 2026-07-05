@@ -5302,10 +5302,13 @@ class Controller(ControllerSecondary):
                             my_timer_remaining_sec=remaining_sec,
                             my_timer_last_critical_at_epoch=time.time(),
                         )
-                    if timer_type == "TimerType_ActivePlayer" and not self._stop_requested:
-                        bot_logger.log_info("MY_TIMER_CRITICAL: ActivePlayer timer expired — forcing immediate concede")
-                        t = threading.Thread(target=self.__force_concede, daemon=True)
-                        t.start()
+                    # Note: no concede on TimerType_ActivePlayer. That timer is
+                    # MTGA's rope (TimerBehavior_TakeControl) — on expiry the
+                    # client just auto-passes; the game is NOT lost. Conceding
+                    # here threw away winnable games (and even fired during the
+                    # next game's mulligan when GRE replayed the old timer
+                    # snapshot). Loss protection is handled exclusively by the
+                    # TimerType_Inactivity emergency-concede scheduling above.
                     critical = True
                 if remaining_sec is not None and remaining_sec > 5.0:
                     critical = False
