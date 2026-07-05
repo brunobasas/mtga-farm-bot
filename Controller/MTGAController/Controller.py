@@ -2346,7 +2346,10 @@ class Controller(ControllerSecondary):
         time.sleep(1)
         self.input.left_click(1)
         self.__last_attack_submit_ts = time.time()
-        if self.__attack_target_required:
+        # Skip the nested target selection while the attack-target flow already
+        # runs on another thread: the non-blocking lock would reject it anyway,
+        # and entering select_target would consume a freshly re-set flag.
+        if self.__attack_target_required and not self.__attack_target_flow_lock.locked():
             time.sleep(0.3)
             self.select_target(-1)
         return True
@@ -2366,7 +2369,20 @@ class Controller(ControllerSecondary):
     def select_target(self, target_id: int) -> None:
         was_attack_target = self.__attack_target_required
         self.__attack_target_required = False
-        if not was_attack_target and not self.__attack_target_prompt_active():
+        # A SelectTargetsReq context (e.g. an attack trigger wanting a target
+        # during our own declare-attack step) must stay on the spell path even
+        # though the declare-attack prompt is technically active.
+        spell_target_context = (
+            self.__pending_target_select is not None
+            or (
+                bool(self.__last_target_select_ts)
+                and time.time() - self.__last_target_select_ts < 8.0
+            )
+        )
+        attack_mode = was_attack_target or (
+            self.__attack_target_prompt_active() and not spell_target_context
+        )
+        if not attack_mode:
             # Spell-target case: single click on the resolved avatar position;
             # the log-driven schedule handles verification and retries.
             target, source = self._resolve_opponent_avatar_base(force_reacquire=True)
@@ -2391,6 +2407,9 @@ class Controller(ControllerSecondary):
         try:
             self.__run_attack_target_flow(target_id)
         finally:
+            # Consumed: a fresh DeclareAttackersReq repopulates these, and
+            # stale ids from a finished combat must not be replayed.
+            self.__attack_target_attacker_ids = []
             self.__attack_target_flow_lock.release()
 
     def __run_attack_target_flow(self, target_id: int) -> None:
@@ -2442,8 +2461,9 @@ class Controller(ControllerSecondary):
             self.__last_attack_submit_ts = time.time()
             if _wait_resolved(0.8):
                 return
-            # Confirm via the attack button (attack flag is already cleared, so
-            # all_attack cannot recurse back into this flow).
+        # One confirm via the attack button after all recipients are assigned
+        # (attack flag is already cleared, so all_attack cannot recurse).
+        if self.__attack_target_prompt_active():
             self.all_attack()
             self.__last_attack_submit_ts = time.time()
             if _wait_resolved(1.0):
@@ -2694,6 +2714,16 @@ class Controller(ControllerSecondary):
                 self.__clear_combat_recovery("Combat recovery exhausted attempts.")
                 return
             if not self.__combat_step_ready_for_recovery():
+                self.__combat_recovery_timer = threading.Timer(0.5, _tick)
+                self.__combat_recovery_timer.start()
+                return
+            if self.__attack_target_flow_lock.locked():
+                # The attack-target flow owns the mouse (its battlefield hover
+                # scan can exceed the recent-submit window) — defer, and keep
+                # the deadline alive so recovery can still act afterwards.
+                self.__combat_recovery_deadline_ts = max(
+                    self.__combat_recovery_deadline_ts, time.time() + 3.5
+                )
                 self.__combat_recovery_timer = threading.Timer(0.5, _tick)
                 self.__combat_recovery_timer.start()
                 return
