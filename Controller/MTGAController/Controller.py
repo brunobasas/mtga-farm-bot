@@ -2377,12 +2377,20 @@ class Controller(ControllerSecondary):
             or (
                 bool(self.__last_target_select_ts)
                 and time.time() - self.__last_target_select_ts < 8.0
+                # A submit after the select signal means that selection is
+                # finished — a dead signal must not suppress the attack flow.
+                and self.__last_target_select_ts > float(self.__last_submit_targets_ts or 0.0)
             )
         )
-        attack_mode = was_attack_target or (
-            self.__attack_target_prompt_active() and not spell_target_context
-        )
+        attack_mode = (
+            was_attack_target or self.__attack_target_prompt_active()
+        ) and not spell_target_context
         if not attack_mode:
+            if was_attack_target:
+                # A live spell selection takes precedence right now; restore
+                # the flag so the next all_attack/recovery pass runs the
+                # attack flow once the spell target is resolved.
+                self.__attack_target_required = True
             # Spell-target case: single click on the resolved avatar position;
             # the log-driven schedule handles verification and retries.
             target, source = self._resolve_opponent_avatar_base(force_reacquire=True)
@@ -2405,14 +2413,16 @@ class Controller(ControllerSecondary):
             bot_logger.log_info("ATTACK_TARGET flow already running; skipping duplicate invocation.")
             return
         try:
-            self.__run_attack_target_flow(target_id)
-        finally:
-            # Consumed: a fresh DeclareAttackersReq repopulates these, and
-            # stale ids from a finished combat must not be replayed.
+            # Snapshot-and-clear at flow START: a re-sent DeclareAttackersReq
+            # arriving mid-flow repopulates the list for the NEXT attempt and
+            # must not be wiped by this flow's teardown.
+            attacker_ids = list(self.__attack_target_attacker_ids or [])
             self.__attack_target_attacker_ids = []
+            self.__run_attack_target_flow(target_id, attacker_ids)
+        finally:
             self.__attack_target_flow_lock.release()
 
-    def __run_attack_target_flow(self, target_id: int) -> None:
+    def __run_attack_target_flow(self, target_id: int, attacker_ids: list[int]) -> None:
         # Attack-target case (opponent planeswalker present). Log evidence from
         # a real game: neither the calibrated avatar point nor the avatar grid
         # fan assigned anything — what worked was clicking the ATTACKER on our
@@ -2442,7 +2452,7 @@ class Controller(ControllerSecondary):
         self.__last_attack_submit_ts = time.time()
         if _wait_resolved(0.8):
             return
-        attacker_ids = list(self.__attack_target_attacker_ids or []) or [None]
+        attacker_ids = list(attacker_ids or []) or [None]
         for attacker_id in attacker_ids:
             if time.time() > deadline or self._stop_requested or self._suppress_selections:
                 break
