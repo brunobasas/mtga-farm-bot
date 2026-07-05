@@ -80,6 +80,12 @@ class Controller(ControllerSecondary):
             'select_n': '"type": "GREMessageType_SelectNReq"',
             'select_targets': '"type": "GREMessageType_SelectTargetsReq"',
             'pay_costs': '"type": "GREMessageType_PayCostsReq"',
+            # Client->server messages: cheap ground truth about whether our own
+            # clicks registered (target response, attack submit) or misfired
+            # into the phase strip (SetSettings toggling a transient stop).
+            'client_select_targets_resp': '"type": "ClientMessageType_SelectTargetsResp"',
+            'client_submit_attackers': '"type": "ClientMessageType_SubmitAttackersReq"',
+            'client_set_settings': '"type": "ClientMessageType_SetSettingsReq"',
             'main_nav_loaded': 'MainNav load in',
             'queue_ready_marker': 'Unloading 1 Unused Serialized files (Serialized files now loaded:',
         }
@@ -3908,6 +3914,15 @@ class Controller(ControllerSecondary):
             self.__pending_pay_costs_ts = time.time()
             bot_logger.log_info("PayCostsReq detected: attempting auto-pay.")
             self.__handle_pay_costs_req(line_containing_pattern)
+        elif pattern == self.patterns["client_select_targets_resp"]:
+            bot_logger.log_info("CLIENT_EVENT: SelectTargetsResp sent — a target click registered in the MTGA client.")
+        elif pattern == self.patterns["client_submit_attackers"]:
+            bot_logger.log_info("CLIENT_EVENT: SubmitAttackersReq sent — attack declaration submitted by the client.")
+        elif pattern == self.patterns["client_set_settings"]:
+            bot_logger.log_info(
+                "CLIENT_EVENT: SetSettingsReq sent — if this follows one of our clicks, that click hit the "
+                "phase strip / stops UI instead of the intended target (misclick signal)."
+            )
 
     def _account_switch_due(self) -> bool:
         if self._account_switch_interval <= 0:
@@ -5626,6 +5641,24 @@ class Controller(ControllerSecondary):
         y = int(base_target[1] + offset[1])
         self.__click_opponent_avatar_at_screen(x, y, f"{source}+offset{offset}", tag)
 
+    def __describe_instance(self, instance_id) -> str:
+        # Compact description for log lines: "Creature/seat2", "player", ...
+        try:
+            for obj in self.updated_game_state.get_game_objects() or []:
+                if obj.get("instanceId") == instance_id:
+                    types = obj.get("cardTypes") or []
+                    short = ",".join(t.replace("CardType_", "") for t in types)
+                    return f"{short or obj.get('type', '?')}/seat{obj.get('controllerSeatId')}"
+        except Exception:
+            pass
+        try:
+            for player in self.updated_game_state.get_players() or []:
+                if player.get("systemSeatNumber") == instance_id:
+                    return "player"
+        except Exception:
+            pass
+        return "unknown"
+
     def __write_target_debug_bundle(self, reason: str) -> None:
         # Screenshot + state dump so unresolved target prompts show us the
         # actual UI (e.g. a mid-screen chooser) instead of guessing from logs.
@@ -5984,8 +6017,14 @@ class Controller(ControllerSecondary):
                     min_t = t0.get("minTargets")
                     max_t = t0.get("maxTargets")
                     selected = t0.get("selectedTargets")
+                    legal_desc = ", ".join(
+                        f"{t.get('targetInstanceId')}:{self.__describe_instance(t.get('targetInstanceId'))}"
+                        for t in (t0.get("targets") or [])
+                        if t.get("targetInstanceId") is not None
+                    )
                     bot_logger.log_info(
-                        f"SelectTargetsReq details: sourceId={req.get('sourceId')}, min={min_t}, max={max_t}, selected={selected}, targetCount={len(t0.get('targets', []) or [])}"
+                        f"SelectTargetsReq details: sourceId={req.get('sourceId')}, min={min_t}, max={max_t}, "
+                        f"selected={selected}, targetCount={len(t0.get('targets', []) or [])}, legalTargets=[{legal_desc}]"
                     )
                     self.__update_pending_target_select(
                         req.get("sourceId"),
