@@ -58,7 +58,9 @@ if ! venv_has_tk; then
   exit 1
 fi
 
-if [ ! -f "$MARKER" ] || [ "$REQ_FILE" -nt "$MARKER" ]; then
+# Marker is a copy of the last installed requirements.txt; content compare
+# skips reinstalling when only the file timestamp changed (e.g. git pull).
+if [ ! -f "$MARKER" ] || ! cmp -s "$REQ_FILE" "$MARKER"; then
   "$VENV_PYTHON" -m pip install --upgrade pip || {
     alert_warning "Konnte pip in .venv-macos nicht aktualisieren."
     exit 1
@@ -67,7 +69,7 @@ if [ ! -f "$MARKER" ] || [ "$REQ_FILE" -nt "$MARKER" ]; then
     alert_warning "Konnte erforderliche Pakete nicht installieren."
     exit 1
   }
-  touch "$MARKER"
+  cp "$REQ_FILE" "$MARKER"
 fi
 
 cd "$REPO_DIR"

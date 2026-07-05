@@ -46,13 +46,15 @@ if not exist "%VENV_PYTHON%" (
     )
 )
 
-rem --- Install requirements if marker missing or requirements.txt newer ---
+rem --- Install requirements only when requirements.txt content changed ---
+rem The marker is a copy of the last installed requirements.txt; a byte
+rem compare avoids both date-format pitfalls and pointless reinstalls
+rem after git pull touches the file without changing it.
 set "NEED_INSTALL=0"
 if not exist "%MARKER%" set "NEED_INSTALL=1"
 if exist "%MARKER%" (
-    for %%I in ("%REQ_FILE%") do set "REQ_DATE=%%~tI"
-    for %%I in ("%MARKER%") do set "MARK_DATE=%%~tI"
-    if "!REQ_DATE!" GTR "!MARK_DATE!" set "NEED_INSTALL=1"
+    fc /b "%REQ_FILE%" "%MARKER%" >nul 2>&1
+    if errorlevel 1 set "NEED_INSTALL=1"
 )
 
 if "%NEED_INSTALL%"=="1" (
@@ -64,7 +66,9 @@ if "%NEED_INSTALL%"=="1" (
         pause
         exit /b 1
     )
-    > "%MARKER%" echo installed
+    copy /y "%REQ_FILE%" "%MARKER%" >nul
+) else (
+    echo [INFO] Abhaengigkeiten unveraendert - starte direkt.
 )
 
 rem --- Start the UI ---

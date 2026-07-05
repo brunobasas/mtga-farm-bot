@@ -84,11 +84,15 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$MARKER" || "$REQ_FILE" -nt "$MARKER" ]]; then
+# Marker is a copy of the last installed requirements.txt; content compare
+# skips reinstalling when only the file timestamp changed (e.g. git pull).
+if [[ ! -f "$MARKER" ]] || ! cmp -s "$REQ_FILE" "$MARKER"; then
   echo "[INFO] Installiere Abhaengigkeiten aus requirements.txt"
   "$VENV_PYTHON" -m pip install --upgrade pip
   "$VENV_PYTHON" -m pip install -r "$REQ_FILE"
-  touch "$MARKER"
+  cp "$REQ_FILE" "$MARKER"
+else
+  echo "[INFO] Abhaengigkeiten unveraendert - starte direkt."
 fi
 
 exec "$VENV_PYTHON" "$ROOT_DIR/ui.py"
