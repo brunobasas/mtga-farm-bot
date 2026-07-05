@@ -2349,7 +2349,21 @@ class Controller(ControllerSecondary):
             self.select_target(-1)
         return True
 
+    def __attack_target_prompt_active(self) -> bool:
+        try:
+            turn_info = self.updated_game_state.get_turn_info() or {}
+        except Exception:
+            return False
+        if turn_info.get("phase") != "Phase_Combat" or turn_info.get("step") != "Step_DeclareAttack":
+            return False
+        my_seat = self.__system_seat_id
+        if my_seat is None or turn_info.get("decisionPlayer") != my_seat:
+            return False
+        return True
+
     def select_target(self, target_id: int) -> None:
+        was_attack_target = self.__attack_target_required
+        self.__attack_target_required = False
         target, source = self._resolve_opponent_avatar_base(force_reacquire=True)
         bot_logger.log_info(
             "SELECT_OPPONENT_AVATAR target: source={} arena={} raw={} mapped={} target_id={}".format(
@@ -2365,7 +2379,38 @@ class Controller(ControllerSecondary):
         time.sleep(0.2)
         self.input.left_click(1)
         time.sleep(0.2)
-        self.__attack_target_required = False
+        if not was_attack_target and not self.__attack_target_prompt_active():
+            return
+        # Attack-target case (e.g. opponent planeswalker): a single click has no
+        # feedback loop, so verify via turn info that the declare-attack prompt
+        # resolved and fan out over candidate points like the spell-target path.
+        points = self.__get_avatar_retry_points()
+        deadline = time.time() + 7.0
+        attempts = 0
+        while time.time() < deadline:
+            time.sleep(0.5)
+            if self._stop_requested or self._suppress_selections:
+                return
+            if not self.__attack_target_prompt_active():
+                if attempts:
+                    bot_logger.log_info(
+                        f"SELECT_OPPONENT_AVATAR resolved after {attempts} retries."
+                    )
+                return
+            if attempts >= len(points):
+                break
+            x, y, label = points[attempts]
+            attempts += 1
+            # Hold off combat recovery while this loop owns the mouse — its
+            # forced all_attack/submit could hit "Cancel" mid-target-selection.
+            self.__last_attack_submit_ts = time.time()
+            self.__click_opponent_avatar_at_screen(
+                x, y, label, f"SELECT_OPPONENT_AVATAR_RETRY_{attempts}", fast=True
+            )
+        if self.__attack_target_prompt_active():
+            bot_logger.log_info(
+                "SELECT_OPPONENT_AVATAR retries exhausted; combat recovery will force submit."
+            )
 
     def __cancel_combat_recovery_timer(self) -> None:
         if self.__combat_recovery_timer is None:
@@ -2563,8 +2608,19 @@ class Controller(ControllerSecondary):
                 self.__combat_recovery_timer = threading.Timer(0.5, _tick)
                 self.__combat_recovery_timer.start()
                 return
-            if (time.time() - self.__last_attack_submit_ts) < 1.4:
-                self.__clear_combat_recovery("Combat recovery skipped: recent attack submit already happened.")
+            if (time.time() - self.__last_attack_submit_ts) < 3.0:
+                # A submit just went out (or select_target's retry loop is still
+                # clicking and refreshing the timestamp) — defer instead of
+                # clearing so recovery can still fire if the prompt turns out to
+                # be stuck (e.g. a missed planeswalker attack-target click).
+                # Extend the deadline so deferring cannot expire recovery before
+                # it had a chance to act; the game-state handler clears it once
+                # combat actually advances.
+                self.__combat_recovery_deadline_ts = max(
+                    self.__combat_recovery_deadline_ts, time.time() + 3.5
+                )
+                self.__combat_recovery_timer = threading.Timer(0.5, _tick)
+                self.__combat_recovery_timer.start()
                 return
             attempt = self.__combat_recovery_attempts + 1
             bot_logger.log_info(
