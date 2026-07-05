@@ -373,14 +373,18 @@ BASIC_LAND_MANA_MAP = {
     1250: "red",     # Mountain (verified)
 }
 
-# abilityGrpId to mana color mapping for ActionType_Activate_Mana
-# These are the standard tap-for-mana ability IDs in MTGA
-# Verified from bot.log correlations:
-#   grpId=58449 (Mountain, titleId=1250) -> abilityGrpId=1004 = RED
-#   grpId=58453 (Forest, titleId=647) -> abilityGrpId=1005 = GREEN (was labeled as Swamp/Black)
+# abilityGrpId to mana color mapping for ActionType_Activate_Mana.
+# These are MTGA's standard tap-for-mana ability IDs in WUBRG order.
+# Verified from Player.log data:
+#   Mountain (titleId 1250) -> abilityGrpId 1004 = RED
+#   Forest (titleId 647) -> abilityGrpId 1005 = GREEN
+#   Dual land with SubType_Swamp+SubType_Forest carries 1003 + 1005 -> 1003 = BLACK
 MANA_ABILITY_MAP = {
-    # TODO: Need to verify all these mappings from actual game data
-    # For now, leaving empty - we'll use Scryfall for all lands
+    1001: "white",
+    1002: "blue",
+    1003: "black",
+    1004: "red",
+    1005: "green",
 }
 
 

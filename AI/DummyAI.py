@@ -11,6 +11,13 @@ class DummyAI(AIKernel):
     def __init__(self):
         self.__current_turn_num = 0
         self.__has_land_been_played_this_turn = False
+        # AI debug lines go into the shared bot.log; without this assignment
+        # _debug silently dropped every message (open() raised AttributeError).
+        try:
+            from runtime_paths import runtime_file
+            self.__bot_log_file = str(runtime_file("logs", "bot.log"))
+        except Exception:
+            self.__bot_log_file = "bot.log"
 
     def reset(self):
         """Reset AI state for a new game"""
@@ -50,7 +57,15 @@ class DummyAI(AIKernel):
                     if instance_id not in mana_sources:
                         mana_sources[instance_id] = set()
 
-                    # Use Scryfall to get produced mana colors for ALL lands
+                    # 1) Offline and exact: the action's own mana-ability id
+                    # (duals expose one Activate_Mana action per color).
+                    ability_color = CardInfo.get_mana_color_from_ability(action.get('abilityGrpId'))
+                    if ability_color:
+                        mana_sources[instance_id].add(ability_color)
+                        mana_colors.add(ability_color)
+                        continue
+
+                    # 2) Fallback: produced colors by grpId (local map + Scryfall)
                     grp_id = action.get('grpId') or inst_id_grp_id_dict.get(instance_id)
                     if grp_id:
                         produced_colors = CardInfo.get_land_produced_colors(grp_id)
@@ -62,6 +77,18 @@ class DummyAI(AIKernel):
                             self._debug(f"No Scryfall data for land: instId={instance_id}, grpId={grp_id}")
                     else:
                         self._debug(f"No grpId for mana source: instId={instance_id}")
+
+        # 3) Wildcard fallback: MTGA only offers ActionType_Activate_Mana for
+        # real mana sources. A source whose colors we cannot resolve (unknown
+        # ability id like 1039, Scryfall miss) must still count as usable
+        # mana of any color — treating it as nothing made the AI pass every
+        # turn with dual/utility lands in play.
+        wildcard = {"white", "blue", "black", "red", "green"}
+        for instance_id, colors in mana_sources.items():
+            if not colors:
+                mana_sources[instance_id] = set(wildcard)
+                mana_colors.update(wildcard)
+                self._debug(f"Unknown mana colors for instId={instance_id}; counting as wildcard source")
 
         total_sources = len(mana_sources)
         sources = [set(colors) for colors in mana_sources.values() if colors]
