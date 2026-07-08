@@ -53,6 +53,7 @@ class Controller(ControllerSecondary):
         account_switch_minutes: int | None = None,
         account_cycle_index: int | None = None,
         account_play_order: list[str] | None = None,
+        game_mode: str | None = None,
     ):
         self.__decision_callback = None
         self.__mulligan_decision_callback = None
@@ -297,6 +298,9 @@ class Controller(ControllerSecondary):
         self.__emergency_concede_threshold_sec = 20.0
         self.__emergency_concede_timer: threading.Timer | None = None
         self.__emergency_concede_scheduled_at: float = 0.0
+        _mode = str(game_mode or "historic").strip().lower()
+        self._game_mode = _mode if _mode in ("historic", "starter") else "historic"
+        bot_logger.log_info(f"Queue game_mode configured: {self._game_mode}")
         self._account_switch_interval = max(0, int(account_switch_minutes or 0)) * 60
         self._account_cycle_index = int(account_cycle_index or 0)
         self._account_play_order = account_play_order or []
@@ -1911,9 +1915,232 @@ class Controller(ControllerSecondary):
         self._navigation_verify_failures = 0
         return True
 
+    def _run_starter_deck_routine(self) -> bool:
+        # Post-login entry point simply delegates to the shared navigation, which
+        # is also used by the between-matches queue loop.
+        return self._navigate_starter_deck()
+
+    def _navigate_starter_deck(self) -> bool:
+        """Navigate Home -> Play -> Events -> In Progress -> Starter Deck Duel.
+
+        This mirrors how the Historic flow selects its queue, but instead of the
+        Historic button it clicks the "In Progress" filter and then the Starter
+        Deck Duel banner on the left. Every click is done through
+        _click_image_in_scaled_arena_region, so all ROIs are 1920x1080 arena
+        references scaled to the real arena -> resolution independent. Template
+        matching also makes the flow self-limiting: if we are already in
+        matchmaking or in a game, the buttons are not on screen and each step
+        returns without disrupting anything.
+        """
+        if self._stop_requested:
+            return False
+        if self._get_state_from_log() == BotState.IN_GAME:
+            return False
+
+        # Decide up-front which deck colors advance the most valuable quest;
+        # the swap below only fires when we have a concrete color target.
+        target_colors = self._resolve_starter_target_colors()
+
+        buttons_dir = self._buttons_dir()
+        assets_dir = self._app_path("assets", "assert")
+        play_btn = os.path.join(buttons_dir, "play_btn.png")
+        events_tpl = os.path.join(assets_dir, "events_tab.png")
+        in_progress_tpl = os.path.join(assets_dir, "in_progress_anchor.PNG")
+        starter_tpl = os.path.join(assets_dir, "starter_deck.PNG")
+
+        # ROIs in the 1920x1080 arena reference frame (scaled to the real arena).
+        home_play_roi = (1450, 820, 440, 220)
+        events_tab_roi = (1150, 40, 770, 320)
+        in_progress_roi = (1380, 200, 540, 500)
+        starter_banner_roi = (20, 80, 1300, 760)
+        play_confirm_roi = (1160, 680, 740, 360)
+
+        bot_logger.log_info("Starter: navigating Play > Events > In Progress > Starter Deck Duel.")
+
+        # 1) Open the Play blade from Home. Best-effort: if we are already in the
+        #    blade the home Play button is not found and we just continue.
+        if self._click_image_in_scaled_arena_region(
+            play_btn, "STARTER_PLAY", rel_region=home_play_roi, confidence=0.80, timeout=1.5
+        ):
+            time.sleep(1.0)
+
+        # 2) Events tab (top-right of the Play blade).
+        if not self._click_image_in_scaled_arena_region(
+            events_tpl, "STARTER_EVENTS", rel_region=events_tab_roi, confidence=0.74, timeout=2.0
+        ):
+            bot_logger.log_info("Starter: Events tab not found (not in Play blade yet); will retry.")
+            return False
+        time.sleep(0.8)
+
+        # 3) Best-effort "In Progress" filter. It only helps surface the banner
+        #    when the default Events view does not already show it, so a miss is
+        #    not a failure -- the banner match below is the real success gate.
+        if self._click_image_in_scaled_arena_region(
+            in_progress_tpl, "STARTER_IN_PROGRESS", rel_region=in_progress_roi, confidence=0.66, timeout=1.5
+        ):
+            bot_logger.log_info("Starter: In Progress filter selected.")
+            time.sleep(0.8)
+        else:
+            bot_logger.log_info("Starter: In Progress filter not clicked (banner likely already visible).")
+
+        # 4) Starter Deck Duel banner on the left.
+        if not self._click_image_in_scaled_arena_region(
+            starter_tpl, "STARTER_BANNER", rel_region=starter_banner_roi, confidence=0.72, timeout=3.0
+        ):
+            bot_logger.log_error("Starter: Starter Deck Duel banner not found on screen.")
+            return False
+        time.sleep(1.0)
+
+        # 4.5) Swap to the quest-matched starter deck before pressing Play.
+        self._swap_starter_deck_for_quest(target_colors)
+
+        # 5) Best-effort Play/Resume confirm. Clicking the "Resume" banner may
+        #    already launch the match, so a missing Play button is not a failure.
+        if self._click_image_in_scaled_arena_region(
+            play_btn, "STARTER_PLAY_CONFIRM", rel_region=play_confirm_roi, confidence=0.80, timeout=1.5
+        ):
+            bot_logger.log_info("Starter: Play confirm button clicked.")
+        else:
+            bot_logger.log_info("Starter: no separate Play button (likely launched from Resume).")
+
+        bot_logger.log_info("Starter: Starter Deck Duel selected.")
+        return True
+
+    def _resolve_starter_target_colors(self) -> str:
+        """Colors of the deck that best advances the current top quest.
+
+        Reuses the same quest ranking as the Historic flow (:meth:`_select_best_quest`)
+        and the guild->colors table, so Starter and Historic stay in sync. Returns
+        an empty string when there is no concrete target (no quest, or a quest with
+        no two-color mapping), which tells the caller to keep the current deck.
+        """
+        quest = self._select_best_quest()
+        if not quest:
+            bot_logger.log_info("Starter: no active quest; keeping current deck.")
+            return ""
+        qtype = quest.get("type")
+        if qtype == "guild":
+            colors = _GUILD_COLOR_MAP.get(quest.get("guild") or "", "")
+            bot_logger.log_info(
+                f"Starter: best quest guild={quest.get('guild')} colors={colors} "
+                f"gold={quest.get('gold', 0)}."
+            )
+            return colors
+        if qtype == "forced_file":
+            # Single-letter file (e.g. B.png): use its color letters and let the
+            # chooser pick the best two-color deck that contains them.
+            stem = os.path.splitext(str(quest.get("file") or ""))[0]
+            colors = "".join(ch for ch in stem.upper() if ch in _COLOR_LETTERS)
+            bot_logger.log_info(
+                f"Starter: forced quest ({quest.get('reason')}) colors={colors}."
+            )
+            return colors
+        bot_logger.log_info(
+            f"Starter: quest type={qtype} has no starter-deck color mapping; keeping current deck."
+        )
+        return ""
+
+    def _choose_starter_deck_template(self, target_letters: str | None) -> str | None:
+        """Pick the starter-deck template best matching the target colors.
+
+        Mirrors :meth:`_choose_deck_image` scoring (shared colors win, fewer extra
+        colors break ties) but over assets/assert/starter_decks and returns None on
+        no match, so we never swap to a wrong-color deck.
+        """
+        if not target_letters:
+            return None
+        decks_dir = self._app_path("assets", "assert", "starter_decks")
+        if not os.path.isdir(decks_dir):
+            bot_logger.log_error("Starter: starter_decks folder not found.")
+            return None
+        images = [
+            n for n in os.listdir(decks_dir)
+            if n.lower().endswith((".png", ".jpg", ".jpeg"))
+        ]
+        if not images:
+            bot_logger.log_error("Starter: no starter deck templates found.")
+            return None
+        target_set = set(target_letters.upper())
+        best = None
+        best_score = (-1, -999, 0, "")
+        for name in images:
+            stem = os.path.splitext(name)[0]
+            name_letters = {ch for ch in stem.upper() if ch in _COLOR_LETTERS}
+            score = len(name_letters & target_set)
+            extra = len(name_letters - target_set)
+            tie = (score, -extra, -len(stem), name.lower())
+            if tie > best_score:
+                best_score = tie
+                best = name
+        if best is None or best_score[0] <= 0:
+            bot_logger.log_info(
+                f"Starter: no starter deck matches colors '{target_letters}'; keeping current deck."
+            )
+            return None
+        bot_logger.log_info(
+            f"Starter: chose deck template {best} for colors '{target_letters}'."
+        )
+        return os.path.join(decks_dir, best)
+
+    def _swap_starter_deck_for_quest(self, target_colors: str) -> None:
+        """Change the selected starter deck to one matching the quest colors.
+
+        Best-effort at every step: a miss leaves the currently selected deck in
+        place -- we never block the queue over deck optimization. On the event
+        detail screen the current deck box (top-right) is ~2x the size of the
+        chooser thumbnails, so we open the chooser with a fixed-point click
+        (scale-independent), then select + submit with template matching, which
+        works because the starter_decks/*.PNG crops are native chooser scale.
+        """
+        desired_tpl = self._choose_starter_deck_template(target_colors)
+        if not desired_tpl:
+            return
+        desired_name = os.path.splitext(os.path.basename(desired_tpl))[0].upper()
+
+        # 1) Open the deck chooser by clicking the current deck box on the event
+        #    detail screen. Base-1920 center of the top-right deck box, measured
+        #    from a full-res event-screen capture (box spans ~1568-1900 x /
+        #    ~510-760 y, so this point stays inside it either way the arena region
+        #    is anchored). Tune if the chooser fails to open.
+        deck_box_base = (1734, 640)
+        target, source = self._map_abs_point_to_arena(deck_box_base, label="STARTER_DECK_BOX")
+        bot_logger.log_info(
+            f"Starter: opening deck chooser via deck box base={deck_box_base} "
+            f"target={target} src={source}."
+        )
+        self._click_abs(target[0], target[1], "STARTER_DECK_BOX")
+        time.sleep(1.2)
+
+        # 2) Select the quest-matched deck in the chooser (native-scale match). A
+        #    miss here also means the chooser never opened -> keep current deck.
+        if not self._click_image_in_scaled_arena_region(
+            desired_tpl, f"STARTER_DECK_PICK_{desired_name}",
+            rel_region=None, confidence=0.80, timeout=3.0,
+        ):
+            bot_logger.log_error(
+                f"Starter: {desired_name} not found in chooser (or it did not open); "
+                f"keeping current deck."
+            )
+            return
+        bot_logger.log_info(f"Starter: selected quest deck {desired_name}.")
+        time.sleep(0.6)
+
+        # 3) Confirm the choice.
+        submit_btn = os.path.join(self._buttons_dir(), "submit_deck.PNG")
+        if self._click_image_in_scaled_arena_region(
+            submit_btn, "STARTER_SUBMIT_DECK",
+            rel_region=None, confidence=0.80, timeout=2.0,
+        ):
+            bot_logger.log_info("Starter: submitted deck.")
+        else:
+            bot_logger.log_error("Starter: Submit Deck button not found.")
+        time.sleep(1.0)
+
     def _run_post_login_routine(self, account: dict, all_accounts: list[dict]) -> bool:
         if self._stop_requested:
             return False
+        if self._game_mode == "starter":
+            return self._run_starter_deck_routine()
         quest = self._select_best_quest()
         forced_filename = None
         if quest:
@@ -2016,6 +2243,12 @@ class Controller(ControllerSecondary):
         if self._account_switch_in_progress or self._account_switch_due():
             self._account_switch_pending = True
             bot_logger.log_info("Account switch pending; skipping queue click.")
+            return
+        if self._game_mode == "starter":
+            # Starter Deck Duel is not re-entered by a single Play click; it needs
+            # the full Events > In Progress > banner navigation each time. The
+            # navigation is self-limiting when not on the home/Play blade screen.
+            self._navigate_starter_deck()
             return
         current_state = self._get_state_from_log()
         bot_logger.log_info(f"Queue pre-check state={current_state}")

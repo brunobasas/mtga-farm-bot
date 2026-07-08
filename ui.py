@@ -1496,6 +1496,7 @@ class ConfigManager:
             "ui_scale_percent": 50,
             "first_run_prereq_ack": False,
             "first_run_prereq_ack_version": 1,
+            "game_mode": "historic",
             "account_switch_minutes": 0,
             "managed_accounts": [],
             "account_cycle_index": 0,
@@ -1606,6 +1607,17 @@ class ConfigManager:
 
     def set_input_backend(self, backend: str):
         self.config["input_backend"] = backend
+        self._save_config()
+
+    def get_game_mode(self) -> str:
+        mode = str(self.config.get("game_mode", "historic") or "historic").strip().lower()
+        return mode if mode in ("historic", "starter") else "historic"
+
+    def set_game_mode(self, mode: str) -> None:
+        value = str(mode or "").strip().lower()
+        if value not in ("historic", "starter"):
+            return
+        self.config["game_mode"] = value
         self._save_config()
 
     def get_account_switch_minutes(self) -> int:
@@ -2663,6 +2675,22 @@ class MTGBotUI(tk.Tk):
             font=self.ui_theme["font"]["body"],
             anchor="n",
         )
+        self._queue_mode_var = tk.StringVar(value=self.config_manager.get_game_mode())
+        self._queue_mode_item = self._card_canvas.create_text(
+            0,
+            0,
+            text="",
+            fill="#ffb841",
+            font=("Segoe UI", max(9, self._scale_value(11)), "bold"),
+            anchor="n",
+        )
+        for _evt, _cb in (
+            ("<Button-1>", self._toggle_queue_mode),
+            ("<Enter>", lambda _e: self._card_canvas.configure(cursor="hand2")),
+            ("<Leave>", lambda _e: self._card_canvas.configure(cursor="")),
+        ):
+            self._card_canvas.tag_bind(self._queue_mode_item, _evt, _cb)
+        self._refresh_queue_mode_label()
         self._main_topmost_var = tk.BooleanVar(value=bool(self.config_manager.get_ui_windows_topmost()))
         self._main_topmost_panel_item = self._card_canvas.create_rectangle(
             0,
@@ -2745,6 +2773,7 @@ class MTGBotUI(tk.Tk):
         if self._loading_visible:
             total_h += body_h + sp["xs"] + loading_bar_h + sp["md"]
         total_h += sp["lg"] + body_h
+        total_h += sp["xs"] + body_h
         max_content_y = (canvas_h - footer_h) - footer_gap - total_h
         # Pull the whole main stack slightly upward (~1 cm) to reduce top logo whitespace.
         top_offset = int(self.winfo_fpixels("10m"))
@@ -2785,6 +2814,9 @@ class MTGBotUI(tk.Tk):
             self._card_canvas.itemconfigure(self._loading_bar_window, state="hidden")
 
         self._card_canvas.coords(self._status_text_item, center_x, y)
+        y += body_h + sp["xs"]
+        self._card_canvas.coords(self._queue_mode_item, center_x, y)
+        self._card_canvas.tag_raise(self._queue_mode_item)
         footer_y1 = canvas_h - footer_h
         self._card_canvas.coords(self._main_topmost_panel_item, 0, footer_y1, canvas_w, canvas_h)
         box_size = self._scale_value(18)
@@ -2850,6 +2882,27 @@ class MTGBotUI(tk.Tk):
         self._loading_visible = False
         self.loading_bar.stop()
         self._refresh_card_layout()
+
+    def _refresh_queue_mode_label(self) -> None:
+        mode = str(self._queue_mode_var.get() or "historic").lower()
+        label = "Starter Deck" if mode == "starter" else "Historic"
+        try:
+            self._card_canvas.itemconfigure(
+                self._queue_mode_item,
+                text=f"Queue: {label}   (click to switch)",
+            )
+        except Exception:
+            pass
+
+    def _toggle_queue_mode(self, _event=None) -> None:
+        if self.bot_running:
+            # Changing the queue mid-run would desync navigation; ignore while running.
+            return
+        new_mode = "historic" if str(self._queue_mode_var.get()).lower() == "starter" else "starter"
+        self._queue_mode_var.set(new_mode)
+        self.config_manager.set_game_mode(new_mode)
+        self._refresh_queue_mode_label()
+        self._card_canvas.configure(cursor="")
 
     def _toggle_main_topmost(self, _event=None) -> None:
         enabled = not bool(self._main_topmost_var.get())
@@ -2960,19 +3013,22 @@ class MTGBotUI(tk.Tk):
             account_switch_minutes = self.config_manager.get_account_switch_minutes()
             account_cycle_index = self.config_manager.get_account_cycle_index()
             account_play_order = self.config_manager.get_account_play_order()
+            game_mode = self.config_manager.get_game_mode()
             bot_logger.log_info(
-                "UI start: init controller log_path={} screen_bounds={} input_backend={} account_switch_minutes={}".format(
+                "UI start: init controller log_path={} screen_bounds={} input_backend={} account_switch_minutes={} game_mode={}".format(
                     log_path,
                     screen_bounds,
                     input_backend,
                     account_switch_minutes,
+                    game_mode,
                 )
             )
             controller = Controller(log_path=log_path, screen_bounds=screen_bounds,
                                    click_targets=click_targets, input_backend=input_backend,
                                    account_switch_minutes=account_switch_minutes,
                                    account_cycle_index=account_cycle_index,
-                                   account_play_order=account_play_order)
+                                   account_play_order=account_play_order,
+                                   game_mode=game_mode)
             self._controller = controller
             ai = DummyAI()
             self.game = Game(controller, ai)
