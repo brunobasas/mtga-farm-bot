@@ -80,6 +80,9 @@ class Controller(ControllerSecondary):
             'select_n': '"type": "GREMessageType_SelectNReq"',
             'select_targets': '"type": "GREMessageType_SelectTargetsReq"',
             'pay_costs': '"type": "GREMessageType_PayCostsReq"',
+            # Optional casting-time costs (Kicker etc.): MTGA blocks the cast
+            # behind a mid-screen "Choose One" dialog until a version is picked.
+            'casting_time_options': '"type": "GREMessageType_CastingTimeOptionsReq"',
             # Client->server messages: cheap ground truth about whether our own
             # clicks registered (target response, attack submit) or misfired
             # into the phase strip (SetSettings toggling a transient stop).
@@ -280,6 +283,7 @@ class Controller(ControllerSecondary):
         self.__select_n_stack_wait_timeout_sec = 8.0
         self.__target_submit_cooldown_sec = 1.0
         self.__pending_pay_costs_ts = 0.0
+        self.__last_casting_time_options_ts = 0.0
         self.__combat_recovery_key = None
         self.__combat_recovery_attempts = 0
         self.__declare_attackers_turn_key = ""
@@ -3914,6 +3918,9 @@ class Controller(ControllerSecondary):
             self.__pending_pay_costs_ts = time.time()
             bot_logger.log_info("PayCostsReq detected: attempting auto-pay.")
             self.__handle_pay_costs_req(line_containing_pattern)
+        elif pattern == self.patterns["casting_time_options"]:
+            runtime_status.set_mode("in_game", bot_state=str(current_state))
+            self.__handle_casting_time_options_req(line_containing_pattern)
         elif pattern == self.patterns["client_select_targets_resp"]:
             bot_logger.log_info("CLIENT_EVENT: SelectTargetsResp sent — a target click registered in the MTGA client.")
         elif pattern == self.patterns["client_submit_attackers"]:
@@ -5182,6 +5189,94 @@ class Controller(ControllerSecondary):
         except Exception as e:
             bot_logger.log_error(f"Failed to handle PayCostsReq: {e}")
             threading.Timer(0.6, lambda: self.submit_selection(reason="pay_costs_error_fallback", force=True)).start()
+
+    def __handle_casting_time_options_req(self, line: str) -> None:
+        # Kicker & friends: after clicking a card with optional casting-time
+        # costs, MTGA blocks the cast behind a mid-screen "Choose One" dialog
+        # (plain version on the left, kicked version to its right). Without a
+        # response the bot idles until the priority timer force-resolves it.
+        # Simple policy for now: always pick the plain (non-kicked) version.
+        try:
+            if self._suppress_selections or self._stop_requested:
+                bot_logger.log_info("CastingTimeOptionsReq ignored: selections suppressed or stop requested.")
+                return
+            now = time.time()
+            if now - self.__last_casting_time_options_ts < 2.0:
+                bot_logger.log_info("CastingTimeOptionsReq ignored: duplicate within 2s window.")
+                return
+
+            # Best-effort parse: a truncated/malformed line must not prevent
+            # the click — the dialog is blocking either way.
+            payload = {}
+            try:
+                start = line.find("{")
+                if start != -1:
+                    payload = json.loads(line[start:])
+            except Exception as e:
+                bot_logger.log_info(f"CastingTimeOptionsReq payload unparsable ({e}); clicking anyway.")
+            messages = payload.get("greToClientEvent", {}).get("greToClientMessages", [])
+            option_summaries = []
+            saw_req = False
+            saw_our_req = False
+            for message in messages:
+                if message.get("type") != "GREMessageType_CastingTimeOptionsReq":
+                    continue
+                saw_req = True
+                seat_ids = message.get("systemSeatIds") or []
+                if self.__system_seat_id is not None and seat_ids and self.__system_seat_id not in seat_ids:
+                    bot_logger.log_info(f"CastingTimeOptionsReq for other seat {seat_ids}; skipping message.")
+                    continue
+                saw_our_req = True
+                req = message.get("castingTimeOptionsReq", {}) or {}
+                for option in req.get("castingTimeOptionReq", []) or []:
+                    option_summaries.append(
+                        "type={} ctoId={} grpId={} required={}".format(
+                            option.get("castingTimeOptionType"),
+                            option.get("ctoId"),
+                            option.get("grpId"),
+                            option.get("isRequired", False),
+                        )
+                    )
+            if saw_req and not saw_our_req:
+                # Parsed fine, but every CastingTimeOptionsReq message was for
+                # another seat — nothing for us to answer.
+                return
+            bot_logger.log_info(
+                "CASTING_TIME_OPTIONS detected: options=[{}] — choosing plain (non-kicked) version.".format(
+                    "; ".join(option_summaries) or "unparsed"
+                )
+            )
+
+            def _click_plain_version() -> None:
+                try:
+                    if self._suppress_selections or self._stop_requested:
+                        return
+                    # Base-1920 anchor for the leftmost (plain) chooser plate;
+                    # the kicked plate sits at ~x=1180, so stay well left of it.
+                    # Single click only: once the dialog closes, further clicks
+                    # would land on the battlefield and could hit a wrong target
+                    # for the follow-up SelectTargetsReq.
+                    base_point = (750, 505)
+                    target, source = self._map_abs_point_to_arena(
+                        base_point, label="CASTING_TIME_OPTION"
+                    )
+                    bot_logger.log_info(
+                        f"CASTING_TIME_OPTION click: base={base_point} target={target} source={source}"
+                    )
+                    bot_logger.log_click(target[0], target[1], "CASTING_TIME_OPTION_PLAIN")
+                    self.input.move_abs(target[0], target[1])
+                    time.sleep(0.4)
+                    self.input.left_click(1)
+                except Exception as e:
+                    bot_logger.log_error(f"CastingTimeOptionsReq click execution failed: {e}")
+
+            # Stamp the dedupe window only once a click is actually scheduled,
+            # so a no-click exit above never blocks a legitimate follow-up.
+            self.__last_casting_time_options_ts = now
+            # Give the Choose One overlay a moment to finish animating in.
+            threading.Timer(1.0, _click_plain_version).start()
+        except Exception as e:
+            bot_logger.log_error(f"Failed to handle CastingTimeOptionsReq: {e}")
 
     def __handle_select_targets_req(self, line: str) -> None:
         try:
