@@ -1952,7 +1952,10 @@ class Controller(ControllerSecondary):
         home_play_roi = (1450, 820, 440, 220)
         events_tab_roi = (1150, 40, 770, 320)
         in_progress_roi = (1380, 200, 540, 500)
-        starter_banner_roi = (20, 80, 1300, 760)
+        # Wide enough for both banner columns: the event is not always in the
+        # first slot (e.g. Jump In! can occupy it, pushing Starter Deck Duel
+        # into the second column at x ~760..1460 in the 1920 frame).
+        starter_banner_roi = (20, 80, 1500, 900)
         play_confirm_roi = (1160, 680, 740, 360)
 
         bot_logger.log_info("Starter: navigating Play > Events > In Progress > Starter Deck Duel.")
