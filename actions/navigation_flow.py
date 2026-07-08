@@ -7,6 +7,10 @@ from state.state_machine import BotState
 
 
 def build_post_login_navigation_actions(*, assets_dir: str, buttons_dir: str) -> list[ActionSpec]:
+    # Historic queue navigation. The Starter Deck flow does NOT use this OOB
+    # state-machine path (there are no player-log scenes for the Events blade, so
+    # required_state gating would ESC-recover and get lost). Starter navigation
+    # lives in Controller._navigate_starter_deck, driven purely by templates.
     def a(name: str) -> str:
         return os.path.join(assets_dir, name)
 
