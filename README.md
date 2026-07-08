@@ -139,6 +139,7 @@ The bot maximizes mana usage each turn:
 - Respects color requirements and discounted costs
 - Type priority when CMC is tied: creature → instant → sorcery → enchantment
 - Supports Convoke (untapped creatures as mana sources)
+- Kicker: the "Cast with Kicker?" chooser is answered automatically (always the plain, non-kicked version for now) so the bot never stalls on it
 
 ### Stopping the bot
 
