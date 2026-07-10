@@ -2692,10 +2692,25 @@ class Controller(ControllerSecondary):
                     pass
 
     def cast(self, card_id: int) -> None:
+        # MTGA sometimes emits a card's hover objectId a beat after our scan
+        # passes it ("No hover update before bounds"), so a single pass can miss
+        # a card that is really in hand. Retry a couple of times after a pause.
+        for attempt in range(3):
+            if self._stop_requested or self._suppress_selections:
+                return
+            if self._cast_once(card_id):
+                return
+            if attempt < 2:
+                bot_logger.log_info(
+                    f"CAST_RETRY: card {card_id} not hovered on attempt {attempt}; rescanning after pause."
+                )
+                time.sleep(0.8)
+
+    def _cast_once(self, card_id: int) -> bool:
         bot_logger.set_hover_logging(True)
         try:
             if not self._ensure_options_overlay_closed(context=f"CAST_CARD id={card_id}"):
-                return
+                return False
             hand_p1, hand_p2 = self._get_hand_scan_points_mapped(force_reacquire=True)
             # Clear any stale hover events from previous scans
             self.log_reader.clear_new_line_flag(self.patterns['hover_id'])
@@ -2791,7 +2806,8 @@ class Controller(ControllerSecondary):
                     )
                     break
 
-            if current_hovered_id == card_id:
+            clicked = current_hovered_id == card_id
+            if clicked:
                 click_pos = self.input.position()
                 bot_logger.log_click(click_pos.x, click_pos.y, f"CAST_CARD (id={card_id})")
                 time.sleep(0.5)
@@ -2804,6 +2820,7 @@ class Controller(ControllerSecondary):
             reset_pos = (hand_p1[0], hand_p1[1] - 100)
             bot_logger.log_move(reset_pos[0], reset_pos[1], "RESET_AFTER_CAST")
             self.input.move_abs(reset_pos[0], reset_pos[1])
+            return clicked
         finally:
             bot_logger.set_hover_logging(False)
 
