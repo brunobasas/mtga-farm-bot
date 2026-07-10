@@ -2281,108 +2281,94 @@ class Controller(ControllerSecondary):
         )
         return os.path.join(decks_dir, best)
 
-    # Top-right deck box on the event page (1920x1080 reference frame). The box
-    # is always in this square regardless of which deck art it shows.
-    _STARTER_DECK_BOX_ROI = (1540, 500, 400, 320)
+    # The 10 Starter Deck Duel decks are shown in the chooser in a FIXED
+    # alphabetical grid (6 on the top row, 4 on the bottom). Their positions
+    # never change, so we select by grid coordinate instead of template matching
+    # (the deck art templates are a different scale than the chooser thumbnails
+    # and never match). Map deck color code -> grid index (alphabetical):
+    #   0 Arcane Aerialists WU | 1 Cat Attack WG | 2 Graveyard Gifts UB
+    #   3 Learn from the Land UG | 4 Might of the Legion WR | 5 Morbid Machinations BG
+    #   6 Path of Power RG | 7 Reckless Raid BR | 8 Vampiric Hunger WB
+    #   9 Wondrous Wizardry UR
+    _STARTER_DECK_GRID_INDEX = {
+        "WU": 0, "WG": 1, "UB": 2, "UG": 3, "WR": 4, "BG": 5,
+        "RG": 6, "BR": 7, "WB": 8, "UR": 9,
+    }
+    # Card centers in the 1920x1080 reference frame (measured from the chooser).
+    _STARTER_DECK_COL_X = (187, 480, 773, 1066, 1359, 1652)
+    _STARTER_DECK_ROW_Y = (400, 705)
+    _STARTER_DECK_BOX_BASE = (1734, 640)       # current-deck box on the event page
+    _STARTER_SUBMIT_DECK_BASE = (1735, 1035)   # "Submit Deck" button in the chooser
 
-    def _locate_starter_deck_box(self) -> tuple[int, int] | None:
-        """Find the current-deck box on the event page by matching ANY starter
-        deck thumbnail in the top-right ROI.
-
-        The box shows whichever deck is currently selected, so we try every deck
-        art; a hit both confirms we are on the event page and gives a precise,
-        arena-drift-proof click point. Returns a screen (x, y) or None.
-        """
-        decks_dir = self._app_path("assets", "assert", "starter_decks")
-        if not os.path.isdir(decks_dir):
+    def _starter_deck_grid_point(self, deck_code: str) -> tuple[int, int] | None:
+        """Base-1920 (x, y) of a deck's card in the chooser grid, or None."""
+        idx = self._STARTER_DECK_GRID_INDEX.get(str(deck_code or "").upper())
+        if idx is None:
             return None
-        for name in sorted(os.listdir(decks_dir)):
-            if not name.lower().endswith((".png", ".jpg", ".jpeg")):
-                continue
-            point = self._locate_image_center_in_scaled_arena_region(
-                os.path.join(decks_dir, name), f"STARTER_DECKBOX_{name}",
-                rel_region=self._STARTER_DECK_BOX_ROI, confidence=0.72, timeout=0.6,
-            )
-            if point is not None:
-                bot_logger.log_info(
-                    f"Starter: deck box located via {name} at {point}."
-                )
-                return point
-        return None
+        row, col = divmod(idx, len(self._STARTER_DECK_COL_X))
+        if row >= len(self._STARTER_DECK_ROW_Y):
+            return None
+        return (self._STARTER_DECK_COL_X[col], self._STARTER_DECK_ROW_Y[row])
 
     def _swap_starter_deck_for_quest(self, target_colors: str) -> None:
         """Change the selected starter deck to one matching the quest colors.
 
         Best-effort: a miss leaves the current deck in place -- we never block the
-        queue over deck optimization. Flow: open the deck chooser via the deck box
-        (top-right), pick the quest deck thumbnail, submit, then verify the box
-        now shows the new deck.
+        queue. Flow: click the current-deck box to open the chooser, click the
+        quest deck at its fixed grid position, then Submit Deck. All clicks are by
+        coordinate (the fixed alphabetical grid), which is robust to window scale.
         """
         desired_tpl = self._choose_starter_deck_template(target_colors)
         if not desired_tpl:
             return
         desired_name = os.path.splitext(os.path.basename(desired_tpl))[0].upper()
-
-        # If the deck box already shows the desired deck, nothing to do.
-        if self._locate_image_center_in_scaled_arena_region(
-            desired_tpl, "STARTER_DECK_ALREADY",
-            rel_region=self._STARTER_DECK_BOX_ROI, confidence=0.75, timeout=0.6,
-        ) is not None:
-            bot_logger.log_info(f"Starter: deck box already shows {desired_name}; no swap needed.")
-            return
-
-        # 1) Open the deck chooser by clicking the current deck box. Prefer an
-        #    image-located click (robust to arena drift); fall back to the fixed
-        #    square (the box is always in the same place).
-        box_pt = self._locate_starter_deck_box()
-        if box_pt is not None:
-            self._click_abs(box_pt[0], box_pt[1], "STARTER_DECK_BOX")
-        else:
-            deck_box_base = (1734, 640)
-            target, source = self._map_abs_point_to_arena(deck_box_base, label="STARTER_DECK_BOX")
-            bot_logger.log_info(
-                f"Starter: deck box not matched by image; clicking fixed square "
-                f"base={deck_box_base} -> {target} ({source})."
-            )
-            self._click_abs(target[0], target[1], "STARTER_DECK_BOX")
-        time.sleep(1.2)
-
-        # 2) Select the quest-matched deck in the chooser (native-scale match). A
-        #    miss here also means the chooser never opened -> keep current deck.
-        if not self._click_image_in_scaled_arena_region(
-            desired_tpl, f"STARTER_DECK_PICK_{desired_name}",
-            rel_region=None, confidence=0.80, timeout=3.0,
-        ):
+        grid_base = self._starter_deck_grid_point(desired_name)
+        if grid_base is None:
             bot_logger.log_error(
-                f"Starter: {desired_name} not found in chooser (or it did not open); "
-                f"keeping current deck."
+                f"Starter: no chooser grid position for deck '{desired_name}'; keeping current deck."
             )
             return
-        bot_logger.log_info(f"Starter: selected quest deck {desired_name}.")
-        time.sleep(0.6)
 
-        # 3) Confirm the choice.
+        # 1) Open the deck chooser by clicking the current-deck box (fixed square,
+        #    same position regardless of which deck art it currently shows).
+        box_target, box_src = self._map_abs_point_to_arena(
+            self._STARTER_DECK_BOX_BASE, label="STARTER_DECK_BOX"
+        )
+        bot_logger.log_info(
+            f"Starter: opening deck chooser via deck box base={self._STARTER_DECK_BOX_BASE} "
+            f"-> {box_target} ({box_src})."
+        )
+        self._click_abs(box_target[0], box_target[1], "STARTER_DECK_BOX")
+        time.sleep(1.3)
+
+        # 2) Select the quest deck at its fixed grid position.
+        deck_target, deck_src = self._map_abs_point_to_arena(
+            grid_base, label=f"STARTER_DECK_PICK_{desired_name}"
+        )
+        bot_logger.log_info(
+            f"Starter: selecting deck {desired_name} at grid base={grid_base} "
+            f"-> {deck_target} ({deck_src})."
+        )
+        self._click_abs(deck_target[0], deck_target[1], f"STARTER_DECK_PICK_{desired_name}")
+        time.sleep(0.8)
+
+        # 3) Confirm via Submit Deck. Prefer the template (exact), fall back to the
+        #    fixed button position.
         submit_btn = os.path.join(self._buttons_dir(), "submit_deck.PNG")
-        if self._click_image_in_scaled_arena_region(
-            submit_btn, "STARTER_SUBMIT_DECK",
-            rel_region=None, confidence=0.80, timeout=2.0,
+        if os.path.exists(submit_btn) and self._click_image_in_scaled_arena_region(
+            submit_btn, "STARTER_SUBMIT_DECK", rel_region=None, confidence=0.80, timeout=1.5,
         ):
-            bot_logger.log_info("Starter: submitted deck.")
+            bot_logger.log_info("Starter: submitted deck (template).")
         else:
-            bot_logger.log_error("Starter: Submit Deck button not found.")
-        time.sleep(1.2)
-
-        # 4) Verify the deck box now shows the desired deck (catch silent misses).
-        if self._locate_image_center_in_scaled_arena_region(
-            desired_tpl, "STARTER_DECK_VERIFY",
-            rel_region=self._STARTER_DECK_BOX_ROI, confidence=0.72, timeout=1.5,
-        ) is not None:
-            bot_logger.log_info(f"Starter: deck swap verified -> {desired_name}.")
-        else:
-            bot_logger.log_error(
-                f"Starter: deck swap NOT verified; box does not show {desired_name} "
-                f"(check deck-box ROI / chooser templates)."
+            sub_target, sub_src = self._map_abs_point_to_arena(
+                self._STARTER_SUBMIT_DECK_BASE, label="STARTER_SUBMIT_DECK"
             )
+            bot_logger.log_info(
+                f"Starter: submitting deck via fixed button base={self._STARTER_SUBMIT_DECK_BASE} "
+                f"-> {sub_target} ({sub_src})."
+            )
+            self._click_abs(sub_target[0], sub_target[1], "STARTER_SUBMIT_DECK")
+        time.sleep(1.2)
 
     def _run_post_login_routine(self, account: dict, all_accounts: list[dict]) -> bool:
         if self._stop_requested:
