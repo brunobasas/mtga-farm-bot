@@ -2281,33 +2281,70 @@ class Controller(ControllerSecondary):
         )
         return os.path.join(decks_dir, best)
 
+    # Top-right deck box on the event page (1920x1080 reference frame). The box
+    # is always in this square regardless of which deck art it shows.
+    _STARTER_DECK_BOX_ROI = (1540, 500, 400, 320)
+
+    def _locate_starter_deck_box(self) -> tuple[int, int] | None:
+        """Find the current-deck box on the event page by matching ANY starter
+        deck thumbnail in the top-right ROI.
+
+        The box shows whichever deck is currently selected, so we try every deck
+        art; a hit both confirms we are on the event page and gives a precise,
+        arena-drift-proof click point. Returns a screen (x, y) or None.
+        """
+        decks_dir = self._app_path("assets", "assert", "starter_decks")
+        if not os.path.isdir(decks_dir):
+            return None
+        for name in sorted(os.listdir(decks_dir)):
+            if not name.lower().endswith((".png", ".jpg", ".jpeg")):
+                continue
+            point = self._locate_image_center_in_scaled_arena_region(
+                os.path.join(decks_dir, name), f"STARTER_DECKBOX_{name}",
+                rel_region=self._STARTER_DECK_BOX_ROI, confidence=0.72, timeout=0.6,
+            )
+            if point is not None:
+                bot_logger.log_info(
+                    f"Starter: deck box located via {name} at {point}."
+                )
+                return point
+        return None
+
     def _swap_starter_deck_for_quest(self, target_colors: str) -> None:
         """Change the selected starter deck to one matching the quest colors.
 
-        Best-effort at every step: a miss leaves the currently selected deck in
-        place -- we never block the queue over deck optimization. On the event
-        detail screen the current deck box (top-right) is ~2x the size of the
-        chooser thumbnails, so we open the chooser with a fixed-point click
-        (scale-independent), then select + submit with template matching, which
-        works because the starter_decks/*.PNG crops are native chooser scale.
+        Best-effort: a miss leaves the current deck in place -- we never block the
+        queue over deck optimization. Flow: open the deck chooser via the deck box
+        (top-right), pick the quest deck thumbnail, submit, then verify the box
+        now shows the new deck.
         """
         desired_tpl = self._choose_starter_deck_template(target_colors)
         if not desired_tpl:
             return
         desired_name = os.path.splitext(os.path.basename(desired_tpl))[0].upper()
 
-        # 1) Open the deck chooser by clicking the current deck box on the event
-        #    detail screen. Base-1920 center of the top-right deck box, measured
-        #    from a full-res event-screen capture (box spans ~1568-1900 x /
-        #    ~510-760 y, so this point stays inside it either way the arena region
-        #    is anchored). Tune if the chooser fails to open.
-        deck_box_base = (1734, 640)
-        target, source = self._map_abs_point_to_arena(deck_box_base, label="STARTER_DECK_BOX")
-        bot_logger.log_info(
-            f"Starter: opening deck chooser via deck box base={deck_box_base} "
-            f"target={target} src={source}."
-        )
-        self._click_abs(target[0], target[1], "STARTER_DECK_BOX")
+        # If the deck box already shows the desired deck, nothing to do.
+        if self._locate_image_center_in_scaled_arena_region(
+            desired_tpl, "STARTER_DECK_ALREADY",
+            rel_region=self._STARTER_DECK_BOX_ROI, confidence=0.75, timeout=0.6,
+        ) is not None:
+            bot_logger.log_info(f"Starter: deck box already shows {desired_name}; no swap needed.")
+            return
+
+        # 1) Open the deck chooser by clicking the current deck box. Prefer an
+        #    image-located click (robust to arena drift); fall back to the fixed
+        #    square (the box is always in the same place).
+        box_pt = self._locate_starter_deck_box()
+        if box_pt is not None:
+            self._click_abs(box_pt[0], box_pt[1], "STARTER_DECK_BOX")
+        else:
+            deck_box_base = (1734, 640)
+            target, source = self._map_abs_point_to_arena(deck_box_base, label="STARTER_DECK_BOX")
+            bot_logger.log_info(
+                f"Starter: deck box not matched by image; clicking fixed square "
+                f"base={deck_box_base} -> {target} ({source})."
+            )
+            self._click_abs(target[0], target[1], "STARTER_DECK_BOX")
         time.sleep(1.2)
 
         # 2) Select the quest-matched deck in the chooser (native-scale match). A
@@ -2333,7 +2370,19 @@ class Controller(ControllerSecondary):
             bot_logger.log_info("Starter: submitted deck.")
         else:
             bot_logger.log_error("Starter: Submit Deck button not found.")
-        time.sleep(1.0)
+        time.sleep(1.2)
+
+        # 4) Verify the deck box now shows the desired deck (catch silent misses).
+        if self._locate_image_center_in_scaled_arena_region(
+            desired_tpl, "STARTER_DECK_VERIFY",
+            rel_region=self._STARTER_DECK_BOX_ROI, confidence=0.72, timeout=1.5,
+        ) is not None:
+            bot_logger.log_info(f"Starter: deck swap verified -> {desired_name}.")
+        else:
+            bot_logger.log_error(
+                f"Starter: deck swap NOT verified; box does not show {desired_name} "
+                f"(check deck-box ROI / chooser templates)."
+            )
 
     def _run_post_login_routine(self, account: dict, all_accounts: list[dict]) -> bool:
         if self._stop_requested:
