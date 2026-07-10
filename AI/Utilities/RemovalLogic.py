@@ -159,6 +159,35 @@ def effective_toughness(creature: dict) -> int:
     return _stat(creature.get("toughness")) - _stat(creature.get("damage"))
 
 
+# Creatures whose death is beneficial or who recur from the graveyard -- ideal
+# to feed to a sacrifice cost (e.g. Eaten Alive). Manual pins plus an oracle
+# heuristic so it generalizes.
+_SAC_FODDER_GRPIDS = {
+    93777,                # Infestation Sage (dies -> token)
+    93776,                # Infernal Vessel (dies -> returns upgraded)
+    67912, 93032, 93895,  # Reassembling Skeleton (graveyard recursion)
+}
+
+
+def is_sacrifice_fodder(grp_id) -> bool:
+    """True if sacrificing this creature is (near) free -- a beneficial death
+    trigger or graveyard recursion."""
+    if grp_id is None:
+        return False
+    try:
+        grp_id = int(grp_id)
+    except Exception:
+        return False
+    if grp_id in _SAC_FODDER_GRPIDS:
+        return True
+    try:
+        info = CardInfo.get_card_info(grp_id) or {}
+    except Exception:
+        return False
+    text = str(info.get("oracleText") or "").lower()
+    return "this creature dies" in text or "from your graveyard" in text
+
+
 def _creature_keywords(creature: dict) -> set[str]:
     """Printed keywords for the creature's card (best-effort; keywords granted
     by other effects are not visible here)."""

@@ -5886,10 +5886,14 @@ class Controller(ControllerSecondary):
                 hand_candidates = [cid for cid in ids if cid in hand_ids]
                 bf_candidates = [cid for cid in ids if _on_our_battlefield(cid)]
 
-                # Sacrifice the least valuable creature first (keep our bombs).
+                # Sacrifice fodder first (creatures whose death is beneficial or
+                # who recur -- Infestation Sage, Reassembling Skeleton, Infernal
+                # Vessel), then the least valuable creature (keep our bombs).
                 def _sac_value(cid: int):
                     obj = obj_by_id.get(cid) or {}
+                    fodder = 0 if RemovalLogic.is_sacrifice_fodder(obj.get("grpId")) else 1
                     return (
+                        fodder,
                         RemovalLogic.effective_toughness(obj) + RemovalLogic._stat(obj.get("power")),
                         RemovalLogic._stat(obj.get("power")),
                     )
@@ -5972,6 +5976,7 @@ class Controller(ControllerSecondary):
                 bot_logger.log_info(f"CastingTimeOptionsReq payload unparsable ({e}); clicking anyway.")
             messages = payload.get("greToClientEvent", {}).get("greToClientMessages", [])
             option_summaries = []
+            is_choose_or_cost = False
             saw_req = False
             saw_our_req = False
             for message in messages:
@@ -5985,6 +5990,11 @@ class Controller(ControllerSecondary):
                 saw_our_req = True
                 req = message.get("castingTimeOptionsReq", {}) or {}
                 for option in req.get("castingTimeOptionReq", []) or []:
+                    if option.get("castingTimeOptionType") == "CastingTimeOptionType_ChooseOrCost":
+                        # "Choose an additional cost" -- e.g. Eaten Alive's
+                        # "sacrifice a creature or pay {3}{B}". We prefer to
+                        # sacrifice (saves mana; fodder creatures are expendable).
+                        is_choose_or_cost = True
                     option_summaries.append(
                         "type={} ctoId={} grpId={} required={}".format(
                             option.get("castingTimeOptionType"),
@@ -5997,40 +6007,75 @@ class Controller(ControllerSecondary):
                 # Parsed fine, but every CastingTimeOptionsReq message was for
                 # another seat — nothing for us to answer.
                 return
+            # "Choose an additional cost" (sacrifice-or-pay) renders as two
+            # bottom-right buttons (Pay on top, "Sacrifice a creature" below);
+            # Kicker-style options render as mid-screen plates. Pick accordingly.
+            if is_choose_or_cost:
+                label = "CASTING_TIME_OPTION_SACRIFICE"
+                base_point = (1775, 978)  # bottom-right "Sacrifice a creature" button
+                choice_desc = "sacrifice-a-creature (bottom button)"
+            else:
+                label = "CASTING_TIME_OPTION_PLAIN"
+                base_point = (750, 505)   # leftmost (plain, non-kicked) plate
+                choice_desc = "plain (non-kicked) version"
             bot_logger.log_info(
-                "CASTING_TIME_OPTIONS detected: options=[{}] — choosing plain (non-kicked) version.".format(
-                    "; ".join(option_summaries) or "unparsed"
+                "CASTING_TIME_OPTIONS detected: options=[{}] — choosing {}.".format(
+                    "; ".join(option_summaries) or "unparsed", choice_desc
                 )
             )
 
-            def _click_plain_version() -> None:
+            # Snapshot the turn state so retries stop once the dialog resolves --
+            # avoids clicking the board after it closes (like the modal handler).
+            snap_ti = {}
+            try:
+                snap_ti = dict(self.updated_game_state.get_turn_info() or {})
+            except Exception:
+                snap_ti = {}
+            snap_key = (
+                snap_ti.get("turnNumber"), snap_ti.get("phase"),
+                snap_ti.get("step"), snap_ti.get("decisionPlayer"),
+            )
+
+            def _dialog_still_open() -> bool:
+                try:
+                    ti = self.updated_game_state.get_turn_info() or {}
+                except Exception:
+                    return True
+                return (
+                    ti.get("turnNumber"), ti.get("phase"),
+                    ti.get("step"), ti.get("decisionPlayer"),
+                ) == snap_key
+
+            def _click_option(attempt: int = 0) -> None:
                 try:
                     if self._suppress_selections or self._stop_requested:
                         return
-                    # Base-1920 anchor for the leftmost (plain) chooser plate;
-                    # the kicked plate sits at ~x=1180, so stay well left of it.
-                    # Single click only: once the dialog closes, further clicks
-                    # would land on the battlefield and could hit a wrong target
-                    # for the follow-up SelectTargetsReq.
-                    base_point = (750, 505)
-                    target, source = self._map_abs_point_to_arena(
-                        base_point, label="CASTING_TIME_OPTION"
-                    )
+                    if attempt > 0 and not _dialog_still_open():
+                        bot_logger.log_info(
+                            f"CASTING_TIME_OPTION: dialog resolved before retry {attempt}; stopping."
+                        )
+                        return
+                    target, source = self._map_abs_point_to_arena(base_point, label=label)
                     bot_logger.log_info(
-                        f"CASTING_TIME_OPTION click: base={base_point} target={target} source={source}"
+                        f"CASTING_TIME_OPTION click (attempt {attempt}): base={base_point} "
+                        f"target={target} source={source}"
                     )
-                    bot_logger.log_click(target[0], target[1], "CASTING_TIME_OPTION_PLAIN")
+                    bot_logger.log_click(target[0], target[1], label)
                     self.input.move_abs(target[0], target[1])
                     time.sleep(0.4)
                     self.input.left_click(1)
+                    # Only the ChooseOrCost button gets retries -- the Kicker plate
+                    # sits mid-screen and a stray click there could hit the board.
+                    if is_choose_or_cost and attempt < 2:
+                        threading.Timer(1.4, lambda: _click_option(attempt + 1)).start()
                 except Exception as e:
                     bot_logger.log_error(f"CastingTimeOptionsReq click execution failed: {e}")
 
             # Stamp the dedupe window only once a click is actually scheduled,
             # so a no-click exit above never blocks a legitimate follow-up.
             self.__last_casting_time_options_ts = now
-            # Give the Choose One overlay a moment to finish animating in.
-            threading.Timer(1.0, _click_plain_version).start()
+            # Give the overlay a moment to finish animating in.
+            threading.Timer(1.0, lambda: _click_option(0)).start()
         except Exception as e:
             bot_logger.log_error(f"Failed to handle CastingTimeOptionsReq: {e}")
 
