@@ -10,6 +10,7 @@ from pathlib import Path
 
 from Controller.ControllerInterface import ControllerSecondary
 import AI.Utilities.RemovalLogic as RemovalLogic
+import AI.Utilities.FightLogic as FightLogic
 from Controller.MTGAController.LogReader import LogReader
 from Controller.Utilities.GameState import GameState
 from Controller.Utilities.input_controller import InputControllerError, create_input_controller
@@ -6054,6 +6055,11 @@ class Controller(ControllerSecondary):
                 req = message.get("selectTargetsReq", {}) or {}
                 source_id = req.get("sourceId")
                 self.__update_pending_target_select(source_id)
+                # Two-target pump-fight spells (e.g. Felling Blow) need both a
+                # friendly and an enemy creature picked -- handle before the
+                # single-target paths.
+                if self.__try_handle_fight_targets(req):
+                    return
                 chooser_target = self.__pick_chooser_target(req)
                 if chooser_target is not None:
                     self.__schedule_chooser_target_selection(
@@ -6711,6 +6717,117 @@ class Controller(ControllerSecondary):
             start_delay = delay_remaining + 0.4
         threading.Timer(start_delay, lambda: _do_click(0)).start()
 
+    def __try_handle_fight_targets(self, req) -> bool:
+        """Handle a two-target pump-fight spell (e.g. Felling Blow): pick our
+        highest-power creature (the group whose legal targets we control) and the
+        best enemy creature it can then kill (the other group). Returns True if it
+        scheduled the two-target selection, False to fall back to normal handling.
+        """
+        try:
+            groups = req.get("targets", []) or []
+            if len(groups) < 2 or self.__system_seat_id is None:
+                return False
+            source_id = req.get("sourceId")
+            if source_id is None:
+                return False
+            game_objects = self.updated_game_state.get_game_objects() or []
+            obj_by_id = {o.get("instanceId"): o for o in game_objects if isinstance(o, dict)}
+            grp_id = (obj_by_id.get(source_id) or {}).get("grpId")
+            profile = FightLogic.get_fight_profile(grp_id)
+            if not profile:
+                return False
+
+            def _legal_ids(group):
+                return [
+                    t.get("targetInstanceId")
+                    for t in (group.get("targets", []) or [])
+                    if t.get("legalAction") == "SelectAction_Select"
+                    and t.get("targetInstanceId") is not None
+                ]
+
+            our_ids = None
+            enemy_ids = None
+            for group in groups:
+                ids = _legal_ids(group)
+                if not ids:
+                    continue
+                controllers = {(obj_by_id.get(i) or {}).get("controllerSeatId") for i in ids}
+                if controllers == {self.__system_seat_id}:
+                    our_ids = ids
+                else:
+                    enemy_ids = ids
+            if not our_ids or not enemy_ids:
+                return False
+
+            def _pow(i):
+                return RemovalLogic._stat((obj_by_id.get(i) or {}).get("power"))
+
+            def _tough(i):
+                return RemovalLogic.effective_toughness(obj_by_id.get(i) or {})
+
+            counter = int(profile.get("counter", 1))
+            our_id = max(our_ids, key=_pow)
+            damage = _pow(our_id) + counter
+            killable = [
+                i for i in enemy_ids
+                if FightLogic.killable_by_damage(obj_by_id.get(i) or {}, damage)
+            ]
+            if not killable:
+                return False
+            enemy_id = max(killable, key=lambda i: (_tough(i), _pow(i)))
+
+            bot_logger.log_info(
+                f"FIGHT targets: source={source_id} grp={grp_id} our={our_id} "
+                f"(dmg={damage}) enemy={enemy_id} of {enemy_ids}."
+            )
+            self.__schedule_fight_target_selection(source_id, our_id, enemy_id)
+            return True
+        except Exception as e:
+            bot_logger.log_error(f"Failed to handle fight targets: {e}")
+            return False
+
+    def __schedule_fight_target_selection(self, source_id, our_id, enemy_id) -> None:
+        """Two-target selection: click our creature (group 1) on our battlefield,
+        then the enemy creature (group 2) on the opponent's, then submit."""
+        now = time.time()
+        if self._suppress_selections or self._stop_requested:
+            return
+        norm_source = source_id if source_id is not None else -1
+        if self.__last_target_select_source_id == norm_source and now - self.__last_target_select_ts < 1.5:
+            return
+        self.__last_target_select_source_id = norm_source
+        self.__last_target_select_ts = now
+        self.__update_pending_target_select(source_id)
+        bot_logger.log_info(
+            f"FIGHT target flow: our creature {our_id} then enemy creature {enemy_id}."
+        )
+
+        def _flow() -> None:
+            if self._suppress_selections or self._stop_requested:
+                return
+            try:
+                ok1 = self.select_battlefield_permanent(our_id, clicks=1)
+            except Exception as e:
+                ok1 = False
+                bot_logger.log_error(f"Fight our-creature click failed: {e}")
+            bot_logger.log_info(f"FIGHT our-creature click: id={our_id} found={ok1}")
+            time.sleep(0.6)
+            if self._suppress_selections or self._stop_requested:
+                return
+            try:
+                ok2 = self.select_opponent_battlefield_permanent(enemy_id, clicks=1)
+            except Exception as e:
+                ok2 = False
+                bot_logger.log_error(f"Fight enemy-creature click failed: {e}")
+            bot_logger.log_info(f"FIGHT enemy-creature click: id={enemy_id} found={ok2}")
+            time.sleep(0.6)
+            self.__last_submit_targets_ts = time.time()
+            self.submit_selection(reason="fight_target_submit", force=True)
+
+        delay_remaining = self.__get_delay_timer_remaining()
+        start_delay = 0.8 if delay_remaining <= 0.05 else delay_remaining + 0.4
+        threading.Timer(start_delay, _flow).start()
+
     def _get_chooser_scan_points_mapped(
         self,
         *,
@@ -7220,6 +7337,11 @@ class Controller(ControllerSecondary):
                         threading.Timer(0.2, _submit_if_pending_target_still_matches).start()
                         return
                 source_id = message.get("selectTargetsReq", {}).get("sourceId")
+                # Two-target pump-fight spells (e.g. Felling Blow): pick a friendly
+                # creature and an enemy creature. Handle before the single-target
+                # paths (mirrors __handle_select_targets_req).
+                if self.__try_handle_fight_targets(req):
+                    return
                 # Off-battlefield targets (a spell on the stack for a counter, a
                 # card in graveyard/exile) are shown in a central overlay, not on
                 # a battlefield row -- route them to the chooser click. Mirrors

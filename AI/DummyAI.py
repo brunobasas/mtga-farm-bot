@@ -5,6 +5,7 @@ import AI.Utilities.CardInfo as CardInfo
 import AI.Utilities.RemovalLogic as RemovalLogic
 import AI.Utilities.CardPolicy as CardPolicy
 import AI.Utilities.CounterLogic as CounterLogic
+import AI.Utilities.FightLogic as FightLogic
 import traceback
 from datetime import datetime
 
@@ -712,6 +713,25 @@ class DummyAI(AIKernel):
                                     continue
                                 self._debug(
                                     f"Removal {card_name} target={_rm_target} (profile={removal_profile})."
+                                )
+                            # Pump-fight (e.g. Felling Blow): only cast it if we
+                            # have a creature to buff AND an enemy it can then
+                            # kill (our best power + counter >= enemy toughness).
+                            fight_profile = FightLogic.get_fight_profile(grp_id)
+                            if fight_profile is not None:
+                                _fight = FightLogic.choose_fight_pairing(
+                                    fight_profile,
+                                    removal_game_objects,
+                                    my_seat,
+                                    battlefield_zone_ids=removal_bf_ids,
+                                )
+                                if _fight is None:
+                                    self._debug(
+                                        f"Fight {card_name} has no killable pairing; skipping cast."
+                                    )
+                                    continue
+                                self._debug(
+                                    f"Fight {card_name} pairing our={_fight[0]} enemy={_fight[1]} (profile={fight_profile})."
                                 )
                             type_priority = self._card_type_priority(card_types)
                             cast_actions.append(
