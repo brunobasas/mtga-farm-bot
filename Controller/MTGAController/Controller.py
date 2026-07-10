@@ -1963,6 +1963,38 @@ class Controller(ControllerSecondary):
             return True
         return False
 
+    def _queue_from_event_landing(self, target_colors: str) -> bool:
+        """Re-queue directly from the Starter Deck Duel event landing page.
+
+        After a match MTGA returns to the event's own page (not Home), which has
+        its own Play button. The Home->Events->banner navigation can't start from
+        here (there is no Events tab), so the bot would stall. This clicks that
+        Play button, swapping to the quest-matched deck first. Template-gated on
+        Buttons/event_play.png, so it is a no-op on any other screen and the
+        caller can fall back to full navigation.
+        """
+        event_play = os.path.join(self._buttons_dir(), "event_play.png")
+        if not os.path.exists(event_play):
+            return False
+        # Play button at the bottom-right of the event page (1920x1080 frame).
+        event_play_roi = (1400, 900, 520, 180)
+        # Confirm we are actually on the event page before touching the deck box.
+        if self._locate_image_center_in_scaled_arena_region(
+            event_play, "STARTER_EVENT_PLAY_PROBE", rel_region=event_play_roi,
+            confidence=0.80, timeout=1.0,
+        ) is None:
+            return False
+        # Swap to the deck that best advances the top quest, then queue.
+        self._swap_starter_deck_for_quest(target_colors)
+        if self._click_image_in_scaled_arena_region(
+            event_play, "STARTER_EVENT_PLAY", rel_region=event_play_roi,
+            confidence=0.80, timeout=2.0,
+        ):
+            bot_logger.log_info("Starter: re-queued from event landing page via Play button.")
+            time.sleep(1.0)
+            return True
+        return False
+
     def _navigate_starter_deck(self) -> bool:
         """Navigate Home -> Play -> Events -> In Progress -> Starter Deck Duel.
 
@@ -2019,6 +2051,11 @@ class Controller(ControllerSecondary):
         if not self._click_image_in_scaled_arena_region(
             events_tpl, "STARTER_EVENTS", rel_region=events_tab_roi, confidence=0.74, timeout=2.0
         ):
+            # Not in the Play blade. We may already be on the event landing page
+            # (MTGA returns here after each match) -- re-queue from its Play
+            # button instead of stalling.
+            if self._queue_from_event_landing(target_colors):
+                return True
             bot_logger.log_info("Starter: Events tab not found (not in Play blade yet); will retry.")
             return False
         time.sleep(0.8)
