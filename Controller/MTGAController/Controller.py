@@ -5176,6 +5176,11 @@ class Controller(ControllerSecondary):
             bottom_y = int(group_center_y + ((n - 1) / 2.0) * spacing_y)
             base_point = (center_x, bottom_y)
             self.__last_modal_choice_ts = now
+            # Pause the decision loop while we resolve the modal, so a running
+            # hand/board scan does not move the mouse and race the modal click
+            # (mirrors the scry/GroupReq handler). Without this the click could
+            # land off the "Lose 3 life" plate and the choice would not register.
+            self.__group_req_active_until = now + 5.0
             bot_logger.log_info(
                 f"MODAL_CHOICE: {n} option(s) (source={source_id}) -> clicking bottom "
                 f"(lose life) at base={base_point}"
@@ -5196,8 +5201,11 @@ class Controller(ControllerSecondary):
                 except Exception as e:
                     bot_logger.log_error(f"Modal choice click execution failed: {e}")
 
-            # Let the "Choose One" overlay finish animating in before clicking.
-            threading.Timer(0.8, _click_bottom).start()
+            # Let the "Choose One" overlay finish animating in before clicking. If
+            # this click misses, MTGA re-sends the prompt while the modal is still
+            # open and this handler fires again (after the 2s throttle) to retry --
+            # so we never blind-click the board after it resolves.
+            threading.Timer(1.0, _click_bottom).start()
         except Exception as e:
             bot_logger.log_error(f"Failed to handle modal choice: {e}")
 
