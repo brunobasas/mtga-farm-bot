@@ -1,10 +1,14 @@
-"""Play policy: cards the bot should NOT cast yet because they trigger an
-in-resolution card chooser (graveyard / exile / library / revealed hand) that
-the bot cannot click through, which stalls the game.
+"""Play policy: cards the bot should NOT cast.
 
-Remove entries here as those choosers get implemented. Two layers, manual-first:
-  1. UNSUPPORTED_GRP_IDS  -- exact grpIds, always block.
-  2. oracle-text patterns -- catch the common phrasings automatically.
+Two reasons a card lands here:
+  * it triggers an in-resolution card chooser the bot cannot click through
+    (would stall the game), or
+  * it is a reactive card with no good proactive line, so casting it on our own
+    turn just wastes it (STRATEGIC_SKIP_GRP_IDS).
+
+Layers, manual-first:
+  1. UNSUPPORTED_GRP_IDS / STRATEGIC_SKIP_GRP_IDS -- exact grpIds, always block.
+  2. oracle-text patterns -- catch the common stall phrasings automatically.
 """
 
 from __future__ import annotations
@@ -16,6 +20,15 @@ import AI.Utilities.CardInfo as CardInfo
 # Exact grpIds we never cast for now (manual override / guaranteed catch).
 UNSUPPORTED_GRP_IDS: set[int] = {
     93756,  # Inspiration from Beyond -- return an instant/sorcery from graveyard
+}
+
+# Cards we deliberately never cast: reactive-only tricks with no reliable
+# proactive line. Casting them on our turn wastes them.
+STRATEGIC_SKIP_GRP_IDS: set[int] = {
+    # Undying Malice -- "target creature gains 'when it dies, return it with a
+    # +1/+1 counter'." Only worth it in response to removal targeting our
+    # creature; that reactive read is too situational to automate reliably.
+    78934, 93677,
 }
 
 # Oracle-text patterns for effects that pop an unclickable card chooser during
@@ -39,7 +52,7 @@ def is_unsupported_to_cast(grp_id) -> bool:
         grp_id = int(grp_id)
     except Exception:
         return False
-    if grp_id in UNSUPPORTED_GRP_IDS:
+    if grp_id in UNSUPPORTED_GRP_IDS or grp_id in STRATEGIC_SKIP_GRP_IDS:
         return True
     try:
         text = CardInfo.get_oracle_text(grp_id) or ""
