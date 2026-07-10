@@ -6128,12 +6128,13 @@ class Controller(ControllerSecondary):
                         source_id, chooser_target, reason="SelectTargetsReq(chooser)"
                     )
                 else:
-                    legal_creature_ids, face_legal = self.__analyze_legal_targets(req)
+                    opp_creatures, own_creatures, face_legal = self.__analyze_legal_targets(req)
                     self.__schedule_target_selection(
                         source_id,
                         reason="SelectTargetsReq",
-                        legal_creature_ids=legal_creature_ids,
+                        legal_creature_ids=opp_creatures,
                         face_legal=face_legal,
+                        own_creature_ids=own_creatures,
                     )
         except Exception as e:
             bot_logger.log_error(f"Failed to handle SelectTargetsReq: {e}")
@@ -6606,15 +6607,18 @@ class Controller(ControllerSecondary):
         except Exception as e:
             bot_logger.log_error(f"Target debug bundle failed: {e}")
 
-    def __analyze_legal_targets(self, req) -> tuple[list[int], bool]:
-        """From a SelectTargetsReq, return (legal enemy-creature instanceIds,
-        whether an opponent player/face is a legal target).
+    def __analyze_legal_targets(self, req) -> tuple[list[int], list[int], bool]:
+        """From a SelectTargetsReq, classify the legal targets into
+        (enemy-creature ids, friendly-creature ids, is-a-player/face-legal).
 
-        MTGA only ever lists *legal* targets in the request, so this is the
-        ground truth for what a click may land on. When the face is not among
-        them (e.g. "Destroy target creature"), clicking the avatar is illegal
-        and would stall the game -- the caller must pick a creature instead."""
-        creature_ids: list[int] = []
+        MTGA only lists *legal* targets, so this is the ground truth for what a
+        click may land on. Off-battlefield targets (creature spells on the stack)
+        are already routed to the chooser before this runs, so any creature here
+        is a battlefield permanent -- clickable on our or the opponent's row.
+        When the face is not a legal target, clicking the avatar is illegal and
+        would stall, so the caller must pick a creature (ours or theirs)."""
+        opp_creatures: list[int] = []
+        own_creatures: list[int] = []
         face_legal = False
         try:
             game_objects = self.updated_game_state.get_game_objects() or []
@@ -6625,13 +6629,6 @@ class Controller(ControllerSecondary):
                 p.get("systemSeatNumber")
                 for p in (self.updated_game_state.get_players() or [])
             }
-            bf_zone_ids = set()
-            try:
-                for zone in self.updated_game_state.get_full_state().get("zones", []) or []:
-                    if zone.get("type") == "ZoneType_Battlefield" and zone.get("zoneId") is not None:
-                        bf_zone_ids.add(zone.get("zoneId"))
-            except Exception:
-                bf_zone_ids = set()
             for group in req.get("targets", []) or []:
                 for tgt in group.get("targets", []) or []:
                     if tgt.get("legalAction") != "SelectAction_Select":
@@ -6640,19 +6637,11 @@ class Controller(ControllerSecondary):
                     if tid is None:
                         continue
                     obj = obj_by_id.get(tid)
-                    # Only a creature *on the battlefield* is clickable via the
-                    # battlefield scan. A creature spell on the stack (a counter
-                    # target) is off-battlefield and handled by the chooser path.
-                    # If we could not resolve battlefield zones, don't exclude
-                    # creatures (keep the removal anti-stall behaviour).
-                    on_battlefield = (not bf_zone_ids) or (obj.get("zoneId") in bf_zone_ids) if obj else False
-                    if (
-                        obj is not None
-                        and "CardType_Creature" in (obj.get("cardTypes") or [])
-                        and on_battlefield
-                    ):
-                        if obj.get("controllerSeatId") != self.__system_seat_id:
-                            creature_ids.append(int(tid))
+                    if obj is not None and "CardType_Creature" in (obj.get("cardTypes") or []):
+                        if obj.get("controllerSeatId") == self.__system_seat_id:
+                            own_creatures.append(int(tid))
+                        else:
+                            opp_creatures.append(int(tid))
                     elif tid in player_seats and tid != self.__system_seat_id:
                         face_legal = True
                     elif obj is None:
@@ -6661,7 +6650,7 @@ class Controller(ControllerSecondary):
                         face_legal = True
         except Exception as e:
             bot_logger.log_error(f"analyze_legal_targets failed: {e}")
-        return creature_ids, face_legal
+        return opp_creatures, own_creatures, face_legal
 
     def __best_creature_among(self, candidate_ids) -> int | None:
         """Pick the enemy creature with the highest effective toughness (power as
@@ -6732,10 +6721,10 @@ class Controller(ControllerSecondary):
             bot_logger.log_error(f"Failed to resolve removal target: {e}")
             return None
 
-    def __schedule_creature_target_selection(self, source_id, creature_id, reason):
-        """Target an enemy creature (removal): click it on the opponent's
-        battlefield via hover-scan, then submit. Mirrors the avatar flow's
-        pending/submit machinery."""
+    def __schedule_creature_target_selection(self, source_id, creature_id, reason, *, friendly=False):
+        """Target a creature: click it via hover-scan, then submit. Clicks our own
+        battlefield row when `friendly` (a "target creature you control" spell),
+        otherwise the opponent's row. Mirrors the avatar flow's pending/submit."""
         now = time.time()
         if self._suppress_selections or self._stop_requested:
             return
@@ -6743,7 +6732,8 @@ class Controller(ControllerSecondary):
         self.__last_target_select_ts = now
         self.__update_pending_target_select(source_id)
         selection_token = (self.__pending_target_select or {}).get("token")
-        bot_logger.log_info(f"{reason}: targeting enemy creature instanceId={creature_id}")
+        side = "friendly" if friendly else "enemy"
+        bot_logger.log_info(f"{reason}: targeting {side} creature instanceId={creature_id}")
 
         def _valid() -> bool:
             if self._suppress_selections or self._stop_requested:
@@ -6763,11 +6753,14 @@ class Controller(ControllerSecondary):
                 return
             clicked = False
             try:
-                clicked = self.select_opponent_battlefield_permanent(creature_id, clicks=1)
+                if friendly:
+                    clicked = self.select_battlefield_permanent(creature_id, clicks=1)
+                else:
+                    clicked = self.select_opponent_battlefield_permanent(creature_id, clicks=1)
             except Exception as e:
                 bot_logger.log_error(f"Creature target click failed: {e}")
             bot_logger.log_info(
-                f"CREATURE_TARGET click: id={creature_id} found={clicked} attempt={attempt}"
+                f"CREATURE_TARGET click: id={creature_id} side={side} found={clicked} attempt={attempt}"
             )
             threading.Timer(0.5, _attempt_submit).start()
             if not clicked and attempt < 2 and _valid():
@@ -6995,6 +6988,7 @@ class Controller(ControllerSecondary):
         reason: str,
         legal_creature_ids: list[int] | None = None,
         face_legal: bool | None = None,
+        own_creature_ids: list[int] | None = None,
     ) -> None:
         now = time.time()
         if self._suppress_selections or self._stop_requested:
@@ -7004,6 +6998,10 @@ class Controller(ControllerSecondary):
         if self.__last_target_select_source_id == source_id and now - self.__last_target_select_ts < 1.0:
             return
         removal_target = self.__resolve_removal_target(source_id)
+        bot_logger.log_info(
+            f"{reason}: target decision -- removal_target={removal_target} "
+            f"opp_creatures={legal_creature_ids} own_creatures={own_creature_ids} face_legal={face_legal}"
+        )
 
         # Reconcile the profile-based result with the prompt's explicit legal
         # targets. This makes creature removal robust even when we have no oracle
@@ -7026,7 +7024,7 @@ class Controller(ControllerSecondary):
                 if replacement is not None:
                     bot_logger.log_info(
                         f"{reason}: no removal profile and face not a legal target; "
-                        f"picking highest-toughness legal creature {replacement} "
+                        f"picking highest-toughness enemy creature {replacement} "
                         f"of {legal_creature_ids}."
                     )
                     removal_target = replacement
@@ -7034,6 +7032,21 @@ class Controller(ControllerSecondary):
         if removal_target is not None and removal_target != RemovalLogic.FACE_TARGET:
             self.__schedule_creature_target_selection(source_id, removal_target, reason)
             return
+
+        # No enemy-creature/face target. If the face is not legal but the spell
+        # can target a creature WE control (e.g. Undying Malice), pick our best
+        # creature and click our own battlefield -- never the avatar.
+        if not face_legal and not legal_creature_ids and own_creature_ids:
+            own_target = self.__best_creature_among(own_creature_ids)
+            if own_target is not None:
+                bot_logger.log_info(
+                    f"{reason}: face not legal; targeting our own creature "
+                    f"{own_target} of {own_creature_ids}."
+                )
+                self.__schedule_creature_target_selection(
+                    source_id, own_target, reason, friendly=True
+                )
+                return
         self.__last_target_select_source_id = source_id
         self.__last_target_select_ts = now
         self.__update_pending_target_select(source_id)
@@ -7415,12 +7428,13 @@ class Controller(ControllerSecondary):
                         reason="SelectTargetsReq (from game state, chooser)",
                     )
                     return
-                legal_creature_ids, face_legal = self.__analyze_legal_targets(req)
+                opp_creatures, own_creatures, face_legal = self.__analyze_legal_targets(req)
                 self.__schedule_target_selection(
                     source_id,
                     reason="SelectTargetsReq (from game state)",
-                    legal_creature_ids=legal_creature_ids,
+                    legal_creature_ids=opp_creatures,
                     face_legal=face_legal,
+                    own_creature_ids=own_creatures,
                 )
                 return
             for message in messages:
