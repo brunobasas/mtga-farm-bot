@@ -37,12 +37,23 @@ def get_state_from_playerlog(log_tail: str) -> BotState:
         return BotState.UNKNOWN
 
     lowered = text.lower()
-    if "gremessagetype_gamestatemessage" in lowered:
+    # A GameStateMessage means we're in a match -- but ONLY if it's more recent
+    # than the last "left the match" marker (a menu/event scene load, MainNav, or
+    # MatchCompleted). Otherwise a match's game-state messages linger in the tail
+    # and keep reporting IN_GAME long after we returned to a menu, which stalls
+    # the post-match queue/reward flow.
+    gsm_pos = lowered.rfind("gremessagetype_gamestatemessage")
+    scene_iter = list(re.finditer(r'"toSceneName"\s*:\s*"([^"]+)"', text))
+    left_pos = max(
+        lowered.rfind("mainnav load in"),
+        lowered.rfind("matchgameroomstatetype_matchcompleted"),
+        (scene_iter[-1].start() if scene_iter else -1),
+    )
+    if gsm_pos != -1 and gsm_pos > left_pos:
         return BotState.IN_GAME
 
-    scene_matches = re.findall(r'"toSceneName"\s*:\s*"([^"]+)"', text)
-    if scene_matches:
-        scene = scene_matches[-1].strip().lower()
+    if scene_iter:
+        scene = scene_iter[-1].group(1).strip().lower()
         for key, value in _SCENE_MAP.items():
             if key in scene:
                 return value
