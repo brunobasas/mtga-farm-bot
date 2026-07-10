@@ -5180,32 +5180,62 @@ class Controller(ControllerSecondary):
             # hand/board scan does not move the mouse and race the modal click
             # (mirrors the scry/GroupReq handler). Without this the click could
             # land off the "Lose 3 life" plate and the choice would not register.
-            self.__group_req_active_until = now + 5.0
+            self.__group_req_active_until = now + 6.0
+            # Snapshot the turn state so retries stop once the modal resolves (the
+            # game advances past this step) -- avoids clicking the board after.
+            snap_ti = {}
+            try:
+                snap_ti = dict(self.updated_game_state.get_turn_info() or {})
+            except Exception:
+                snap_ti = {}
+            snap_key = (
+                snap_ti.get("turnNumber"), snap_ti.get("phase"),
+                snap_ti.get("step"), snap_ti.get("decisionPlayer"),
+            )
             bot_logger.log_info(
                 f"MODAL_CHOICE: {n} option(s) (source={source_id}) -> clicking bottom "
                 f"(lose life) at base={base_point}"
             )
 
-            def _click_bottom() -> None:
+            def _modal_still_open() -> bool:
+                # Resolved if the turn state moved on from the modal's step.
+                try:
+                    ti = self.updated_game_state.get_turn_info() or {}
+                except Exception:
+                    return True
+                cur = (
+                    ti.get("turnNumber"), ti.get("phase"),
+                    ti.get("step"), ti.get("decisionPlayer"),
+                )
+                return cur == snap_key
+
+            def _click_bottom(attempt: int = 0) -> None:
                 try:
                     if self._suppress_selections or self._stop_requested:
                         return
+                    if attempt > 0 and not _modal_still_open():
+                        bot_logger.log_info(
+                            f"MODAL_CHOICE: modal resolved before retry {attempt}; stopping."
+                        )
+                        return
                     target, src = self._map_abs_point_to_arena(base_point, label="MODAL_LOSE_LIFE")
                     bot_logger.log_info(
-                        f"MODAL_CHOICE click: base={base_point} target={target} src={src}"
+                        f"MODAL_CHOICE click (attempt {attempt}): base={base_point} target={target} src={src}"
                     )
                     bot_logger.log_click(target[0], target[1], "MODAL_LOSE_LIFE")
                     self.input.move_abs(target[0], target[1])
                     time.sleep(0.3)
                     self.input.left_click(1)
+                    # Retry a couple of times in case the click landed mid-animation
+                    # or did not register; guarded by _modal_still_open so we never
+                    # click the board once it resolves.
+                    if attempt < 2:
+                        threading.Timer(1.4, lambda: _click_bottom(attempt + 1)).start()
                 except Exception as e:
                     bot_logger.log_error(f"Modal choice click execution failed: {e}")
 
-            # Let the "Choose One" overlay finish animating in before clicking. If
-            # this click misses, MTGA re-sends the prompt while the modal is still
-            # open and this handler fires again (after the 2s throttle) to retry --
-            # so we never blind-click the board after it resolves.
-            threading.Timer(1.0, _click_bottom).start()
+            # Let the "Choose One" overlay finish animating in before clicking.
+            threading.Timer(1.0, lambda: _click_bottom(0)).start()
         except Exception as e:
             bot_logger.log_error(f"Failed to handle modal choice: {e}")
 
