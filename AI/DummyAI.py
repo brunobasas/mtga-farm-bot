@@ -2,6 +2,9 @@ from AI.AIInterface import AIKernel
 from Controller.Utilities.GameState import GameState
 from Controller.Utilities.GameStateInterface import GameStateSecondary
 import AI.Utilities.CardInfo as CardInfo
+import AI.Utilities.RemovalLogic as RemovalLogic
+import AI.Utilities.CardPolicy as CardPolicy
+import AI.Utilities.CounterLogic as CounterLogic
 import traceback
 from datetime import datetime
 
@@ -445,6 +448,60 @@ class DummyAI(AIKernel):
             return 2
         return 1
 
+    def _find_counter_cast(
+        self,
+        action_list,
+        game_state,
+        inst_id_grp_id_dict,
+        my_seat,
+        available_colors,
+        total_mana,
+        sources,
+    ):
+        """If the opponent has a spell on the stack we can counter and we hold a
+        payable counterspell, return that counter's instanceId. Reactive: works
+        on either player's turn as long as we have priority."""
+        try:
+            full_state = game_state.get_full_state() or {}
+            stack_ids = CounterLogic.stack_zone_ids(full_state)
+            if not stack_ids:
+                return None
+            game_objects = game_state.get_game_objects() or []
+            if not CounterLogic.opponent_spells_on_stack(game_objects, my_seat, stack_ids):
+                return None
+
+            for action_wrapper in action_list:
+                action = action_wrapper.get('action', {})
+                if action.get('actionType') != 'ActionType_Cast':
+                    continue
+                instance_id = action.get('instanceId')
+                grp_id = action.get('grpId') or inst_id_grp_id_dict.get(instance_id)
+                profile = CounterLogic.get_counter_profile(grp_id)
+                if not profile:
+                    continue
+                target = CounterLogic.find_counterable_spell(
+                    profile, game_objects, my_seat, stack_ids, full_state
+                )
+                if target is None:
+                    continue
+                action_mana_cost = action.get('manaCost', [])
+                if not self._can_cast_with_mana_costs(
+                    action_mana_cost, available_colors, total_mana, sources
+                ):
+                    self._debug(
+                        f"Counter available but not payable (grpId={grp_id})."
+                    )
+                    continue
+                card_info = CardInfo.get_card_info(grp_id) or {}
+                self._debug(
+                    f"COUNTER: casting {card_info.get('name', grp_id)} "
+                    f"(instanceId={instance_id}) to counter spell {target} (profile={profile})."
+                )
+                return instance_id
+        except Exception as e:
+            self._debug(f"ERROR in _find_counter_cast: {e}")
+        return None
+
     def generate_move(self, game_state: GameStateSecondary, inst_id_grp_id_dict) -> dict[str, list[int]]:
         move = {'resolve': []}
 
@@ -498,6 +555,17 @@ class DummyAI(AIKernel):
                 self._debug(f"Not our priority (priority={priority_player}, my_seat={my_seat})")
                 self._debug(f"Returning default move: {move}")
                 return move
+
+            # Reactive counterspell: if the opponent has a counterable spell on
+            # the stack and we hold a payable counter, cast it now. This runs on
+            # either player's turn (we just need priority), so it is checked
+            # before the proactive/own-turn block below.
+            counter_instance_id = self._find_counter_cast(
+                action_list, game_state, inst_id_grp_id_dict, my_seat,
+                available_colors, total_mana, sources,
+            )
+            if counter_instance_id is not None:
+                return {'cast': [counter_instance_id]}
 
             # Only do proactive actions (play land / cast / attack) on our active turn.
             if active_player == my_seat and decision_player == my_seat:
@@ -558,6 +626,23 @@ class DummyAI(AIKernel):
                     # Second: cast any spell to maximize mana usage (category-agnostic)
                     cast_actions = []
                     convoke_colors, convoke_sources = self._get_convoke_sources(game_state, my_seat)
+                    # Targeted-removal context (shared with the Controller's
+                    # target selection via RemovalLogic).
+                    removal_game_objects = game_state.get_game_objects() or []
+                    try:
+                        removal_opp_life = RemovalLogic.opponent_life_from_players(
+                            game_state.get_players(), my_seat
+                        )
+                    except Exception:
+                        removal_opp_life = None
+                    removal_bf_ids = set()
+                    try:
+                        for _zone in (game_state.get_full_state().get('zones', []) or []):
+                            if _zone.get('type') == 'ZoneType_Battlefield' and _zone.get('zoneId') is not None:
+                                removal_bf_ids.add(_zone.get('zoneId'))
+                    except Exception:
+                        removal_bf_ids = set()
+                    removal_bf_ids = removal_bf_ids or None
                     allow_sorcery = phase in ['Phase_Main1', 'Phase_Main2']
                     sorcery_found = 0
                     sorcery_castable = 0
@@ -585,6 +670,14 @@ class DummyAI(AIKernel):
                             continue
 
                         card_name = card_info.get('name', f'Card#{instance_id}')
+                        # Do not cast cards whose in-resolution card chooser
+                        # (e.g. return-from-graveyard) is not implemented yet;
+                        # the bot cannot click it and would stall the game.
+                        if CardPolicy.is_unsupported_to_cast(grp_id):
+                            self._debug(
+                                f"Skipping {card_name}: in-resolution chooser not implemented yet."
+                            )
+                            continue
                         mana_cost_str = card_info.get('manaCost', '')
                         nominal_cmc = CardInfo.calculate_cmc(mana_cost_str)
                         paid_cost = self._mana_cost_total(action_mana_cost)
@@ -601,6 +694,25 @@ class DummyAI(AIKernel):
 
                         # Check if we can pay the mana cost (color + total)
                         if self._can_cast_with_mana_costs(action_mana_cost, eff_colors, eff_total_mana, eff_sources):
+                            # Targeted removal: only cast it if it has a valid
+                            # target (kills a creature, or is lethal to the face).
+                            removal_profile = RemovalLogic.get_removal_profile(grp_id)
+                            if removal_profile is not None:
+                                _rm_target = RemovalLogic.choose_removal_target(
+                                    removal_profile,
+                                    removal_game_objects,
+                                    my_seat,
+                                    opponent_life=removal_opp_life,
+                                    battlefield_zone_ids=removal_bf_ids,
+                                )
+                                if _rm_target is None:
+                                    self._debug(
+                                        f"Removal {card_name} has no killable target; skipping cast."
+                                    )
+                                    continue
+                                self._debug(
+                                    f"Removal {card_name} target={_rm_target} (profile={removal_profile})."
+                                )
                             type_priority = self._card_type_priority(card_types)
                             cast_actions.append(
                                 (

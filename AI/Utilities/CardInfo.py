@@ -8,6 +8,12 @@ from pathlib import Path
 
 from runtime_paths import ensure_runtime_subdir
 
+# Scryfall now rejects (HTTP 400) any request missing an Accept header in
+# addition to User-Agent. Sending only User-Agent made every card/oracle
+# lookup fail, and the failures were cached as empty strings -- which is why
+# removal detection (and anything else needing oracle text) silently broke.
+_SCRYFALL_HEADERS = {"User-Agent": "MTGABot/1.0", "Accept": "application/json"}
+
 
 def _app_root_dir() -> str:
     if getattr(sys, "frozen", False):
@@ -141,7 +147,7 @@ def _save_missing_cards(ids: list[int]) -> None:
 def _fetch_card_info_from_scryfall(arena_id: int) -> dict | None:
     try:
         url = f"https://api.scryfall.com/cards/arena/{arena_id}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'MTGABot/1.0'})
+        req = urllib.request.Request(url, headers=_SCRYFALL_HEADERS)
         with urllib.request.urlopen(req, timeout=8) as response:
             data = json.loads(response.read().decode('utf-8'))
         # Normalize to the fields the bot uses from cards.json
@@ -187,7 +193,7 @@ def refresh_cards_from_scryfall_bulk_if_needed() -> None:
     try:
         req = urllib.request.Request(
             "https://api.scryfall.com/bulk-data",
-            headers={"User-Agent": "MTGABot/1.0"},
+            headers=_SCRYFALL_HEADERS,
         )
         with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode("utf-8"))
@@ -209,7 +215,7 @@ def refresh_cards_from_scryfall_bulk_if_needed() -> None:
         return
 
     try:
-        req = urllib.request.Request(download_uri, headers={"User-Agent": "MTGABot/1.0"})
+        req = urllib.request.Request(download_uri, headers=_SCRYFALL_HEADERS)
         with urllib.request.urlopen(req, timeout=30) as response:
             bulk_cards = json.loads(response.read().decode("utf-8"))
     except Exception:
@@ -297,7 +303,7 @@ def get_produced_mana_from_scryfall(arena_id: int):
     # Fetch from Scryfall
     try:
         url = f"https://api.scryfall.com/cards/arena/{arena_id}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'MTGABot/1.0'})
+        req = urllib.request.Request(url, headers=_SCRYFALL_HEADERS)
         with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read().decode('utf-8'))
             produced_mana = data.get('produced_mana', [])
@@ -307,10 +313,14 @@ def get_produced_mana_from_scryfall(arena_id: int):
             _save_scryfall_cache()
 
             return produced_mana
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, Exception):
-        # Cache None to avoid repeated failed requests
-        _scryfall_cache[cache_key] = None
-        _save_scryfall_cache()
+    except urllib.error.HTTPError as e:
+        # Only a genuine 404 is worth caching as "no data"; other statuses are
+        # transient and must not poison the cache (see oracle-cache note above).
+        if e.code == 404:
+            _scryfall_cache[cache_key] = None
+            _save_scryfall_cache()
+        return None
+    except (urllib.error.URLError, json.JSONDecodeError, Exception):
         return None
 
 
@@ -324,16 +334,24 @@ def get_oracle_text_from_scryfall(arena_id: int):
         return _scryfall_oracle_cache[cache_key]
     try:
         url = f"https://api.scryfall.com/cards/arena/{arena_id}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'MTGABot/1.0'})
+        req = urllib.request.Request(url, headers=_SCRYFALL_HEADERS)
         with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read().decode('utf-8'))
             oracle_text = data.get('oracle_text', '') or ''
             _scryfall_oracle_cache[cache_key] = oracle_text
             _save_scryfall_oracle_cache()
             return oracle_text
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, Exception):
-        _scryfall_oracle_cache[cache_key] = ""
-        _save_scryfall_oracle_cache()
+    except urllib.error.HTTPError as e:
+        # 404 = this arena_id genuinely isn't on Scryfall; cache the miss so we
+        # don't hammer it. Any other HTTP status (e.g. transient 429/500, or the
+        # old 400 header bug) must NOT be cached, or one bad response poisons the
+        # entry forever.
+        if e.code == 404:
+            _scryfall_oracle_cache[cache_key] = ""
+            _save_scryfall_oracle_cache()
+        return ""
+    except (urllib.error.URLError, json.JSONDecodeError, Exception):
+        # Network/parse failure: transient, do not poison the cache.
         return ""
 
 
@@ -408,6 +426,19 @@ _card_data = _load_json_with_fallback(
 if not isinstance(_card_data, list):
     _card_data = []
 
+# Curated Starter Deck Duel card DB (grpId -> full info incl. oracle text) for
+# exactly the ten Foundations Starter Decks. Committed and offline: the MTGA
+# export (cards.json) carries no oracle text and Starter Deck Duel only ever
+# uses these cards, so this is consulted first and removes the live-Scryfall
+# dependency during matches. Regenerate with tools/build_starter_deck_cards.py.
+_starter_cards = _load_json_with_fallback(
+    _resource_data_path("starter_deck_cards.json"),
+    "",
+    {},
+)
+if not isinstance(_starter_cards, dict):
+    _starter_cards = {}
+
 
 def reload_cards_from_disk() -> None:
     """Reload cards.json into memory after an export/update."""
@@ -421,6 +452,41 @@ def reload_cards_from_disk() -> None:
         _card_data = data
 
 
+def warm_up_starter_data() -> dict:
+    """Eagerly load the curated Starter Deck Duel card DB and pre-resolve the
+    removal/counter profiles for every card in it.
+
+    Called once at bot startup. It pays the JSON parse + profile scan cost
+    (~0.2s) up front, instead of on the first in-game decision, and validates
+    the data is present. Returns a summary dict for logging.
+    """
+    global _starter_cards
+    if not isinstance(_starter_cards, dict) or not _starter_cards:
+        _starter_cards = _load_json_with_fallback(
+            _resource_data_path("starter_deck_cards.json"), "", {}
+        )
+        if not isinstance(_starter_cards, dict):
+            _starter_cards = {}
+
+    removal = counter = 0
+    # Local imports: RemovalLogic/CounterLogic import this module, so importing
+    # them at module load time would be circular. At call time both exist.
+    try:
+        import AI.Utilities.RemovalLogic as RemovalLogic
+        import AI.Utilities.CounterLogic as CounterLogic
+        for gid in _starter_cards:
+            try:
+                if RemovalLogic.get_removal_profile(int(gid)):
+                    removal += 1
+                if CounterLogic.get_counter_profile(int(gid)):
+                    counter += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return {"cards": len(_starter_cards), "removal": removal, "counter": counter}
+
+
 def get_card_info(mtga_id: int):
     """
     Parameters
@@ -428,6 +494,11 @@ def get_card_info(mtga_id: int):
     Returns
         A dictionary object containing full info of the card that has the specified MTGA id
     """
+    # Curated Starter Deck Duel data first: it has oracle text (which the MTGA
+    # export lacks) and covers every card that can appear in this mode.
+    starter = _starter_cards.get(str(mtga_id))
+    if starter:
+        return starter
     for card in _card_data:
         if card.get("grpId") == mtga_id:
             return card

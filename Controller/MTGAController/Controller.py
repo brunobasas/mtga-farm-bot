@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from Controller.ControllerInterface import ControllerSecondary
+import AI.Utilities.RemovalLogic as RemovalLogic
 from Controller.MTGAController.LogReader import LogReader
 from Controller.Utilities.GameState import GameState
 from Controller.Utilities.input_controller import InputControllerError, create_input_controller
@@ -78,7 +79,13 @@ class Controller(ControllerSecondary):
             'match_completed': 'MatchGameRoomStateType_MatchCompleted',
             'assign_damage': '"type": "GREMessageType_AssignDamageReq"',
             'declare_attackers': '"type": "GREMessageType_DeclareAttackersReq"',
+            # Defending: we have no blocking logic yet, so we just declare no
+            # blocks to avoid freezing on 'Choose blockers'.
+            'declare_blockers': '"type": "GREMessageType_DeclareBlockersReq"',
             'select_n': '"type": "GREMessageType_SelectNReq"',
+            # Scry/surveil and other ordered-grouping prompts. We only click
+            # Done for now so the bot does not stall on them.
+            'group_req': '"type": "GREMessageType_GroupReq"',
             'select_targets': '"type": "GREMessageType_SelectTargetsReq"',
             'pay_costs': '"type": "GREMessageType_PayCostsReq"',
             # Optional casting-time costs (Kicker etc.): MTGA blocks the cast
@@ -150,6 +157,15 @@ class Controller(ControllerSecondary):
             int(1080 * 0.90),
         )
         self.battlefield_scan_step = 55
+        # Opponent battlefield = upper arena band (mirror of ours). Calibrated
+        # from a full-res board capture: the enemy creature row sits between the
+        # opponent's lands and the centre divider (~y 0.24-0.45), full width.
+        self.opponent_battlefield_scan_p1 = (int(1920 * 0.10), int(1080 * 0.24))
+        self.opponent_battlefield_scan_p2 = (int(1920 * 0.92), int(1080 * 0.45))
+        # Central 'choose a card' overlay (graveyard/exile target choosers,
+        # e.g. Zombify). First estimate -- NEEDS IN-GAME CALIBRATION.
+        self.chooser_scan_p1 = (int(1920 * 0.20), int(1080 * 0.29))
+        self.chooser_scan_p2 = (int(1920 * 0.78), int(1080 * 0.70))
         self.stack_scan_p1 = (
             int(1920 * 0.65),
             int(1080 * 0.25),
@@ -285,6 +301,10 @@ class Controller(ControllerSecondary):
         self.__target_submit_cooldown_sec = 1.0
         self.__pending_pay_costs_ts = 0.0
         self.__last_casting_time_options_ts = 0.0
+        self.__last_modal_choice_ts = 0.0
+        self.__last_group_req_ts = 0.0
+        self.__group_req_active_until = 0.0
+        self.__last_declare_blockers_ts = 0.0
         self.__combat_recovery_key = None
         self.__combat_recovery_attempts = 0
         self.__declare_attackers_turn_key = ""
@@ -1920,6 +1940,29 @@ class Controller(ControllerSecondary):
         # is also used by the between-matches queue loop.
         return self._navigate_starter_deck()
 
+    def _dismiss_reward_popup(self) -> bool:
+        """Click 'Claim' on the Starter Deck Duel reward screen.
+
+        After winning games the event shows a full-window 'Reward' popup with a
+        Claim button; it covers the Play/Events controls, so the queue loop gets
+        stuck retrying navigation forever. This is template-gated (Buttons/claim.png)
+        so it is a safe no-op on any screen where the Claim button is absent.
+        """
+        if self._stop_requested:
+            return False
+        claim_btn = os.path.join(self._buttons_dir(), "claim.png")
+        if not os.path.exists(claim_btn):
+            return False
+        # Claim button sits at the bottom-right of the window (1920x1080 frame).
+        claim_roi = (1450, 850, 470, 230)
+        if self._click_image_in_scaled_arena_region(
+            claim_btn, "REWARD_CLAIM", rel_region=claim_roi, confidence=0.80, timeout=1.5
+        ):
+            bot_logger.log_info("Reward screen detected: clicked Claim to continue.")
+            time.sleep(1.0)
+            return True
+        return False
+
     def _navigate_starter_deck(self) -> bool:
         """Navigate Home -> Play -> Events -> In Progress -> Starter Deck Duel.
 
@@ -1935,6 +1978,11 @@ class Controller(ControllerSecondary):
         if self._stop_requested:
             return False
         if self._get_state_from_log() == BotState.IN_GAME:
+            return False
+
+        # A post-match reward popup covers the Play/Events controls; clear it
+        # first so navigation is not stuck retrying against a blocked screen.
+        if self._dismiss_reward_popup():
             return False
 
         # Decide up-front which deck colors advance the most valuable quest;
@@ -2493,6 +2541,8 @@ class Controller(ControllerSecondary):
             end_y = hand_p2[1]
 
             while current_hovered_id != card_id:
+                if self._stop_requested or self._suppress_selections or time.time() < self.__group_req_active_until:
+                    break
                 # Check if we have exceeded the scan area
                 current_x = self.input.position().x
                 if (direction == 1 and current_x >= end_x) or (direction == -1 and current_x <= end_x):
@@ -3058,6 +3108,8 @@ class Controller(ControllerSecondary):
             end_y = hand_p2[1]
 
             while current_hovered_id != card_id:
+                if self._stop_requested or self._suppress_selections or time.time() < self.__group_req_active_until:
+                    return False
                 current_x = self.input.position().x
                 if (direction == 1 and current_x >= end_x) or (direction == -1 and current_x <= end_x):
                     bot_logger.log_error(
@@ -3200,6 +3252,62 @@ class Controller(ControllerSecondary):
                 scan_end=scan_p2,
                 current_pos=(current_pos.x, current_pos.y),
                 current_hovered_id=None,
+            )
+            return False
+        finally:
+            bot_logger.set_hover_logging(False)
+
+    def _get_opponent_battlefield_scan_points_mapped(
+        self,
+        *,
+        force_reacquire: bool = False,
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        p1, _s1 = self._map_abs_point_to_arena(
+            self.opponent_battlefield_scan_p1,
+            label="OPP_BATTLEFIELD_SCAN_P1",
+            force_reacquire=force_reacquire,
+            apply_correction=False,
+        )
+        p2, _s2 = self._map_abs_point_to_arena(
+            self.opponent_battlefield_scan_p2,
+            label="OPP_BATTLEFIELD_SCAN_P2",
+            force_reacquire=False,
+            apply_correction=False,
+        )
+        bot_logger.log_info(
+            "OPP_BATTLEFIELD_SCAN mapped: arena={} raw_p1={} raw_p2={} mapped_p1={} mapped_p2={}".format(
+                self._arena_region,
+                self.opponent_battlefield_scan_p1,
+                self.opponent_battlefield_scan_p2,
+                p1,
+                p2,
+            )
+        )
+        return p1, p2
+
+    def select_opponent_battlefield_permanent(self, card_id: int, clicks: int = 1) -> bool:
+        """Select an opponent's permanent by hover-scanning the upper arena band
+        for the matching objectId. Mirror of select_battlefield_permanent.
+
+        NOTE: the scan region (opponent_battlefield_scan_p1/p2) is a first
+        estimate and needs in-game calibration.
+        """
+        bot_logger.set_hover_logging(True)
+        scan_p1, scan_p2 = self._get_opponent_battlefield_scan_points_mapped(force_reacquire=True)
+        try:
+            if self.__select_object_in_region(
+                card_id=card_id,
+                p1=scan_p1,
+                p2=scan_p2,
+                step=self.battlefield_scan_step,
+                clicks=clicks,
+                label="OPP_BATTLEFIELD_ITEM",
+                max_scan_sec=4.0,
+            ):
+                return True
+            bot_logger.log_error(
+                f"Opponent battlefield select failed for card_id={card_id} "
+                f"(scan {scan_p1}->{scan_p2}); region may need calibration."
             )
             return False
         finally:
@@ -4143,9 +4251,15 @@ class Controller(ControllerSecondary):
         elif pattern == self.patterns["declare_attackers"]:
             runtime_status.set_mode("in_game", bot_state=str(current_state))
             self.__handle_declare_attackers_req(line_containing_pattern)
+        elif pattern == self.patterns["declare_blockers"]:
+            runtime_status.set_mode("in_game", bot_state=str(current_state))
+            self.__handle_declare_blockers_req(line_containing_pattern)
         elif pattern == self.patterns["select_n"]:
             runtime_status.set_mode("in_game", bot_state=str(current_state))
             self.__handle_select_n_req(line_containing_pattern)
+        elif pattern == self.patterns["group_req"]:
+            runtime_status.set_mode("in_game", bot_state=str(current_state))
+            self.__handle_group_req(line_containing_pattern)
         elif pattern == self.patterns["select_targets"]:
             runtime_status.set_mode("in_game", bot_state=str(current_state))
             self.__handle_select_targets_req(line_containing_pattern)
@@ -4853,6 +4967,114 @@ class Controller(ControllerSecondary):
         time.sleep(0.2)
         self.input.left_click(1)
 
+    def __handle_modal_choose_last_option(self, n_options: int, source_id=None) -> None:
+        """Click the bottom button of a modal "Choose One" overlay.
+
+        Used for ability-resolution choices whose options are prompt-parameter
+        indices (no game object to click), e.g. Perforating Artist's "each
+        opponent loses 3 life unless they sacrifice/discard". The punitive
+        "lose life" option is always the last/bottom plate, so we click it.
+        Geometry is base-1920x1080, measured from a 3-option capture; the button
+        stack is vertically centered, so the bottom plate shifts predictably with
+        the option count (2 options when hand/board is empty).
+        """
+        try:
+            if self._suppress_selections or self._stop_requested:
+                bot_logger.log_info("Modal choice ignored: selections suppressed or stop requested.")
+                return
+            now = time.time()
+            if now - self.__last_modal_choice_ts < 2.0:
+                bot_logger.log_info("Modal choice ignored: duplicate within 2s window.")
+                return
+            n = max(1, int(n_options or 1))
+            group_center_y = 408
+            spacing_y = 107
+            center_x = 956
+            bottom_y = int(group_center_y + ((n - 1) / 2.0) * spacing_y)
+            base_point = (center_x, bottom_y)
+            self.__last_modal_choice_ts = now
+            bot_logger.log_info(
+                f"MODAL_CHOICE: {n} option(s) (source={source_id}) -> clicking bottom "
+                f"(lose life) at base={base_point}"
+            )
+
+            def _click_bottom() -> None:
+                try:
+                    if self._suppress_selections or self._stop_requested:
+                        return
+                    target, src = self._map_abs_point_to_arena(base_point, label="MODAL_LOSE_LIFE")
+                    bot_logger.log_info(
+                        f"MODAL_CHOICE click: base={base_point} target={target} src={src}"
+                    )
+                    bot_logger.log_click(target[0], target[1], "MODAL_LOSE_LIFE")
+                    self.input.move_abs(target[0], target[1])
+                    time.sleep(0.3)
+                    self.input.left_click(1)
+                except Exception as e:
+                    bot_logger.log_error(f"Modal choice click execution failed: {e}")
+
+            # Let the "Choose One" overlay finish animating in before clicking.
+            threading.Timer(0.8, _click_bottom).start()
+        except Exception as e:
+            bot_logger.log_error(f"Failed to handle modal choice: {e}")
+
+    def __handle_group_req(self, line: str) -> None:
+        """Scry / surveil / other ordered-grouping prompts. No reordering logic
+        for now -- just click Done so the bot does not stall. Leaving the cards
+        untouched keeps them in their default order (i.e. on top for scry)."""
+        try:
+            if self._suppress_selections or self._stop_requested:
+                bot_logger.log_info("GroupReq ignored: selections suppressed or stop requested.")
+                return
+            start = line.find("{")
+            if start == -1:
+                return
+            payload = json.loads(line[start:])
+            messages = payload.get("greToClientEvent", {}).get("greToClientMessages", [])
+            for message in messages:
+                if message.get("type") != "GREMessageType_GroupReq":
+                    continue
+                if self.__system_seat_id is None:
+                    return
+                seat_ids = message.get("systemSeatIds") or []
+                if self.__system_seat_id not in seat_ids:
+                    continue
+                context = (message.get("groupReq", {}) or {}).get("context", "")
+                now = time.time()
+                if now - self.__last_group_req_ts < 2.0:
+                    bot_logger.log_info("GroupReq ignored: duplicate within 2s window.")
+                    return
+                self.__last_group_req_ts = now
+                # A running decision/cast hand-scan moves the mouse and would
+                # race the Done click. Signal scans to abort and pause new
+                # decisions until the scry resolves.
+                self.__group_req_active_until = now + 6.0
+                bot_logger.log_info(f"GROUP_REQ ({context}): clicking Done (no reordering).")
+
+                def _click_done() -> None:
+                    try:
+                        if self._suppress_selections or self._stop_requested:
+                            return
+                        # "Done" button, centre-bottom of the scry/surveil overlay
+                        # (base 1920x1080; calibrated from a scry capture).
+                        base_point = (960, 886)
+                        target, src = self._map_abs_point_to_arena(base_point, label="SCRY_DONE")
+                        bot_logger.log_info(
+                            f"GROUP_REQ Done click: base={base_point} target={target} src={src}"
+                        )
+                        bot_logger.log_click(target[0], target[1], "SCRY_DONE")
+                        self.input.move_abs(target[0], target[1])
+                        time.sleep(0.3)
+                        self.input.left_click(1)
+                    except Exception as e:
+                        bot_logger.log_error(f"GroupReq Done click failed: {e}")
+
+                # Let the scry overlay finish animating in before clicking.
+                threading.Timer(0.8, _click_done).start()
+                return
+        except Exception as e:
+            bot_logger.log_error(f"Failed to handle GroupReq: {e}")
+
     def __handle_select_n_req(self, line: str) -> None:
         try:
             if self._suppress_selections or self._stop_requested:
@@ -4880,6 +5102,24 @@ class Controller(ControllerSecondary):
                 ids = list(req.get("ids", []) or [])
                 if not ids:
                     continue
+                # Modal "Choose One" from an ability resolution (e.g. Perforating
+                # Artist: "loses 3 life unless sacrifice/discard"). Options are
+                # prompt-parameter indices, not game objects, so the object-based
+                # selection paths below cannot resolve them and the bot would abort
+                # and stall. Policy: click the LAST option, which is the punitive
+                # "lose life" plate -- it is never filtered out and always renders
+                # at the bottom.
+                if (
+                    req.get("idType") == "IdType_PromptParameterIndex"
+                    and req.get("context") == "SelectionContext_Resolution"
+                ):
+                    self.__handle_modal_choose_last_option(
+                        len(ids), source_id=req.get("sourceId")
+                    )
+                    self.__clear_pending_select_n_state(
+                        "Modal choice: clicked last option (lose life)."
+                    )
+                    return
                 existing_pending = self.__pending_select_n if isinstance(self.__pending_select_n, dict) else None
                 same_pending = False
                 if existing_pending is not None:
@@ -5396,28 +5636,86 @@ class Controller(ControllerSecondary):
                 except Exception:
                     hand_zone = None
                 hand_ids = set(hand_zone.get("objectInstanceIds", []) or []) if hand_zone else set()
-                preferred_ids = [cid for cid in ids if cid in hand_ids]
-                candidate_ids = preferred_ids if preferred_ids else ids
-                target_id = candidate_ids[0]
 
-                def _do_cost_selection(card_id: int) -> None:
+                # Classify each candidate by zone so we click the right region.
+                # A "sacrifice a creature" cost lists battlefield permanents, not
+                # hand cards -- clicking the hand region for those silently fails
+                # and stalls the cast (the original bug with Arbiter of Woe).
+                game_objects = self.updated_game_state.get_game_objects() or []
+                obj_by_id = {
+                    o.get("instanceId"): o for o in game_objects if isinstance(o, dict)
+                }
+                bf_zone_ids = set()
+                try:
+                    for zone in self.updated_game_state.get_full_state().get("zones", []) or []:
+                        if zone.get("type") == "ZoneType_Battlefield" and zone.get("zoneId") is not None:
+                            bf_zone_ids.add(zone.get("zoneId"))
+                except Exception:
+                    bf_zone_ids = set()
+
+                def _on_our_battlefield(cid: int) -> bool:
+                    obj = obj_by_id.get(cid)
+                    return (
+                        bool(obj)
+                        and obj.get("zoneId") in bf_zone_ids
+                        and obj.get("controllerSeatId") == self.__system_seat_id
+                    )
+
+                hand_candidates = [cid for cid in ids if cid in hand_ids]
+                bf_candidates = [cid for cid in ids if _on_our_battlefield(cid)]
+
+                # Sacrifice the least valuable creature first (keep our bombs).
+                def _sac_value(cid: int):
+                    obj = obj_by_id.get(cid) or {}
+                    return (
+                        RemovalLogic.effective_toughness(obj) + RemovalLogic._stat(obj.get("power")),
+                        RemovalLogic._stat(obj.get("power")),
+                    )
+
+                bf_candidates.sort(key=_sac_value)
+
+                need = max(min_sel, 1)
+                if bf_candidates:
+                    chosen_ids, click_kind = bf_candidates[:need], "battlefield"
+                elif hand_candidates:
+                    chosen_ids, click_kind = hand_candidates[:need], "hand"
+                else:
+                    chosen_ids, click_kind = ids[:need], "unknown"
+
+                bot_logger.log_info(
+                    f"PayCostsReq paying via {click_kind}: {chosen_ids} (need {need} of {ids})"
+                )
+
+                def _do_cost_selection(card_ids: list[int], kind: str) -> None:
                     try:
                         if self._suppress_selections or self._stop_requested:
                             return
-                        selected = self.select_hand_card(card_id, clicks=1)
-                        if not selected:
-                            selected = self.select_hand_card_offset(card_id, clicks=1, y_offset=-120)
-                        if not selected:
-                            selected = self.select_hand_card_offset(card_id, clicks=1, y_offset=-200)
-                        if not selected:
-                            bot_logger.log_error(f"PayCostsReq selection failed for id={card_id}.")
-                            return
-                        time.sleep(0.35)
+                        for cid in card_ids:
+                            selected = False
+                            if kind == "hand":
+                                selected = self.select_hand_card(cid, clicks=1)
+                                if not selected:
+                                    selected = self.select_hand_card_offset(cid, clicks=1, y_offset=-120)
+                                if not selected:
+                                    selected = self.select_hand_card_offset(cid, clicks=1, y_offset=-200)
+                            elif kind == "battlefield":
+                                selected = self.select_battlefield_permanent(cid, clicks=1)
+                            else:
+                                # Zone unknown: try battlefield then hand.
+                                selected = self.select_battlefield_permanent(cid, clicks=1)
+                                if not selected:
+                                    selected = self.select_hand_card(cid, clicks=1)
+                            if not selected:
+                                bot_logger.log_error(
+                                    f"PayCostsReq selection failed for id={cid} (kind={kind})."
+                                )
+                            time.sleep(0.25)
+                        time.sleep(0.2)
                         self.submit_selection(reason="pay_costs_selection_submit", force=True)
                     except Exception as e:
                         bot_logger.log_error(f"PayCostsReq selection execution failed: {e}")
 
-                threading.Timer(0.6, _do_cost_selection, args=(target_id,)).start()
+                threading.Timer(0.6, _do_cost_selection, args=(chosen_ids, click_kind)).start()
                 break
 
             if not handled_selection:
@@ -5532,9 +5830,22 @@ class Controller(ControllerSecondary):
                 seat_ids = message.get("systemSeatIds") or []
                 if self.__system_seat_id not in seat_ids:
                     continue
-                source_id = message.get("selectTargetsReq", {}).get("sourceId")
+                req = message.get("selectTargetsReq", {}) or {}
+                source_id = req.get("sourceId")
                 self.__update_pending_target_select(source_id)
-                self.__schedule_target_selection(source_id, reason="SelectTargetsReq")
+                chooser_target = self.__pick_chooser_target(req)
+                if chooser_target is not None:
+                    self.__schedule_chooser_target_selection(
+                        source_id, chooser_target, reason="SelectTargetsReq(chooser)"
+                    )
+                else:
+                    legal_creature_ids, face_legal = self.__analyze_legal_targets(req)
+                    self.__schedule_target_selection(
+                        source_id,
+                        reason="SelectTargetsReq",
+                        legal_creature_ids=legal_creature_ids,
+                        face_legal=face_legal,
+                    )
         except Exception as e:
             bot_logger.log_error(f"Failed to handle SelectTargetsReq: {e}")
 
@@ -6006,13 +6317,322 @@ class Controller(ControllerSecondary):
         except Exception as e:
             bot_logger.log_error(f"Target debug bundle failed: {e}")
 
-    def __schedule_target_selection(self, source_id: int | None, reason: str) -> None:
+    def __analyze_legal_targets(self, req) -> tuple[list[int], bool]:
+        """From a SelectTargetsReq, return (legal enemy-creature instanceIds,
+        whether an opponent player/face is a legal target).
+
+        MTGA only ever lists *legal* targets in the request, so this is the
+        ground truth for what a click may land on. When the face is not among
+        them (e.g. "Destroy target creature"), clicking the avatar is illegal
+        and would stall the game -- the caller must pick a creature instead."""
+        creature_ids: list[int] = []
+        face_legal = False
+        try:
+            game_objects = self.updated_game_state.get_game_objects() or []
+            obj_by_id = {
+                o.get("instanceId"): o for o in game_objects if isinstance(o, dict)
+            }
+            player_seats = {
+                p.get("systemSeatNumber")
+                for p in (self.updated_game_state.get_players() or [])
+            }
+            bf_zone_ids = set()
+            try:
+                for zone in self.updated_game_state.get_full_state().get("zones", []) or []:
+                    if zone.get("type") == "ZoneType_Battlefield" and zone.get("zoneId") is not None:
+                        bf_zone_ids.add(zone.get("zoneId"))
+            except Exception:
+                bf_zone_ids = set()
+            for group in req.get("targets", []) or []:
+                for tgt in group.get("targets", []) or []:
+                    if tgt.get("legalAction") != "SelectAction_Select":
+                        continue
+                    tid = tgt.get("targetInstanceId")
+                    if tid is None:
+                        continue
+                    obj = obj_by_id.get(tid)
+                    # Only a creature *on the battlefield* is clickable via the
+                    # battlefield scan. A creature spell on the stack (a counter
+                    # target) is off-battlefield and handled by the chooser path.
+                    # If we could not resolve battlefield zones, don't exclude
+                    # creatures (keep the removal anti-stall behaviour).
+                    on_battlefield = (not bf_zone_ids) or (obj.get("zoneId") in bf_zone_ids) if obj else False
+                    if (
+                        obj is not None
+                        and "CardType_Creature" in (obj.get("cardTypes") or [])
+                        and on_battlefield
+                    ):
+                        if obj.get("controllerSeatId") != self.__system_seat_id:
+                            creature_ids.append(int(tid))
+                    elif tid in player_seats and tid != self.__system_seat_id:
+                        face_legal = True
+                    elif obj is None:
+                        # Unknown target (player/planeswalker not in objects): do
+                        # not force a creature click when a face click may be valid.
+                        face_legal = True
+        except Exception as e:
+            bot_logger.log_error(f"analyze_legal_targets failed: {e}")
+        return creature_ids, face_legal
+
+    def __best_creature_among(self, candidate_ids) -> int | None:
+        """Pick the enemy creature with the highest effective toughness (power as
+        tiebreak) from an explicit list of legal instanceIds."""
+        if not candidate_ids:
+            return None
+        game_objects = self.updated_game_state.get_game_objects() or []
+        obj_by_id = {
+            o.get("instanceId"): o for o in game_objects if isinstance(o, dict)
+        }
+        best_id = None
+        best_key = None
+        for cid in candidate_ids:
+            obj = obj_by_id.get(cid)
+            if obj is None:
+                key = (-1, -1)
+            else:
+                key = (
+                    RemovalLogic.effective_toughness(obj),
+                    RemovalLogic._stat(obj.get("power")),
+                )
+            if best_key is None or key > best_key:
+                best_key = key
+                best_id = int(cid)
+        return best_id
+
+    def __resolve_removal_target(self, source_id):
+        """Decide whether a spell/ability on the stack should target an enemy
+        creature. Returns a creature instanceId, RemovalLogic.FACE_TARGET (-1)
+        for lethal burn, or None when it is not creature removal (face path)."""
+        try:
+            if source_id is None or self.__system_seat_id is None:
+                return None
+            game_objects = self.updated_game_state.get_game_objects() or []
+            grp_id = None
+            for obj in game_objects:
+                if isinstance(obj, dict) and obj.get("instanceId") == source_id:
+                    grp_id = obj.get("grpId")
+                    break
+            if grp_id is None:
+                return None
+            profile = RemovalLogic.get_removal_profile(grp_id)
+            if not profile:
+                return None
+            bf_ids = set()
+            try:
+                for zone in self.updated_game_state.get_full_state().get("zones", []) or []:
+                    if zone.get("type") == "ZoneType_Battlefield" and zone.get("zoneId") is not None:
+                        bf_ids.add(zone.get("zoneId"))
+            except Exception:
+                bf_ids = set()
+            opp_life = RemovalLogic.opponent_life_from_players(
+                self.updated_game_state.get_players(), self.__system_seat_id
+            )
+            target = RemovalLogic.choose_removal_target(
+                profile,
+                game_objects,
+                self.__system_seat_id,
+                opponent_life=opp_life,
+                battlefield_zone_ids=(bf_ids or None),
+            )
+            bot_logger.log_info(
+                f"REMOVAL resolve: source={source_id} grp={grp_id} profile={profile} "
+                f"opp_life={opp_life} -> target={target}"
+            )
+            return target
+        except Exception as e:
+            bot_logger.log_error(f"Failed to resolve removal target: {e}")
+            return None
+
+    def __schedule_creature_target_selection(self, source_id, creature_id, reason):
+        """Target an enemy creature (removal): click it on the opponent's
+        battlefield via hover-scan, then submit. Mirrors the avatar flow's
+        pending/submit machinery."""
+        now = time.time()
+        if self._suppress_selections or self._stop_requested:
+            return
+        self.__last_target_select_source_id = source_id if source_id is not None else -1
+        self.__last_target_select_ts = now
+        self.__update_pending_target_select(source_id)
+        selection_token = (self.__pending_target_select or {}).get("token")
+        bot_logger.log_info(f"{reason}: targeting enemy creature instanceId={creature_id}")
+
+        def _valid() -> bool:
+            if self._suppress_selections or self._stop_requested:
+                return False
+            pending = self.__pending_target_select or {}
+            return pending.get("source_id") == source_id and pending.get("token") == selection_token
+
+        def _attempt_submit() -> None:
+            if not _valid():
+                return
+            if self.__pending_target_ready_to_submit():
+                self.__last_submit_targets_ts = time.time()
+                self.submit_selection(reason="creature_target_submit")
+
+        def _do_click(attempt: int = 0) -> None:
+            if not _valid():
+                return
+            clicked = False
+            try:
+                clicked = self.select_opponent_battlefield_permanent(creature_id, clicks=1)
+            except Exception as e:
+                bot_logger.log_error(f"Creature target click failed: {e}")
+            bot_logger.log_info(
+                f"CREATURE_TARGET click: id={creature_id} found={clicked} attempt={attempt}"
+            )
+            threading.Timer(0.5, _attempt_submit).start()
+            if not clicked and attempt < 2 and _valid():
+                threading.Timer(0.9, lambda: _do_click(attempt + 1)).start()
+
+        delay_remaining = self.__get_delay_timer_remaining()
+        start_delay = 0.8
+        if delay_remaining > 0.05:
+            start_delay = delay_remaining + 0.4
+        threading.Timer(start_delay, lambda: _do_click(0)).start()
+
+    def _get_chooser_scan_points_mapped(
+        self,
+        *,
+        force_reacquire: bool = False,
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        p1, _s1 = self._map_abs_point_to_arena(
+            self.chooser_scan_p1, label="CHOOSER_SCAN_P1",
+            force_reacquire=force_reacquire, apply_correction=False,
+        )
+        p2, _s2 = self._map_abs_point_to_arena(
+            self.chooser_scan_p2, label="CHOOSER_SCAN_P2",
+            force_reacquire=False, apply_correction=False,
+        )
+        bot_logger.log_info(
+            f"CHOOSER_SCAN mapped: arena={self._arena_region} p1={p1} p2={p2}"
+        )
+        return p1, p2
+
+    def select_chooser_card(self, card_id: int, clicks: int = 1) -> bool:
+        """Select a card shown in a central 'choose a card' overlay (e.g. a
+        creature in the graveyard for Zombify) by hover-scanning that region.
+        NOTE: the region (chooser_scan_p1/p2) is a first estimate and needs
+        in-game calibration."""
+        bot_logger.set_hover_logging(True)
+        scan_p1, scan_p2 = self._get_chooser_scan_points_mapped(force_reacquire=True)
+        try:
+            return self.__select_object_in_region(
+                card_id=card_id, p1=scan_p1, p2=scan_p2,
+                step=self.battlefield_scan_step, clicks=clicks,
+                label="CHOOSER_ITEM", max_scan_sec=8.0,
+            )
+        finally:
+            bot_logger.set_hover_logging(False)
+
+    def __pick_chooser_target(self, req):
+        """If a SelectTargetsReq's legal target is a card off the battlefield
+        (graveyard/exile/limbo -> shown in a central overlay), return its
+        instanceId; otherwise None (normal battlefield/face targeting)."""
+        try:
+            game_objects = self.updated_game_state.get_game_objects() or []
+            obj_by_id = {
+                o.get("instanceId"): o for o in game_objects if isinstance(o, dict)
+            }
+            bf_ids = set()
+            for zone in self.updated_game_state.get_full_state().get("zones", []) or []:
+                if zone.get("type") == "ZoneType_Battlefield" and zone.get("zoneId") is not None:
+                    bf_ids.add(zone.get("zoneId"))
+            for group in req.get("targets", []) or []:
+                for tgt in group.get("targets", []) or []:
+                    if tgt.get("legalAction") != "SelectAction_Select":
+                        continue
+                    tid = tgt.get("targetInstanceId")
+                    if tid is None:
+                        continue
+                    obj = obj_by_id.get(tid)
+                    if obj is None:
+                        continue  # e.g. a player target -> not a card overlay
+                    zid = obj.get("zoneId")
+                    if zid is not None and zid not in bf_ids:
+                        return int(tid)
+            return None
+        except Exception as e:
+            bot_logger.log_error(f"pick_chooser_target failed: {e}")
+            return None
+
+    def __schedule_chooser_target_selection(self, source_id, target_id, reason):
+        if self._suppress_selections or self._stop_requested:
+            return
+        # Dedup: both SelectTargetsReq entry points (raw pattern + game-state
+        # dict) can fire for the same request. Skip a duplicate chooser click
+        # for the same source within a short window (mirrors the avatar path).
+        now = time.time()
+        norm_source = source_id if source_id is not None else -1
+        if self.__last_target_select_source_id == norm_source and now - self.__last_target_select_ts < 1.0:
+            return
+        self.__last_target_select_source_id = norm_source
+        self.__last_target_select_ts = now
+        bot_logger.log_info(f"{reason}: choosing card instanceId={target_id} from overlay")
+
+        def _do(attempt: int = 0) -> None:
+            if self._suppress_selections or self._stop_requested:
+                return
+            found = False
+            try:
+                found = self.select_chooser_card(target_id, clicks=1)
+            except Exception as e:
+                bot_logger.log_error(f"Chooser target click failed: {e}")
+            bot_logger.log_info(
+                f"CHOOSER_TARGET click: id={target_id} found={found} attempt={attempt}"
+            )
+            time.sleep(0.5)
+            self.submit_selection(reason="chooser_target_submit", force=True)
+            if not found and attempt < 2 and not (self._suppress_selections or self._stop_requested):
+                threading.Timer(1.0, lambda: _do(attempt + 1)).start()
+
+        delay = self.__get_delay_timer_remaining()
+        start_delay = 0.8 if delay <= 0.05 else delay + 0.4
+        threading.Timer(start_delay, lambda: _do(0)).start()
+
+    def __schedule_target_selection(
+        self,
+        source_id: int | None,
+        reason: str,
+        legal_creature_ids: list[int] | None = None,
+        face_legal: bool | None = None,
+    ) -> None:
         now = time.time()
         if self._suppress_selections or self._stop_requested:
             return
         if source_id is None:
             source_id = -1
         if self.__last_target_select_source_id == source_id and now - self.__last_target_select_ts < 1.0:
+            return
+        removal_target = self.__resolve_removal_target(source_id)
+
+        # Reconcile the profile-based result with the prompt's explicit legal
+        # targets. This makes creature removal robust even when we have no oracle
+        # profile for the card (missing/offline card data): if the face is not a
+        # legal target, we must never click the avatar or the game stalls.
+        if legal_creature_ids:
+            has_creature = (
+                removal_target is not None and removal_target != RemovalLogic.FACE_TARGET
+            )
+            if has_creature and removal_target not in legal_creature_ids:
+                replacement = self.__best_creature_among(legal_creature_ids)
+                if replacement is not None:
+                    bot_logger.log_info(
+                        f"{reason}: profile target {removal_target} not offered; "
+                        f"using best legal creature {replacement} of {legal_creature_ids}."
+                    )
+                    removal_target = replacement
+            elif not has_creature and not face_legal:
+                replacement = self.__best_creature_among(legal_creature_ids)
+                if replacement is not None:
+                    bot_logger.log_info(
+                        f"{reason}: no removal profile and face not a legal target; "
+                        f"picking highest-toughness legal creature {replacement} "
+                        f"of {legal_creature_ids}."
+                    )
+                    removal_target = replacement
+
+        if removal_target is not None and removal_target != RemovalLogic.FACE_TARGET:
+            self.__schedule_creature_target_selection(source_id, removal_target, reason)
             return
         self.__last_target_select_source_id = source_id
         self.__last_target_select_ts = now
@@ -6365,6 +6985,10 @@ class Controller(ControllerSecondary):
                     )
                     pending_token = (self.__pending_target_select or {}).get("token")
                     if self.__pending_target_ready_to_submit():
+                        # MTGA already has enough targets selected -- e.g. a spell
+                        # with a single legal target (Essence Scatter vs the one
+                        # creature spell on the stack) is auto-targeted. Just
+                        # confirm; clicking again could toggle the target off.
                         def _submit_if_pending_target_still_matches() -> None:
                             pending = self.__pending_target_select or {}
                             if (
@@ -6373,8 +6997,26 @@ class Controller(ControllerSecondary):
                             ):
                                 self.submit_selection(reason="target_selection_ready")
                         threading.Timer(0.2, _submit_if_pending_target_still_matches).start()
+                        return
                 source_id = message.get("selectTargetsReq", {}).get("sourceId")
-                self.__schedule_target_selection(source_id, reason="SelectTargetsReq (from game state)")
+                # Off-battlefield targets (a spell on the stack for a counter, a
+                # card in graveyard/exile) are shown in a central overlay, not on
+                # a battlefield row -- route them to the chooser click. Mirrors
+                # __handle_select_targets_req so both entry points behave alike.
+                chooser_target = self.__pick_chooser_target(req)
+                if chooser_target is not None:
+                    self.__schedule_chooser_target_selection(
+                        source_id, chooser_target,
+                        reason="SelectTargetsReq (from game state, chooser)",
+                    )
+                    return
+                legal_creature_ids, face_legal = self.__analyze_legal_targets(req)
+                self.__schedule_target_selection(
+                    source_id,
+                    reason="SelectTargetsReq (from game state)",
+                    legal_creature_ids=legal_creature_ids,
+                    face_legal=face_legal,
+                )
                 return
             for message in messages:
                 if message.get("type") != "GREMessageType_GameStateMessage":
@@ -6416,6 +7058,62 @@ class Controller(ControllerSecondary):
                     self.__clear_pending_target_select_state("SubmitTargetsResp: success")
         except Exception as e:
             bot_logger.log_error(f"Failed to handle target selection from game state: {e}")
+
+    def __handle_declare_blockers_req(self, line: str) -> None:
+        """Defending step. No blocking logic yet -> declare NO blocks by clicking
+        the bottom-right combat button (which reads "No Blocks" here). Guiding
+        rule: never freeze; better to lose than to stall."""
+        try:
+            if self._suppress_selections or self._stop_requested:
+                return
+            # Only act if the block decision is ours.
+            start = line.find("{")
+            if start != -1:
+                try:
+                    payload = json.loads(line[start:])
+                    messages = payload.get("greToClientEvent", {}).get("greToClientMessages", [])
+                    ours = False
+                    for message in messages:
+                        if message.get("type") != "GREMessageType_DeclareBlockersReq":
+                            continue
+                        seat_ids = message.get("systemSeatIds") or []
+                        if self.__system_seat_id is None or self.__system_seat_id in seat_ids:
+                            ours = True
+                    if messages and not ours:
+                        return
+                except Exception:
+                    pass
+            now = time.time()
+            if now - self.__last_declare_blockers_ts < 2.0:
+                return
+            self.__last_declare_blockers_ts = now
+            bot_logger.log_info("DeclareBlockersReq: declaring NO blocks (no blocking logic yet).")
+
+            def _click_no_blocks() -> None:
+                try:
+                    if self._suppress_selections or self._stop_requested:
+                        return
+                    target, source = self._map_abs_point_to_arena(
+                        self.main_br_button_coordinates,
+                        label="NO_BLOCKS",
+                        force_reacquire=True,
+                        apply_correction=False,
+                    )
+                    if source == "absolute_no_arena":
+                        bot_logger.log_error("NO_BLOCKS aborted: arena_region unavailable.")
+                        return
+                    bot_logger.log_click(target[0], target[1], "NO_BLOCKS")
+                    self.input.move_abs(target[0], target[1])
+                    self.input.left_click(1)
+                    time.sleep(0.6)
+                    # Second click confirms through any first-strike/submit sub-step.
+                    self.input.left_click(1)
+                except Exception as e:
+                    bot_logger.log_error(f"NO_BLOCKS click failed: {e}")
+
+            threading.Timer(0.8, _click_no_blocks).start()
+        except Exception as e:
+            bot_logger.log_error(f"Failed to handle DeclareBlockersReq: {e}")
 
     def __handle_declare_attackers_req(self, line: str) -> None:
         try:
@@ -6822,6 +7520,16 @@ class Controller(ControllerSecondary):
         )
 
         if self.__arm_mulligan_if_needed(turn_info_dict, raw_dict):
+            return
+
+        if time.time() < self.__group_req_active_until:
+            if self.__decision_execution_thread is not None:
+                self.__decision_execution_thread.cancel()
+                self.__decision_execution_thread = None
+                self.__decision_delay_key = None
+                self.__decision_delay_scheduled_at = 0.0
+            runtime_status.set_intentional_wait(2.0, "scry_wait")
+            bot_logger.log_info("Pausing decision while scry/group prompt is active")
             return
 
         if self.__should_pause_for_assign_damage():

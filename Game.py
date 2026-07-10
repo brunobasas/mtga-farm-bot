@@ -30,6 +30,17 @@ class Game:
         self._stop_requested = False
         runtime_status.set_mode("starting")
         self._refresh_card_data()
+        # Eagerly load the curated Starter Deck Duel card DB (oracle text, types,
+        # keywords) and pre-resolve removal/counter profiles. ~0.2s paid once at
+        # startup so the first in-game decision has this data ready offline.
+        try:
+            summary = CardInfo.warm_up_starter_data()
+            self._debug(
+                "Starter card DB warmed: {cards} cards, "
+                "{removal} removal / {counter} counter profiles.".format(**summary)
+            )
+        except Exception as e:
+            self._debug(f"Starter card DB warm-up failed: {e}")
         try:
             CardInfo.refresh_missing_cards()
             self._debug("Card data refresh: missing cards resolved via Scryfall (if any).")
