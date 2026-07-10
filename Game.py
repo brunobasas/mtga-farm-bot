@@ -46,6 +46,13 @@ class Game:
             self._debug("Card data refresh: missing cards resolved via Scryfall (if any).")
         except Exception as e:
             self._debug(f"Card data refresh failed: {e}")
+        # Cache the account's quests once from Home so deck selection uses local
+        # data instead of re-parsing the player.log every queue cycle.
+        try:
+            if hasattr(self.controller, "refresh_quests_cache"):
+                self.controller.refresh_quests_cache()
+        except Exception as e:
+            self._debug(f"Quest cache refresh failed: {e}")
         self.controller.start_game()
         self.controller.set_mulligan_decision_callback(self.mulligan_decision_method)
         self.controller.set_decision_callback(self.decision_method)

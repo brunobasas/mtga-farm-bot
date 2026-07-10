@@ -8,6 +8,7 @@ import time
 from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageStat, ImageTk
 import json
 import threading
+import runtime_status
 from Controller.Utilities.input_controller import InputControllerError, create_input_controller
 from runtime_paths import runtime_file
 from vision.window_locator import ArenaDetectionResult, run_arena_setup_check, supported_16x9_message
@@ -2691,6 +2692,23 @@ class MTGBotUI(tk.Tk):
         ):
             self._card_canvas.tag_bind(self._queue_mode_item, _evt, _cb)
         self._refresh_queue_mode_label()
+
+        # Account quests (up to 3), shown below the queue switch. The one being
+        # pursued (whose colors we play) is highlighted. Data comes from the bot
+        # via runtime_status; see Controller.refresh_quests_cache.
+        self._quest_title_item = self._card_canvas.create_text(
+            0, 0, text="", fill=c["text_muted"],
+            font=("Segoe UI", max(8, self._scale_value(10)), "bold"), anchor="n",
+        )
+        self._quest_items = []
+        for _ in range(3):
+            item = self._card_canvas.create_text(
+                0, 0, text="", fill=c["text_muted"],
+                font=("Segoe UI", max(8, self._scale_value(10))), anchor="n",
+            )
+            self._quest_items.append(item)
+        self._quests_poll_signature = None
+        self.after(1500, self._poll_quests_display)
         self._main_topmost_var = tk.BooleanVar(value=bool(self.config_manager.get_ui_windows_topmost()))
         self._main_topmost_panel_item = self._card_canvas.create_rectangle(
             0,
@@ -2774,6 +2792,10 @@ class MTGBotUI(tk.Tk):
             total_h += body_h + sp["xs"] + loading_bar_h + sp["md"]
         total_h += sp["lg"] + body_h
         total_h += sp["xs"] + body_h
+        quest_font = tkfont.Font(font=("Segoe UI", max(8, self._scale_value(10))))
+        quest_h = quest_font.metrics("linespace")
+        quest_rows = 1 + len(getattr(self, "_quest_items", []))  # title + rows
+        total_h += (quest_h + sp["xs"]) * quest_rows
         max_content_y = (canvas_h - footer_h) - footer_gap - total_h
         # Pull the whole main stack slightly upward (~1 cm) to reduce top logo whitespace.
         top_offset = int(self.winfo_fpixels("10m"))
@@ -2817,6 +2839,15 @@ class MTGBotUI(tk.Tk):
         y += body_h + sp["xs"]
         self._card_canvas.coords(self._queue_mode_item, center_x, y)
         self._card_canvas.tag_raise(self._queue_mode_item)
+        y += body_h + sp["xs"]
+        if hasattr(self, "_quest_title_item"):
+            self._card_canvas.coords(self._quest_title_item, center_x, y)
+            self._card_canvas.tag_raise(self._quest_title_item)
+            y += quest_h + sp["xs"]
+        for item in getattr(self, "_quest_items", []):
+            self._card_canvas.coords(item, center_x, y)
+            self._card_canvas.tag_raise(item)
+            y += quest_h + sp["xs"]
         footer_y1 = canvas_h - footer_h
         self._card_canvas.coords(self._main_topmost_panel_item, 0, footer_y1, canvas_w, canvas_h)
         box_size = self._scale_value(18)
@@ -2893,6 +2924,63 @@ class MTGBotUI(tk.Tk):
             )
         except Exception:
             pass
+
+    def _poll_quests_display(self) -> None:
+        try:
+            self._render_quests_from_status()
+        except Exception:
+            pass
+        try:
+            self.after(3000, self._poll_quests_display)
+        except Exception:
+            pass
+
+    def _render_quests_from_status(self) -> None:
+        """Update the card's quest rows from runtime_status (status.json). The
+        active quest (the one whose colors the bot is playing) is highlighted."""
+        if not hasattr(self, "_quest_items"):
+            return
+        c = self.ui_theme["colors"]
+        try:
+            status = runtime_status.read_status() or {}
+        except Exception:
+            status = {}
+        quests = status.get("quests") or []
+        if not isinstance(quests, list):
+            quests = []
+        active_id = str(status.get("active_quest_id") or "")
+
+        # Only redraw when something actually changed (avoid canvas churn).
+        sig = json.dumps([quests, active_id], sort_keys=True, default=str)
+        if sig == getattr(self, "_quests_poll_signature", None):
+            return
+        self._quests_poll_signature = sig
+
+        muted = c.get("text_muted", "#9aa0a6")
+        active_color = c.get("pill_running_text", "#7CFF7C")
+        self._card_canvas.itemconfigure(
+            self._quest_title_item,
+            text=("Daily Quests" if quests else ""),
+            fill=muted,
+        )
+        for i, item in enumerate(self._quest_items):
+            if i < len(quests) and isinstance(quests[i], dict):
+                q = quests[i]
+                parts = [str(q.get("name") or "Quest")]
+                colors = str(q.get("colors") or "")
+                if colors:
+                    parts.append(f"({colors})")
+                goal = q.get("goal")
+                if isinstance(goal, int) and goal > 0:
+                    parts.append(f"{q.get('progress')}/{goal}")
+                is_active = bool(active_id) and str(q.get("id") or "") == active_id
+                text = ("▶ " if is_active else "") + "  ".join(parts)
+                self._card_canvas.itemconfigure(
+                    item, text=text, fill=(active_color if is_active else muted)
+                )
+            else:
+                self._card_canvas.itemconfigure(item, text="", fill=muted)
+        self._refresh_card_layout()
 
     def _toggle_queue_mode(self, _event=None) -> None:
         if self.bot_running:

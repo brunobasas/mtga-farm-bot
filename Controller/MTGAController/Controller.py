@@ -333,6 +333,11 @@ class Controller(ControllerSecondary):
         self._queue_spam_thread = None
         self._stop_queue_spam = False
         self._queue_ready = False
+        # Quests parsed once from the player.log (at startup / between matches)
+        # and reused locally, so we don't re-parse the log on every queue cycle.
+        self._cached_quests: list[dict] = []
+        self._cached_active_quest_id: str = ""
+        self._cached_active_colors: str = ""
         self._match_end_dismissed = False
         self._post_match_ready_ts = None
         self._post_match_delay_sec = 30
@@ -1816,6 +1821,96 @@ class Controller(ControllerSecondary):
             return {"type": "creature"}
         return None
 
+    @staticmethod
+    def _quest_display_name(loc_key: str) -> str:
+        """'Quests/Quest_Dimir_Cutpurse' -> 'Dimir Cutpurse'."""
+        stem = str(loc_key or "").split("/")[-1]
+        stem = re.sub(r"^quest_", "", stem, flags=re.I)
+        name = stem.replace("_", " ").strip()
+        return name or "Quest"
+
+    @staticmethod
+    def _quest_colors_for_loc_key(loc_key: str) -> str:
+        lk = str(loc_key or "").lower()
+        for guild, colors in _GUILD_COLOR_MAP.items():
+            if guild in lk:
+                return colors
+        return ""
+
+    def _build_quest_view(self, quests: list[dict]) -> list[dict]:
+        """Convert raw player.log quests into a compact, UI-friendly list."""
+        view = []
+        for q in quests or []:
+            loc_key = q.get("locKey", "")
+            gold = 0
+            chest = q.get("chestDescription") or {}
+            loc_params = chest.get("locParams") or {}
+            if isinstance(loc_params, dict):
+                try:
+                    gold = int(loc_params.get("number1") or 0)
+                except (TypeError, ValueError):
+                    gold = 0
+            try:
+                progress = int(q.get("endingProgress") or 0)
+            except (TypeError, ValueError):
+                progress = 0
+            try:
+                goal = int(q.get("goal") or 0)
+            except (TypeError, ValueError):
+                goal = 0
+            view.append({
+                "id": str(q.get("questId", "")),
+                "name": self._quest_display_name(loc_key),
+                "colors": self._quest_colors_for_loc_key(loc_key),
+                "gold": gold,
+                "progress": progress,
+                "goal": goal,
+            })
+        return view
+
+    def refresh_quests_cache(self) -> list[dict]:
+        """Parse the account's quests once and cache them for local reuse.
+
+        Called at startup (from Home) and between matches. Populates
+        self._cached_quests / _cached_active_* and publishes them to
+        runtime_status so the bot UI can show them. Keeps the last known list if
+        the log has no quests block right now.
+        """
+        quests = self._extract_latest_quests()
+        if not quests:
+            return self._cached_quests
+        view = self._build_quest_view(quests)
+
+        # Active quest = the one whose colors we play. Mirror _select_best_quest:
+        # the highest-gold guild (two-color) quest.
+        active_id = ""
+        active_colors = ""
+        guild_entries = [v for v in view if v.get("colors")]
+        if guild_entries:
+            best = max(guild_entries, key=lambda v: v.get("gold", 0))
+            active_id = best.get("id", "")
+            active_colors = best.get("colors", "")
+
+        self._cached_quests = view
+        self._cached_active_quest_id = active_id
+        self._cached_active_colors = active_colors
+        for v in view:
+            v["active"] = (v.get("id") == active_id and bool(active_id))
+        try:
+            runtime_status.update_status(
+                quests=view,
+                active_quest_id=active_id,
+                active_quest_colors=active_colors,
+            )
+        except Exception:
+            pass
+        bot_logger.log_info(
+            "Quests cached: {} quest(s); active={} colors={}.".format(
+                len(view), active_id or "-", active_colors or "-"
+            )
+        )
+        return view
+
     def _accounts_base_dir(self) -> str:
         base = self._app_path("Accounts")
         try:
@@ -1984,6 +2079,9 @@ class Controller(ControllerSecondary):
             confidence=0.80, timeout=1.0,
         ) is None:
             return False
+        # Between matches: refresh quest progress best-effort (keeps the cache and
+        # the UI display current when Home has logged a fresh quests block).
+        self.refresh_quests_cache()
         # Swap to the deck that best advances the top quest, then queue.
         self._swap_starter_deck_for_quest(target_colors)
         if self._click_image_in_scaled_arena_region(
@@ -2016,6 +2114,11 @@ class Controller(ControllerSecondary):
         # first so navigation is not stuck retrying against a blocked screen.
         if self._dismiss_reward_popup():
             return False
+
+        # Populate the quest cache the first time we reach navigation (in case the
+        # startup pass ran before Home had logged the quests block).
+        if not self._cached_quests:
+            self.refresh_quests_cache()
 
         # Decide up-front which deck colors advance the most valuable quest;
         # the swap below only fires when we have a concrete color target.
@@ -2097,11 +2200,19 @@ class Controller(ControllerSecondary):
     def _resolve_starter_target_colors(self) -> str:
         """Colors of the deck that best advances the current top quest.
 
-        Reuses the same quest ranking as the Historic flow (:meth:`_select_best_quest`)
-        and the guild->colors table, so Starter and Historic stay in sync. Returns
-        an empty string when there is no concrete target (no quest, or a quest with
-        no two-color mapping), which tells the caller to keep the current deck.
+        Prefers the locally cached quests (parsed once at startup / between
+        matches) so we don't re-parse the player.log on every queue cycle; falls
+        back to a live parse if the cache is empty. Returns an empty string when
+        there is no concrete two-color target (keep the current deck).
         """
+        if self._cached_quests:
+            if self._cached_active_colors:
+                bot_logger.log_info(
+                    f"Starter: using cached quest colors {self._cached_active_colors}."
+                )
+            else:
+                bot_logger.log_info("Starter: cached quests have no guild target; keeping current deck.")
+            return self._cached_active_colors
         quest = self._select_best_quest()
         if not quest:
             bot_logger.log_info("Starter: no active quest; keeping current deck.")

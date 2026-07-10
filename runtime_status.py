@@ -57,6 +57,9 @@ def reset_status(*, log_path: str | None = None) -> dict[str, Any]:
         "my_timer_last_critical_at_epoch": 0.0,
         "my_timer_timeout_seen": False,
         "my_timer_timeout_at_epoch": 0.0,
+        "quests": [],
+        "active_quest_id": "",
+        "active_quest_colors": "",
     }
     return _write_payload(payload)
 
