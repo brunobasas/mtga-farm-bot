@@ -2,6 +2,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 from datetime import datetime
+import glob
 import os
 import sys
 import time
@@ -63,6 +64,26 @@ def _app_root_dir() -> str:
     if getattr(sys, "frozen", False):
         return os.path.abspath(os.path.dirname(sys.executable))
     return os.path.abspath(os.path.dirname(__file__))
+
+
+# Same file patterns tools/mtga_cards_export.py looks for, duplicated here (not
+# imported) so picking an MTGA folder in the UI doesn't have to import the
+# exporter script as a module just to validate a path.
+_MTGA_CARD_FILE_PATTERNS = ("data_cards*.mtga", "Raw_CardDatabase*.mtga")
+
+
+def _looks_like_mtga_data_dir(path: str) -> bool:
+    """True if `path` looks like an MTGA_Data/Downloads/Raw folder (i.e. it
+    actually contains a card database file the exporter can read)."""
+    if not path or not os.path.isdir(path):
+        return False
+    try:
+        for pattern in _MTGA_CARD_FILE_PATTERNS:
+            if glob.glob(os.path.join(path, pattern)):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def _app_path(*parts: str) -> str:
@@ -1498,6 +1519,10 @@ class ConfigManager:
             "first_run_prereq_ack": False,
             "first_run_prereq_ack_version": 1,
             "game_mode": "historic",
+            # User-picked MTGA_Data/Downloads/Raw folder, used when the bot can't
+            # auto-detect a standard Steam/Wizards install location. Empty means
+            # "not set yet / rely on auto-detect".
+            "mtga_data_dir": "",
             "account_switch_minutes": 0,
             # Account-switch trigger: "time" (every N minutes) or "quests"
             # (when main-quest completions and daily wins reach the thresholds).
@@ -1604,6 +1629,16 @@ class ConfigManager:
 
     def detect_player_log_path(self) -> str:
         return self._detect_player_log_path()
+
+    def get_mtga_data_dir(self) -> str:
+        return str(self.config.get("mtga_data_dir", "") or "")
+
+    def set_mtga_data_dir(self, path: str) -> None:
+        value = str(path or "").strip()
+        if not value:
+            return
+        self.config["mtga_data_dir"] = os.path.abspath(value)
+        self._save_config()
 
     def get_screen_bounds(self):
         bounds = self.config.get("screen_bounds", [[0, 0], [1920, 1080]])
@@ -3138,6 +3173,66 @@ class MTGBotUI(tk.Tk):
             parent=self,
         )
 
+    def _resolve_mtga_data_dir(self) -> str:
+        """Called from the bot thread (via Game's data_dir_prompt callback) when
+        the bot couldn't auto-detect the MTGA install. Returns a folder path the
+        card exporter can use, or "" if the user has none / cancels.
+
+        Without this, a non-standard install location (the original report: a
+        user with MTGA installed outside every hard-coded Steam/Wizards path)
+        made card-data export silently no-op, so the bot never had card info
+        and only ever played mana -- with no visible error pointing at the cause.
+
+        tkinter dialogs must run on the Tk main thread, so the actual prompt is
+        marshaled there via `after()` and this method blocks (on the bot thread,
+        which is fine) until it completes.
+        """
+        cached = self.config_manager.get_mtga_data_dir()
+        if _looks_like_mtga_data_dir(cached):
+            return cached
+
+        result: dict[str, str] = {}
+        done = threading.Event()
+
+        def _ask_on_main_thread() -> None:
+            try:
+                messagebox.showinfo(
+                    "MTGA folder not found",
+                    "The bot couldn't find your MTG Arena install automatically, "
+                    "so it has no card data to make decisions with (it will only "
+                    "be able to play lands).\n\n"
+                    "Please locate the folder:\n"
+                    "  <your MTGA install>\\MTGA_Data\\Downloads\\Raw",
+                    parent=self,
+                )
+                chosen = filedialog.askdirectory(
+                    title="Select your MTGA_Data\\Downloads\\Raw folder",
+                    parent=self,
+                )
+                if chosen and not _looks_like_mtga_data_dir(chosen):
+                    messagebox.showwarning(
+                        "MTGA folder not found",
+                        f"That folder doesn't look right (no card database file found in "
+                        f"it):\n{chosen}\n\nCard data export will be skipped for now; you "
+                        "can try again the next time you start the bot.",
+                        parent=self,
+                    )
+                    chosen = ""
+                result["path"] = chosen or ""
+            except Exception:
+                result["path"] = ""
+            finally:
+                done.set()
+
+        self.after(0, _ask_on_main_thread)
+        # Generous timeout: this is a one-time, user-attended prompt, not a
+        # polling loop, so waiting rather than giving up quickly is correct.
+        done.wait(timeout=300)
+        chosen = result.get("path", "")
+        if chosen:
+            self.config_manager.set_mtga_data_dir(chosen)
+        return chosen
+
     def _run_bot(self):
         try:
             import bot_logger
@@ -3172,7 +3267,7 @@ class MTGBotUI(tk.Tk):
                                    game_mode=game_mode)
             self._controller = controller
             ai = DummyAI()
-            self.game = Game(controller, ai)
+            self.game = Game(controller, ai, data_dir_prompt=self._resolve_mtga_data_dir)
             bot_logger.log_info("UI start: game.start() begin")
             self.game.start()
             bot_logger.log_info("UI start: game.start() completed")

@@ -12,7 +12,7 @@ import runtime_status
 
 class Game:
 
-    def __init__(self, controller: ControllerSecondary, ai: AIKernel):
+    def __init__(self, controller: ControllerSecondary, ai: AIKernel, data_dir_prompt=None):
         self.ai = ai
         self.controller = controller
         self.last_logged_turn = -1
@@ -21,6 +21,12 @@ class Game:
         self._stop_requested = False
         self._timers: list[threading.Timer] = []
         self._last_action_delay_turn = -1
+        # Optional callback (no args -> path string or "") the UI can supply to
+        # ask the user to locate their MTGA install when auto-detection in
+        # _refresh_card_data() fails. Without card data the bot has no removal/
+        # counter/fight information and effectively only plays lands, with no
+        # obvious error pointing at the missing install path as the cause.
+        self._data_dir_prompt = data_dir_prompt
 
         # Initialize bot.log with centralized logger
         bot_logger.init_bot_log()
@@ -174,9 +180,22 @@ class Game:
                     "~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/MTGA/MTGA_Data/Downloads/Raw"
                 ),
                 r"C:\\Program Files (x86)\\Steam\\steamapps\\common\\MTGA\\MTGA_Data\\Downloads\\Raw",
+                r"C:\\Program Files\\Wizards of the Coast\\MTGA\\MTGA_Data\\Downloads\\Raw",
                 r"C:\\Program Files\\Steam\\steamapps\\common\\MTGA\\MTGA_Data\\Downloads\\Raw",
             ]
             data_dir = next((p for p in base_candidates if os.path.isdir(p)), "")
+            if not data_dir and self._data_dir_prompt is not None:
+                self._debug(
+                    "Card data refresh: MTGA data dir not found via auto-detect; "
+                    "asking the user to locate it."
+                )
+                try:
+                    prompted = self._data_dir_prompt() or ""
+                except Exception as e:
+                    self._debug(f"Card data refresh: data dir prompt failed: {e}")
+                    prompted = ""
+                if prompted and os.path.isdir(prompted):
+                    data_dir = prompted
             if not data_dir:
                 self._debug("Card data refresh: MTGA data dir not found, skipping export.")
                 return
