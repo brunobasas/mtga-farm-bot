@@ -66,6 +66,37 @@ def get_removal_profile(grp_id: int | None) -> dict | None:
     return detect_profile_from_oracle(grp_id)
 
 
+# --- Self-target pump/protect tricks ---
+# These must be cast on one of OUR creatures, never an enemy's (that would buff
+# the opponent) and never the avatar. "target creature" spells also list enemy
+# creatures as legal, so without this the generic path would hand the buff to the
+# opponent or stall on the illegal avatar. Fake Your Own Death across all its
+# printings, plus an oracle heuristic for other "+N/+M" pump tricks.
+SELF_BUFF_GRPIDS: set[int] = {80230, 90433, 92991, 93887}
+
+_RE_SELF_BUFF = re.compile(r"target creature gets \+\d+/", re.I)
+
+
+def is_self_buff(grp_id) -> bool:
+    """True if the card is a pump/protect trick to cast on our own creature."""
+    if grp_id is None:
+        return False
+    try:
+        grp_id = int(grp_id)
+    except Exception:
+        return False
+    if grp_id in SELF_BUFF_GRPIDS:
+        return True
+    # A card that is removal is not a self-buff, even if its text mentions a buff.
+    if get_removal_profile(grp_id):
+        return False
+    try:
+        text = str(CardInfo.get_oracle_text(grp_id) or "")
+    except Exception:
+        return False
+    return bool(_RE_SELF_BUFF.search(text))
+
+
 # --- Layer 1b: auto-detection from oracle text ---
 _CREATURE_TARGET = r"target (?:attacking |blocking |tapped |untapped )?creature"
 

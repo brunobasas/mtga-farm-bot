@@ -11,6 +11,7 @@ from pathlib import Path
 from Controller.ControllerInterface import ControllerSecondary
 import AI.Utilities.RemovalLogic as RemovalLogic
 import AI.Utilities.FightLogic as FightLogic
+import AI.Utilities.CardInfo as CardInfo
 from Controller.MTGAController.LogReader import LogReader
 from Controller.Utilities.GameState import GameState
 from Controller.Utilities.input_controller import InputControllerError, create_input_controller
@@ -53,6 +54,9 @@ class Controller(ControllerSecondary):
         click_targets=None,
         input_backend: str | None = None,
         account_switch_minutes: int | None = None,
+        account_switch_mode: str | None = None,
+        account_switch_main_quests: int | None = None,
+        account_switch_daily_wins: int | None = None,
         account_cycle_index: int | None = None,
         account_play_order: list[str] | None = None,
         game_mode: str | None = None,
@@ -323,6 +327,27 @@ class Controller(ControllerSecondary):
         self._game_mode = _mode if _mode in ("historic", "starter") else "historic"
         bot_logger.log_info(f"Queue game_mode configured: {self._game_mode}")
         self._account_switch_interval = max(0, int(account_switch_minutes or 0)) * 60
+        # Account-switch trigger mode: "time" (every N minutes) or "quests"
+        # (when main-quest completions and daily wins reach the thresholds).
+        # Mutually exclusive -- only one mode drives the switch.
+        _sw_mode = str(account_switch_mode or "time").strip().lower()
+        self._account_switch_mode = _sw_mode if _sw_mode in ("time", "quests") else "time"
+        self._account_switch_main_quests = max(0, min(3, int(account_switch_main_quests or 0)))
+        self._account_switch_daily_wins = max(0, min(15, int(account_switch_daily_wins or 0)))
+        # Quest-mode tracking: the quest ids present when this account started
+        # (a daily quest is "completed" once its id drops out of the list), and a
+        # local win counter (the bot knows every match result).
+        self._account_start_quest_ids: set[str] | None = None
+        self._daily_wins_this_account = 0
+        self._win_counted_this_match = False
+        bot_logger.log_info(
+            "Account-switch config: mode={} time_min={} main_quests={} daily_wins={}".format(
+                self._account_switch_mode,
+                self._account_switch_interval // 60,
+                self._account_switch_main_quests,
+                self._account_switch_daily_wins,
+            )
+        )
         self._account_cycle_index = int(account_cycle_index or 0)
         self._account_play_order = account_play_order or []
         if self._account_play_order:
@@ -339,7 +364,13 @@ class Controller(ControllerSecondary):
         self._cached_quests: list[dict] = []
         self._cached_active_quest_id: str = ""
         self._cached_active_colors: str = ""
+        # MTGA only logs quest progress on Home (via QuestGetQuests), never on the
+        # event page where the bot re-queues, so quest data/UI would otherwise
+        # freeze at startup values. Periodically dip back to Home to refresh.
+        self._matches_since_quest_refresh = 0
+        self._quest_refresh_every_n_matches = 3
         self._match_end_dismissed = False
+        self._unknown_screen_strikes = 0
         self._post_match_ready_ts = None
         self._post_match_delay_sec = 30
         self._stop_requested = False
@@ -1745,27 +1776,59 @@ class Controller(ControllerSecondary):
     def _last_scene_is_store(self) -> bool:
         return self._get_last_scene_name() == "Store"
 
-    def _extract_latest_quests(self) -> list[dict]:
+    def _extract_latest_quests(self) -> list[dict] | None:
+        """Latest quests block from the log, or None when none is available.
+
+        Returns None for "no readable/valid block" (no log, no block, parse error,
+        or a stale block from a previous account) so callers keep their cache.
+        Returns a list (possibly EMPTY) when a current block exists -- an empty
+        list means all daily quests are completed, which the quest-mode account
+        switch must be able to see."""
         if not self._log_path:
-            return []
+            return None
         log_tail = self._read_log_tail(self._log_path)
         if not log_tail:
-            return []
+            return None
         idx = log_tail.rfind('"quests"')
         if idx == -1:
-            return []
+            return None
+        # Account-safety: a "quests" block belongs to whichever account was logged
+        # in when MTGA wrote it. After an account switch the PREVIOUS account's
+        # block is still in the log tail, and using it makes the bot farm the wrong
+        # account's quests (its colors/deck). Reject the block when the account
+        # that owns it (last screenName logged before it) differs from the current
+        # account (last screenName in the tail). No screenName -> single session,
+        # use it as before.
+        try:
+            name_matches = list(re.finditer(r'"screenName"\s*:\s*"([^"]+)"', log_tail))
+            if name_matches:
+                current_account = name_matches[-1].group(1)
+                owner = None
+                for m in name_matches:
+                    if m.start() < idx:
+                        owner = m.group(1)
+                    else:
+                        break
+                if owner is not None and owner != current_account:
+                    bot_logger.log_info(
+                        f"Quests block ignored: belongs to '{owner}' but current account "
+                        f"is '{current_account}' (stale after account switch)."
+                    )
+                    return None
+        except Exception:
+            pass
         start = log_tail.rfind("{", 0, idx)
         if start == -1:
-            return []
+            return None
         decoder = json.JSONDecoder()
         try:
             payload, _ = decoder.raw_decode(log_tail[start:])
         except Exception:
-            return []
+            return None
         quests = payload.get("quests", [])
         if isinstance(quests, list):
             return quests
-        return []
+        return None
 
     def _parse_guild_quests(self, quests: list[dict]) -> list[dict]:
         parsed = []
@@ -1878,17 +1941,35 @@ class Controller(ControllerSecondary):
         the log has no quests block right now.
         """
         quests = self._extract_latest_quests()
-        if not quests:
+        if quests is None:
+            # No readable/valid quests block right now -> keep the last known list.
             return self._cached_quests
+        # quests may be an empty list here, meaning all daily quests are done.
         view = self._build_quest_view(quests)
 
+        # Snapshot the quest ids present when this account first shows quests, so
+        # quest-mode account switching can count completions (a completed daily
+        # quest drops out of the list -> its id disappears).
+        if self._account_start_quest_ids is None:
+            ids = {str(v.get("id")) for v in view if v.get("id")}
+            if ids:
+                self._account_start_quest_ids = ids
+                bot_logger.log_info(f"Account start quest ids captured: {sorted(ids)}")
+
         # Active quest = the one whose colors we play. Mirror _select_best_quest:
-        # the highest-gold guild (two-color) quest.
+        # the highest-gold guild (two-color) quest -- but skip quests already at
+        # their goal so the bot switches to an unfinished quest instead of grinding
+        # a completed one forever. Fall back to all guild quests if every one is done.
         active_id = ""
         active_colors = ""
         guild_entries = [v for v in view if v.get("colors")]
-        if guild_entries:
-            best = max(guild_entries, key=lambda v: v.get("gold", 0))
+        incomplete_guild = [
+            v for v in guild_entries
+            if not v.get("goal") or v.get("progress", 0) < v.get("goal", 0)
+        ]
+        quest_pool = incomplete_guild or guild_entries
+        if quest_pool:
+            best = max(quest_pool, key=lambda v: v.get("gold", 0))
             active_id = best.get("id", "")
             active_colors = best.get("colors", "")
 
@@ -1911,6 +1992,85 @@ class Controller(ControllerSecondary):
             )
         )
         return view
+
+    # The Home tab sits at a fixed spot in the top-left nav bar (1920x1080 frame).
+    # A TEMPLATE match only works when Home is the ACTIVE tab, so from the event
+    # page (where the bot re-queues) the anchor never matches and navigation fails.
+    # Measured live at (104, 39); clicking that fixed point returns Home from any
+    # main screen regardless of which tab is currently active.
+    _HOME_TAB_POINT_1920 = (104, 39)
+
+    def _navigate_to_home(self) -> bool:
+        """Return to the Home screen by clicking the fixed top-left Home tab.
+
+        Clicks a fixed 1920-frame coordinate (not a template match, which only
+        works when Home is already the active tab) and verifies we actually landed
+        on Home (its anchor then matches). Returns True only if Home was reached."""
+        if self._stop_requested:
+            return False
+        arena = self._ensure_arena_region(force_reacquire=True)
+        if arena is None:
+            return False
+        point = self._map_base_point_into_arena(arena, self._HOME_TAB_POINT_1920)
+        self._click_abs(int(point[0]), int(point[1]), "GO_HOME")
+        time.sleep(1.5)
+        # Verify we reached Home: its tab is now active, so the anchor matches.
+        home_tab = self._app_path("assets", "assert", "home_anchor.png")
+        reached = self._locate_image_center_in_scaled_arena_region(
+            home_tab, "GO_HOME_VERIFY", rel_region=(0, 0, 760, 260),
+            confidence=0.75, timeout=2.0,
+        ) is not None
+        if reached:
+            bot_logger.log_info("Quest refresh: reached Home (fixed-coord click).")
+        else:
+            bot_logger.log_info("Quest refresh: Home click did not land on Home; will retry.")
+        return reached
+
+    def _refresh_quests_from_home(self) -> bool:
+        """Dip back to Home so MTGA re-fetches quests, then refresh the local
+        cache + UI.
+
+        MTGA only logs quest progress on Home (QuestGetQuests); the event page the
+        bot re-queues from never re-logs it, so quest data and the UI would freeze
+        at their startup values. This returns to Home, waits for a fresh quests
+        block, and refreshes. Bounded and self-healing: if Home is not reached it
+        aborts quickly and the caller falls back to the normal re-queue, so it can
+        never permanently stall the bot. Returns True if Home was reached."""
+        if self._stop_requested:
+            return False
+        if self._get_state_from_log() == BotState.IN_GAME:
+            return False
+        bot_logger.log_info("Quest refresh: dipping to Home to re-fetch quest progress.")
+        reached = False
+        for _ in range(3):
+            if self._stop_requested:
+                return False
+            if self._navigate_to_home():
+                reached = True
+                break
+            time.sleep(0.8)
+        if not reached:
+            bot_logger.log_info("Quest refresh: Home tab not found; will retry after more matches.")
+            return False
+        # Give MTGA a moment to land on Home and log a fresh quests block, polling
+        # the parser until it picks the new data up (or a short timeout elapses).
+        prev_active = self._cached_active_quest_id
+        prev_progress = {q.get("id"): q.get("progress") for q in self._cached_quests}
+        deadline = time.time() + 8.0
+        while time.time() < deadline and not self._stop_requested:
+            time.sleep(1.0)
+            self.refresh_quests_cache()
+            new_progress = {q.get("id"): q.get("progress") for q in self._cached_quests}
+            if new_progress != prev_progress or self._cached_active_quest_id != prev_active:
+                break
+        bot_logger.log_info(
+            "Quest refresh: done (active {} -> {}, colors {}).".format(
+                prev_active or "-",
+                self._cached_active_quest_id or "-",
+                self._cached_active_colors or "-",
+            )
+        )
+        return True
 
     def _accounts_base_dir(self) -> str:
         base = self._app_path("Accounts")
@@ -2059,6 +2219,58 @@ class Controller(ControllerSecondary):
             return True
         return False
 
+    def _dismiss_match_end_screen(self) -> bool:
+        """Safety net for a DEFEAT/VICTORY result screen the post-match timer
+        failed to dismiss, so the queue loop never stalls on it.
+
+        The full-screen result hides every nav anchor, so detect() returns not-ok
+        -- but so do brief loading transitions. To avoid clicking mid-transition we
+        only act after the screen has stayed unrecognized across several
+        consecutive navigation attempts, then click the continue prompt + center
+        (language-independent, no result-text template needed). Returns True if it
+        clicked, so the caller restarts navigation on the next loop."""
+        if self._stop_requested:
+            return False
+        # In a game the anchors are legitimately different; never click there.
+        if self._get_state_from_log() == BotState.IN_GAME:
+            self._unknown_screen_strikes = 0
+            return False
+        try:
+            det = self._arena_region_provider.detect(write_debug_on_fail=False)
+        except Exception:
+            det = None
+        if det is not None and det.ok:
+            # Back on a recognizable Arena screen -- let normal navigation proceed.
+            self._unknown_screen_strikes = 0
+            return False
+        # Unrecognized/blank screen. Require persistence so a normal loading
+        # transition is not mistaken for a stuck result screen.
+        self._unknown_screen_strikes = getattr(self, "_unknown_screen_strikes", 0) + 1
+        if self._unknown_screen_strikes < 3:
+            return False
+        arena = det.region if (det is not None and det.region is not None) else self._get_ui_action_arena_region(
+            force_reacquire=True, label="MATCH_END_RECOVER"
+        )
+        if arena is None:
+            return False
+        cx = int(arena[0] + (arena[2] // 2))
+        continue_y = int(arena[1] + (arena[3] * 0.93))
+        center_y = int(arena[1] + (arena[3] // 2))
+        bot_logger.log_info(
+            f"Match-end recovery: screen unrecognized for {self._unknown_screen_strikes} tries; clicking continue to advance."
+        )
+        if focus_mtga_window():
+            time.sleep(0.2)
+        for ty in (continue_y, center_y):
+            if self._stop_requested:
+                break
+            self.input.move_abs(cx, ty)
+            time.sleep(0.25)
+            self.input.left_click(1)
+            time.sleep(0.5)
+        self._unknown_screen_strikes = 0
+        return True
+
     def _queue_from_event_landing(self, target_colors: str) -> bool:
         """Re-queue directly from the Starter Deck Duel event landing page.
 
@@ -2114,6 +2326,12 @@ class Controller(ControllerSecondary):
         # A post-match reward popup covers the Play/Events controls; clear it
         # first so navigation is not stuck retrying against a blocked screen.
         if self._dismiss_reward_popup():
+            return False
+
+        # Safety net: a DEFEAT/VICTORY result screen the post-match timer failed
+        # to dismiss also covers the Play/Events controls. Clear it so the queue
+        # loop never spins forever on a screen that still shows the result.
+        if self._dismiss_match_end_screen():
             return False
 
         # Populate the quest cache the first time we reach navigation (in case the
@@ -2480,6 +2698,16 @@ class Controller(ControllerSecondary):
             bot_logger.log_info("Account switch pending; skipping queue click.")
             return
         if self._game_mode == "starter":
+            # Every N matches, dip back to Home so MTGA re-fetches quest progress
+            # (it is only logged on Home). Bounded + self-healing: on any failure
+            # we simply continue the normal re-queue below, so this can never
+            # stall the bot. The subsequent navigation naturally resumes from Home.
+            if self._matches_since_quest_refresh >= self._quest_refresh_every_n_matches:
+                self._matches_since_quest_refresh = 0
+                try:
+                    self._refresh_quests_from_home()
+                except Exception as e:
+                    bot_logger.log_error(f"Quest refresh error: {e}")
             # Starter Deck Duel is not re-entered by a single Play click; it needs
             # the full Events > In Progress > banner navigation each time. The
             # navigation is self-limiting when not on the home/Play blade screen.
@@ -4183,22 +4411,59 @@ class Controller(ControllerSecondary):
         if arena is not None:
             center_x = int(arena[0] + (arena[2] // 2))
             center_y = int(arena[1] + (arena[3] // 2))
+            # The DEFEAT/VICTORY "[Click to Continue]" prompt sits near the bottom
+            # of the board, not the middle. Clicking only the arena center lands on
+            # the DEFEAT crest and does NOT advance the screen, leaving the bot stuck
+            # on the match-end screen forever (no supervisor to recover it). Click
+            # the continue prompt too.
+            continue_x = center_x
+            continue_y = int(arena[1] + (arena[3] * 0.93))
             source = f"arena_center arena={arena}"
         else:
             center_x = (self.screen_bounds[0][0] + self.screen_bounds[1][0]) // 2
             center_y = (self.screen_bounds[0][1] + self.screen_bounds[1][1]) // 2
+            continue_x = center_x
+            continue_y = int(self.screen_bounds[0][1] + (self.screen_bounds[1][1] - self.screen_bounds[0][1]) * 0.93)
             source = f"screen_bounds_center screen_bounds={self.screen_bounds}"
-        bot_logger.log_info(f"Dismiss end screen: clicking {source} target=({center_x}, {center_y})")
+        bot_logger.log_info(f"Dismiss end screen: clicking {source} center=({center_x}, {center_y}) continue=({continue_x}, {continue_y})")
         bot_logger.log_click(center_x, center_y, "DISMISS_END_SCREEN")
         runtime_status.touch_input("DISMISS_END_SCREEN", (center_x, center_y))
-        self.input.move_abs(center_x, center_y)
-        time.sleep(0.5)
-        self.input.left_click(1)
-        time.sleep(1)
-        # Click again in case first click wasn't enough
-        self.input.left_click(1)
-        bot_logger.log_info("Match completed - dismissed end screen")
+        # Click to advance past the result screen, then VERIFY we actually left it
+        # before handing off to the queue loop. A single center click lands on the
+        # DEFEAT crest and does not always advance; a late-rendering result screen
+        # also swallows the first click. Without a verified dismissal the queue loop
+        # spins forever navigating a screen that still shows the result (this
+        # stalled farming until an external clicker intervened). Retry the
+        # continue-prompt + center clicks until the top-left nav anchor reappears --
+        # language-independent, since that anchor is absent on the full-screen
+        # result and present on every normal Arena screen.
+        advanced = False
+        for attempt in range(1, 7):
+            if self._stop_requested:
+                break
+            for (tx, ty) in ((continue_x, continue_y), (center_x, center_y)):
+                self.input.move_abs(tx, ty)
+                time.sleep(0.25)
+                self.input.left_click(1)
+                time.sleep(0.4)
+            time.sleep(1.1)
+            if self._match_end_screen_cleared():
+                advanced = True
+                bot_logger.log_info(f"Match completed - dismissed end screen (confirmed after {attempt} attempt(s))")
+                break
+            bot_logger.log_info(f"Dismiss end screen: result screen still up after attempt {attempt}; retrying continue-click.")
+        if not advanced:
+            bot_logger.log_info("Match completed - dismissed end screen (unconfirmed; queue loop safety net will keep retrying)")
         self._match_end_dismissed = True
+        self._matches_since_quest_refresh += 1
+        # Count a daily win once per match (the bot knows the result). Used by
+        # quest-mode account switching.
+        if self.__last_match_won is True and not self._win_counted_this_match:
+            self._daily_wins_this_account += 1
+            self._win_counted_this_match = True
+            bot_logger.log_info(
+                f"Daily win counted: {self._daily_wins_this_account} win(s) this account."
+            )
         self._post_match_ready_ts = time.time()
         threading.Timer(self._post_match_delay_sec, self._maybe_post_match_action).start()
         if self._queue_ready:
@@ -4212,12 +4477,34 @@ class Controller(ControllerSecondary):
                 # Backwards compatible: callback may not accept args
                 self.__match_end_callback()
 
+    def _match_end_screen_cleared(self) -> bool:
+        """True once we are back on a recognizable Arena screen after a match.
+
+        The full-screen DEFEAT/VICTORY result hides the top-left navigation
+        anchor, so a positive anchor match (detect().ok) means the result screen
+        is gone and normal navigation can resume. Language-independent -- it keys
+        on UI anchors, not result text. Falls back to the player-log HOME state so
+        a detector hiccup during a transition still lets the bot proceed."""
+        try:
+            det = self._arena_region_provider.detect(write_debug_on_fail=False)
+            if det is not None and det.ok:
+                return True
+        except Exception:
+            pass
+        try:
+            if self._get_state_from_log() == BotState.HOME:
+                return True
+        except Exception:
+            pass
+        return False
+
     def reset_for_new_game(self):
         """Reset controller state for a new game - complete fresh start"""
         bot_logger.log_info("Resetting controller state for new game")
         self.__has_mulled_keep = False
         self.__system_seat_id = None
         self.__last_match_won = None
+        self._win_counted_this_match = False
         self.__last_seen_match_id = None
         self.__attack_target_required = False
         self.__attack_target_attacker_ids = []
@@ -4482,7 +4769,32 @@ class Controller(ControllerSecondary):
                 "phase strip / stops UI instead of the intended target (misclick signal)."
             )
 
+    def _main_quests_completed(self) -> int:
+        """How many of this account's starting daily quests are now completed.
+
+        A completed daily quest drops out of the quest list, so completions =
+        starting quest ids that are no longer present. Uses the cached quest list
+        (refreshed between matches) so it stays cheap in the frequently-called
+        switch check; relies only on quest ids, which the log exposes reliably."""
+        if not self._account_start_quest_ids:
+            return 0
+        # _cached_quests is [] only when a valid empty block was parsed (all daily
+        # quests done); a failed refresh keeps the previous non-empty cache, so an
+        # empty current set here genuinely means every starting quest is completed.
+        current_ids = {str(v.get("id")) for v in (self._cached_quests or []) if v.get("id")}
+        return len(self._account_start_quest_ids - current_ids)
+
     def _account_switch_due(self) -> bool:
+        # Quest mode: switch once the configured number of main quests are
+        # completed AND the configured daily wins are reached. A 0 threshold means
+        # "no requirement" for that dimension; if both are 0 the mode is disabled.
+        if self._account_switch_mode == "quests":
+            if self._account_switch_main_quests <= 0 and self._account_switch_daily_wins <= 0:
+                return False
+            main_ok = self._main_quests_completed() >= self._account_switch_main_quests
+            wins_ok = self._daily_wins_this_account >= self._account_switch_daily_wins
+            return main_ok and wins_ok
+        # Time mode (default): switch every N minutes.
         if self._account_switch_interval <= 0:
             return False
         return (time.time() - self._last_account_switch_ts) >= self._account_switch_interval
@@ -4818,6 +5130,11 @@ class Controller(ControllerSecondary):
         if self._account_switch_in_progress:
             return
         self._account_switch_in_progress = True
+        # Reset quest-mode tracking so the incoming account is measured fresh:
+        # re-capture its starting quest ids and restart its daily-win count.
+        self._account_start_quest_ids = None
+        self._daily_wins_this_account = 0
+        self._win_counted_this_match = False
         runtime_status.clear_intentional_wait()
         runtime_status.set_mode("account_switch", bot_state=str(self._get_state_from_log()))
         queued_after_login = False
@@ -6721,6 +7038,57 @@ class Controller(ControllerSecondary):
             bot_logger.log_error(f"Failed to resolve removal target: {e}")
             return None
 
+    def __grp_id_for_instance(self, instance_id):
+        """Map a battlefield/stack instanceId to its grpId (card id)."""
+        if instance_id is None:
+            return None
+        for obj in (self.updated_game_state.get_game_objects() or []):
+            if isinstance(obj, dict) and obj.get("instanceId") == instance_id:
+                return obj.get("grpId")
+        return None
+
+    def __is_self_buff_source(self, source_id) -> bool:
+        """True if the spell on the stack is a pump/protect trick to cast on our
+        own creature (e.g. Fake Your Own Death). Delegates to the shared profile."""
+        try:
+            return RemovalLogic.is_self_buff(self.__grp_id_for_instance(source_id))
+        except Exception:
+            return False
+
+    def __is_my_creature(self, instance_id) -> bool:
+        """True if instance_id is a creature WE control (battlefield permanent)."""
+        if instance_id is None or self.__system_seat_id is None:
+            return False
+        for obj in (self.updated_game_state.get_game_objects() or []):
+            if isinstance(obj, dict) and obj.get("instanceId") == instance_id:
+                return (
+                    obj.get("controllerSeatId") == self.__system_seat_id
+                    and "CardType_Creature" in (obj.get("cardTypes") or [])
+                )
+        return False
+
+    def __best_own_attacker_among(self, candidate_ids) -> int | None:
+        """Our creature with the highest power (attack) among the legal own
+        targets, preferring one that is currently attacking. Rule for self-buff
+        tricks: pump our biggest attacker."""
+        if not candidate_ids:
+            return None
+        game_objects = self.updated_game_state.get_game_objects() or []
+        obj_by_id = {
+            o.get("instanceId"): o for o in game_objects if isinstance(o, dict)
+        }
+        best_id = None
+        best_key = None
+        for cid in candidate_ids:
+            obj = obj_by_id.get(cid) or {}
+            attacking = 1 if obj.get("attackState") == "AttackState_Attacking" else 0
+            power = RemovalLogic._stat(obj.get("power"))
+            key = (attacking, power)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_id = int(cid)
+        return best_id
+
     def __schedule_creature_target_selection(self, source_id, creature_id, reason, *, friendly=False):
         """Target a creature: click it via hover-scan, then submit. Clicks our own
         battlefield row when `friendly` (a "target creature you control" spell),
@@ -7002,6 +7370,32 @@ class Controller(ControllerSecondary):
             f"{reason}: target decision -- removal_target={removal_target} "
             f"opp_creatures={legal_creature_ids} own_creatures={own_creature_ids} face_legal={face_legal}"
         )
+
+        # Self-target buff / combat trick (e.g. Fake Your Own Death): it must ONLY
+        # ever land on a creature WE control -- never an enemy (that buffs the
+        # opponent) and never the avatar. Runs first, before any removal/enemy/face
+        # logic. We re-derive our creatures from ALL offered legal targets (both
+        # lists) rather than trusting own_creature_ids, because the game-state
+        # target path can classify them into the enemy list. If none of the legal
+        # targets is ours, we refuse rather than buff an enemy.
+        if self.__is_self_buff_source(source_id):
+            all_legal = list(legal_creature_ids or []) + list(own_creature_ids or [])
+            our_legal = [cid for cid in all_legal if self.__is_my_creature(cid)]
+            buff_target = self.__best_own_attacker_among(our_legal)
+            if buff_target is not None:
+                bot_logger.log_info(
+                    f"{reason}: self-buff spell; targeting our highest-attack creature "
+                    f"{buff_target} of {our_legal}."
+                )
+                self.__schedule_creature_target_selection(
+                    source_id, buff_target, reason, friendly=True
+                )
+                return
+            bot_logger.log_info(
+                f"{reason}: self-buff spell but no friendly creature among legal targets "
+                f"{all_legal}; refusing to target an enemy."
+            )
+            return
 
         # Reconcile the profile-based result with the prompt's explicit legal
         # targets. This makes creature removal robust even when we have no oracle

@@ -1499,6 +1499,12 @@ class ConfigManager:
             "first_run_prereq_ack_version": 1,
             "game_mode": "historic",
             "account_switch_minutes": 0,
+            # Account-switch trigger: "time" (every N minutes) or "quests"
+            # (when main-quest completions and daily wins reach the thresholds).
+            # The two modes are mutually exclusive.
+            "account_switch_mode": "time",
+            "account_switch_main_quests": 0,   # 0-3 main quests to complete
+            "account_switch_daily_wins": 0,    # 0-15 daily wins to reach
             "managed_accounts": [],
             "account_cycle_index": 0,
             "account_play_order": [],
@@ -1665,6 +1671,47 @@ class ConfigManager:
         if minutes_i < 0:
             minutes_i = 0
         self.config["account_switch_minutes"] = minutes_i
+        self._save_config()
+
+    def get_account_switch_mode(self) -> str:
+        mode = str(self.config.get("account_switch_mode", "time")).strip().lower()
+        return mode if mode in ("time", "quests") else "time"
+
+    def set_account_switch_mode(self, mode: str) -> None:
+        mode_s = str(mode).strip().lower()
+        if mode_s not in ("time", "quests"):
+            mode_s = "time"
+        self.config["account_switch_mode"] = mode_s
+        self._save_config()
+
+    def get_account_switch_main_quests(self) -> int:
+        try:
+            value = int(self.config.get("account_switch_main_quests", 0))
+        except (TypeError, ValueError):
+            value = 0
+        return max(0, min(3, value))
+
+    def set_account_switch_main_quests(self, count: int) -> None:
+        try:
+            value = int(count)
+        except (TypeError, ValueError):
+            return
+        self.config["account_switch_main_quests"] = max(0, min(3, value))
+        self._save_config()
+
+    def get_account_switch_daily_wins(self) -> int:
+        try:
+            value = int(self.config.get("account_switch_daily_wins", 0))
+        except (TypeError, ValueError):
+            value = 0
+        return max(0, min(15, value))
+
+    def set_account_switch_daily_wins(self, count: int) -> None:
+        try:
+            value = int(count)
+        except (TypeError, ValueError):
+            return
+        self.config["account_switch_daily_wins"] = max(0, min(15, value))
         self._save_config()
 
     def _repo_root(self) -> str:
@@ -3099,6 +3146,9 @@ class MTGBotUI(tk.Tk):
             screen_bounds = self.config_manager.get_screen_bounds()
             input_backend = self.config_manager.get_input_backend()
             account_switch_minutes = self.config_manager.get_account_switch_minutes()
+            account_switch_mode = self.config_manager.get_account_switch_mode()
+            account_switch_main_quests = self.config_manager.get_account_switch_main_quests()
+            account_switch_daily_wins = self.config_manager.get_account_switch_daily_wins()
             account_cycle_index = self.config_manager.get_account_cycle_index()
             account_play_order = self.config_manager.get_account_play_order()
             game_mode = self.config_manager.get_game_mode()
@@ -3114,6 +3164,9 @@ class MTGBotUI(tk.Tk):
             controller = Controller(log_path=log_path, screen_bounds=screen_bounds,
                                    click_targets=click_targets, input_backend=input_backend,
                                    account_switch_minutes=account_switch_minutes,
+                                   account_switch_mode=account_switch_mode,
+                                   account_switch_main_quests=account_switch_main_quests,
+                                   account_switch_daily_wins=account_switch_daily_wins,
                                    account_cycle_index=account_cycle_index,
                                    account_play_order=account_play_order,
                                    game_mode=game_mode)
@@ -5018,20 +5071,39 @@ class SwitchAccountWindow(tk.Toplevel):
         self._create_manage_group_panel("accounts_block", x=16, y=136, width=428, height=410)
         self._create_manage_group_panel("order_block", x=16, y=558, width=428, height=220)
 
-        cv.create_text(26, 48, text="Switch account (min)", fill=c["text"], font=("Segoe UI", 10), anchor="nw")
+        # Row 1: switch trigger mode (time vs quests, mutually exclusive) + time.
+        cv.create_text(26, 46, text="Switch by:", fill=c["text"], font=("Segoe UI", 10), anchor="nw")
+        self.switch_mode_var = tk.StringVar(value=self._config_manager.get_account_switch_mode())
+        mode_combo = ttk.Combobox(
+            self, textvariable=self.switch_mode_var, values=["time", "quests"],
+            state="readonly", width=8,
+        )
+        mode_combo.configure(style="ManageFire.TCombobox")
+        cv.create_window(104, 44, anchor="nw", window=mode_combo)
+        cv.create_text(206, 46, text="Time min:", fill=c["text_muted"], font=("Segoe UI", 9), anchor="nw")
         self.switch_minutes_var = tk.StringVar(value=str(self._config_manager.get_account_switch_minutes()))
-        switch_entry = self._make_entry(self, textvariable=self.switch_minutes_var, width=6)
-        switch_entry.bind("<Return>", lambda _e: self._save_switch_minutes())
-        cv.create_window(178, 50, anchor="nw", window=switch_entry)
-        cv.create_text(244, 48, text="0 = off", fill=c["text_muted"], font=("Segoe UI", 9), anchor="nw")
+        time_entry = self._make_entry(self, textvariable=self.switch_minutes_var, width=5)
+        cv.create_window(282, 44, anchor="nw", window=time_entry)
+        cv.create_text(360, 46, text="(0=off)", fill=c["text_muted"], font=("Segoe UI", 8), anchor="nw")
+        # Row 2: quest-mode thresholds + save.
+        cv.create_text(26, 78, text="Main 0-3:", fill=c["text_muted"], font=("Segoe UI", 9), anchor="nw")
+        self.switch_main_var = tk.StringVar(value=str(self._config_manager.get_account_switch_main_quests()))
+        main_entry = self._make_entry(self, textvariable=self.switch_main_var, width=3)
+        cv.create_window(92, 76, anchor="nw", window=main_entry)
+        cv.create_text(150, 78, text="Wins 0-15:", fill=c["text_muted"], font=("Segoe UI", 9), anchor="nw")
+        self.switch_daily_var = tk.StringVar(value=str(self._config_manager.get_account_switch_daily_wins()))
+        daily_entry = self._make_entry(self, textvariable=self.switch_daily_var, width=3)
+        cv.create_window(226, 76, anchor="nw", window=daily_entry)
+        for _e in (time_entry, main_entry, daily_entry):
+            _e.bind("<Return>", lambda _ev: self._save_switch_settings())
         self._create_manage_canvas_button(
             name="save_switch",
-            text="Save Time",
-            x=26,
-            y=76,
-            body_w=150,
-            body_h=34,
-            command=self._save_switch_minutes,
+            text="Save",
+            x=290,
+            y=74,
+            body_w=132,
+            body_h=26,
+            command=self._save_switch_settings,
             primary=True,
         )
 
@@ -5258,19 +5330,42 @@ class SwitchAccountWindow(tk.Toplevel):
             )
         return accounts
 
-    def _save_switch_minutes(self):
+    def _save_switch_settings(self):
+        # Mode (time vs quests -- mutually exclusive).
+        mode = (self.switch_mode_var.get() or "time").strip().lower()
+        self._config_manager.set_account_switch_mode(mode)
+        # Time interval (minutes, 0 = off).
         raw = (self.switch_minutes_var.get() or "").strip()
-        if raw == "":
-            return
-        try:
-            minutes = int(raw)
-        except ValueError:
-            return
-        if minutes < 0:
-            minutes = 0
-        self.switch_minutes_var.set(str(minutes))
-        self._config_manager.set_account_switch_minutes(minutes)
-        messagebox.showinfo("Saved", "Switch account minutes saved.")
+        if raw != "":
+            try:
+                minutes = max(0, int(raw))
+                self.switch_minutes_var.set(str(minutes))
+                self._config_manager.set_account_switch_minutes(minutes)
+            except ValueError:
+                pass
+        # Main quests to complete (0-3).
+        raw_m = (self.switch_main_var.get() or "").strip()
+        if raw_m != "":
+            try:
+                mq = max(0, min(3, int(raw_m)))
+                self.switch_main_var.set(str(mq))
+                self._config_manager.set_account_switch_main_quests(mq)
+            except ValueError:
+                pass
+        # Daily wins to reach (0-15).
+        raw_d = (self.switch_daily_var.get() or "").strip()
+        if raw_d != "":
+            try:
+                dw = max(0, min(15, int(raw_d)))
+                self.switch_daily_var.set(str(dw))
+                self._config_manager.set_account_switch_daily_wins(dw)
+            except ValueError:
+                pass
+        if mode == "quests":
+            detail = f"quests ({self.switch_main_var.get()} main + {self.switch_daily_var.get()} wins)"
+        else:
+            detail = f"time ({self.switch_minutes_var.get()} min)"
+        messagebox.showinfo("Saved", f"Account-switch settings saved: {detail}.")
 
     def _refresh_order_choices(self):
         names = []

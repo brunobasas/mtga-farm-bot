@@ -644,6 +644,18 @@ class DummyAI(AIKernel):
                     except Exception:
                         removal_bf_ids = set()
                     removal_bf_ids = removal_bf_ids or None
+                    # Do we control a creature on the battlefield? Self-buff tricks
+                    # (e.g. Fake Your Own Death) must not be cast with nothing of
+                    # ours to buff -- otherwise the only legal target is an enemy,
+                    # which we must never buff.
+                    _own_bf = removal_bf_ids if removal_bf_ids else set()
+                    have_own_creature = any(
+                        isinstance(o, dict)
+                        and o.get('controllerSeatId') == my_seat
+                        and 'CardType_Creature' in (o.get('cardTypes') or [])
+                        and (not _own_bf or o.get('zoneId') in _own_bf)
+                        for o in removal_game_objects
+                    )
                     allow_sorcery = phase in ['Phase_Main1', 'Phase_Main2']
                     sorcery_found = 0
                     sorcery_castable = 0
@@ -695,6 +707,14 @@ class DummyAI(AIKernel):
 
                         # Check if we can pay the mana cost (color + total)
                         if self._can_cast_with_mana_costs(action_mana_cost, eff_colors, eff_total_mana, eff_sources):
+                            # Self-buff trick (e.g. Fake Your Own Death) with no
+                            # creature of ours to buff: skip. Its only legal target
+                            # would be an enemy, which we must never buff.
+                            if RemovalLogic.is_self_buff(grp_id) and not have_own_creature:
+                                self._debug(
+                                    f"Self-buff {card_name}: we control no creature to target; skipping cast."
+                                )
+                                continue
                             # Targeted removal: only cast it if it has a valid
                             # target (kills a creature, or is lethal to the face).
                             removal_profile = RemovalLogic.get_removal_profile(grp_id)
@@ -707,13 +727,28 @@ class DummyAI(AIKernel):
                                     battlefield_zone_ids=removal_bf_ids,
                                 )
                                 if _rm_target is None:
-                                    self._debug(
-                                        f"Removal {card_name} has no killable target; skipping cast."
+                                    # A non-permanent removal spell (instant/sorcery)
+                                    # is wasted without a target, so skip it. But a
+                                    # creature/permanent whose removal is just an
+                                    # activated or triggered ability (e.g. Fanatical
+                                    # Firebrand's sacrifice) still has board value --
+                                    # cast it as a creature and keep the ability for
+                                    # later. Casting the permanent needs no target.
+                                    is_spell_removal = (
+                                        'Instant' in card_types or 'Sorcery' in card_types
                                     )
-                                    continue
-                                self._debug(
-                                    f"Removal {card_name} target={_rm_target} (profile={removal_profile})."
-                                )
+                                    if is_spell_removal:
+                                        self._debug(
+                                            f"Removal {card_name} has no killable target; skipping cast."
+                                        )
+                                        continue
+                                    self._debug(
+                                        f"Removal {card_name} has no target; casting as creature/permanent for board presence."
+                                    )
+                                else:
+                                    self._debug(
+                                        f"Removal {card_name} target={_rm_target} (profile={removal_profile})."
+                                    )
                             # Pump-fight (e.g. Felling Blow): only cast it if we
                             # have a creature to buff AND an enemy it can then
                             # kill (our best power + counter >= enemy toughness).
