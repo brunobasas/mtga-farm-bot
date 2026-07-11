@@ -1,4 +1,5 @@
 import json
+import time
 import urllib.request
 import urllib.error
 import os
@@ -13,6 +14,27 @@ from runtime_paths import ensure_runtime_subdir
 # lookup fail, and the failures were cached as empty strings -- which is why
 # removal detection (and anything else needing oracle text) silently broke.
 _SCRYFALL_HEADERS = {"User-Agent": "MTGABot/1.0", "Accept": "application/json"}
+
+# In-memory (never persisted) negative cache for transient Scryfall failures
+# (network unreachable, timeout, 429/500...). Genuine 404s are cached to disk
+# as "no data" (see _scryfall_cache / _scryfall_oracle_cache below), but a
+# transient failure must not poison that persistent cache -- one bad response
+# would then look like "confirmed no data" forever. Without any cooldown at
+# all, though, every decision-loop call for the same card re-issues a blocking
+# request with the same failure, which can burn the in-game priority timer.
+# This short in-memory cooldown is the middle ground: fast-fail for a few
+# minutes, then try again in case connectivity/rate-limiting recovered.
+_TRANSIENT_FAILURE_TTL_SEC = 120
+_transient_failure_until: dict[str, float] = {}
+
+
+def _transient_failure_active(cache_key: str) -> bool:
+    until = _transient_failure_until.get(cache_key)
+    return until is not None and time.time() < until
+
+
+def _mark_transient_failure(cache_key: str) -> None:
+    _transient_failure_until[cache_key] = time.time() + _TRANSIENT_FAILURE_TTL_SEC
 
 
 def _app_root_dir() -> str:
@@ -299,6 +321,8 @@ def get_produced_mana_from_scryfall(arena_id: int):
     # Check cache first
     if cache_key in _scryfall_cache:
         return _scryfall_cache[cache_key]
+    if _transient_failure_active(cache_key):
+        return None
 
     # Fetch from Scryfall
     try:
@@ -319,8 +343,11 @@ def get_produced_mana_from_scryfall(arena_id: int):
         if e.code == 404:
             _scryfall_cache[cache_key] = None
             _save_scryfall_cache()
+        else:
+            _mark_transient_failure(cache_key)
         return None
-    except (urllib.error.URLError, json.JSONDecodeError, Exception):
+    except (urllib.error.URLError, json.JSONDecodeError):
+        _mark_transient_failure(cache_key)
         return None
 
 
@@ -332,6 +359,8 @@ def get_oracle_text_from_scryfall(arena_id: int):
     cache_key = str(arena_id)
     if cache_key in _scryfall_oracle_cache:
         return _scryfall_oracle_cache[cache_key]
+    if _transient_failure_active(cache_key):
+        return ""
     try:
         url = f"https://api.scryfall.com/cards/arena/{arena_id}"
         req = urllib.request.Request(url, headers=_SCRYFALL_HEADERS)
@@ -349,9 +378,13 @@ def get_oracle_text_from_scryfall(arena_id: int):
         if e.code == 404:
             _scryfall_oracle_cache[cache_key] = ""
             _save_scryfall_oracle_cache()
+        else:
+            _mark_transient_failure(cache_key)
         return ""
-    except (urllib.error.URLError, json.JSONDecodeError, Exception):
-        # Network/parse failure: transient, do not poison the cache.
+    except (urllib.error.URLError, json.JSONDecodeError):
+        # Network/parse failure: transient, do not poison the persistent cache,
+        # but do avoid hammering it for a couple of minutes.
+        _mark_transient_failure(cache_key)
         return ""
 
 
@@ -372,6 +405,9 @@ def get_land_produced_colors(arena_id: int):
         title_id = card_info.get('titleId')
         if title_id in BASIC_LAND_MANA_MAP:
             return {BASIC_LAND_MANA_MAP[title_id]}
+        name = card_info.get('name')
+        if name in BASIC_LAND_NAME_MAP:
+            return {BASIC_LAND_NAME_MAP[name]}
 
     # For non-basic lands, try Scryfall
     produced_mana = get_produced_mana_from_scryfall(arena_id)
@@ -389,6 +425,18 @@ BASIC_LAND_MANA_MAP = {
     652: "blue",     # Island (verified)
     653: "black",    # Swamp (verified)
     1250: "red",     # Mountain (verified)
+}
+
+# Basic land name -> mana color, keyed by name rather than titleId. The curated
+# Starter Deck Duel DB (data/starter_deck_cards.json) has no titleId field, so it
+# shadows cards.json for every basic-land grpId and BASIC_LAND_MANA_MAP alone
+# would miss every basic in that mode and fall back to a live Scryfall call.
+BASIC_LAND_NAME_MAP = {
+    "Plains": "white",
+    "Island": "blue",
+    "Swamp": "black",
+    "Mountain": "red",
+    "Forest": "green",
 }
 
 # abilityGrpId to mana color mapping for ActionType_Activate_Mana.
@@ -487,6 +535,33 @@ def warm_up_starter_data() -> dict:
     return {"cards": len(_starter_cards), "removal": removal, "counter": counter}
 
 
+_card_data_index: dict = {}
+_card_data_index_state: tuple | None = None
+
+
+def _get_card_data_index() -> dict:
+    """grpId -> card dict, rebuilt from _card_data whenever it changes.
+
+    _card_data is a plain list scanned linearly by get_card_info, which used to
+    be an O(n) walk over the full (Scryfall-bulk-sized) card DB on every miss of
+    the small starter dict -- expensive when called per-creature inside the
+    hot removal/fight evaluation loop. The (id, len) pair changes on both an
+    in-place append and a wholesale reassignment (reload_cards_from_disk), which
+    are the only two ways _card_data is ever mutated, so it is a cheap and
+    correct staleness check without having to touch every call site.
+    """
+    global _card_data_index, _card_data_index_state
+    state = (id(_card_data), len(_card_data))
+    if state != _card_data_index_state:
+        _card_data_index = {
+            card.get("grpId"): card
+            for card in _card_data
+            if isinstance(card, dict) and card.get("grpId") is not None
+        }
+        _card_data_index_state = state
+    return _card_data_index
+
+
 def get_card_info(mtga_id: int):
     """
     Parameters
@@ -499,9 +574,9 @@ def get_card_info(mtga_id: int):
     starter = _starter_cards.get(str(mtga_id))
     if starter:
         return starter
-    for card in _card_data:
-        if card.get("grpId") == mtga_id:
-            return card
+    card = _get_card_data_index().get(mtga_id)
+    if card is not None:
+        return card
     # Not found in local data: try Scryfall once and cache.
     card = _fetch_card_info_from_scryfall(mtga_id)
     if card:
@@ -578,6 +653,9 @@ def get_land_mana_color(mtga_id: int):
     title_id = card_info.get('titleId')
     if title_id in BASIC_LAND_MANA_MAP:
         return BASIC_LAND_MANA_MAP[title_id]
+    name = card_info.get('name')
+    if name in BASIC_LAND_NAME_MAP:
+        return BASIC_LAND_NAME_MAP[name]
 
     # For non-basic lands with colors field, use that
     colors = card_info.get('colors', [])

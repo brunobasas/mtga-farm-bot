@@ -636,14 +636,7 @@ class DummyAI(AIKernel):
                         )
                     except Exception:
                         removal_opp_life = None
-                    removal_bf_ids = set()
-                    try:
-                        for _zone in (game_state.get_full_state().get('zones', []) or []):
-                            if _zone.get('type') == 'ZoneType_Battlefield' and _zone.get('zoneId') is not None:
-                                removal_bf_ids.add(_zone.get('zoneId'))
-                    except Exception:
-                        removal_bf_ids = set()
-                    removal_bf_ids = removal_bf_ids or None
+                    removal_bf_ids = RemovalLogic.battlefield_zone_ids(game_state.get_full_state()) or None
                     # Do we control a creature on the battlefield? Self-buff tricks
                     # (e.g. Fake Your Own Death) must not be cast with nothing of
                     # ours to buff -- otherwise the only legal target is an enemy,

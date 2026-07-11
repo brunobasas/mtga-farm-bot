@@ -44,8 +44,16 @@ _UNSUPPORTED_PATTERNS = [
 ]
 
 
+_unsupported_memo: dict[int, bool] = {}
+
+
 def is_unsupported_to_cast(grp_id) -> bool:
-    """True if we should skip casting this card (unimplemented chooser)."""
+    """True if we should skip casting this card (unimplemented chooser).
+
+    Called per-candidate-card on every AI decision, so the oracle-text result
+    is memoized once real oracle text is available (never for a transient
+    fetch failure -- see RemovalLogic's identical rationale).
+    """
     if grp_id is None:
         return False
     try:
@@ -54,6 +62,8 @@ def is_unsupported_to_cast(grp_id) -> bool:
         return False
     if grp_id in UNSUPPORTED_GRP_IDS or grp_id in STRATEGIC_SKIP_GRP_IDS:
         return True
+    if grp_id in _unsupported_memo:
+        return _unsupported_memo[grp_id]
     try:
         text = CardInfo.get_oracle_text(grp_id) or ""
     except Exception:
@@ -61,4 +71,6 @@ def is_unsupported_to_cast(grp_id) -> bool:
     if not text:
         return False
     t = text.replace("\n", " ")
-    return any(pattern.search(t) for pattern in _UNSUPPORTED_PATTERNS)
+    result = any(pattern.search(t) for pattern in _UNSUPPORTED_PATTERNS)
+    _unsupported_memo[grp_id] = result
+    return result

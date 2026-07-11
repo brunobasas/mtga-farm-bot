@@ -37,7 +37,13 @@ _RE_PUMP_FIGHT = re.compile(
 )
 
 
+_fight_profile_memo: dict[int, dict | None] = {}
+
+
 def get_fight_profile(grp_id) -> dict | None:
+    """Called per-candidate-card on every AI decision, so the oracle-based
+    result is memoized once real oracle text is available (never for a
+    transient fetch failure -- see RemovalLogic's identical rationale)."""
     if grp_id is None:
         return None
     try:
@@ -46,7 +52,9 @@ def get_fight_profile(grp_id) -> dict | None:
         return None
     if grp_id in MANUAL_PROFILES:
         return dict(MANUAL_PROFILES[grp_id])
-    text = ""
+    if grp_id in _fight_profile_memo:
+        profile = _fight_profile_memo[grp_id]
+        return dict(profile) if profile is not None else None
     try:
         text = CardInfo.get_oracle_text(grp_id) or ""
     except Exception:
@@ -54,9 +62,9 @@ def get_fight_profile(grp_id) -> dict | None:
     if not text:
         return None
     m = _RE_PUMP_FIGHT.search(text.replace("\n", " "))
-    if m:
-        return {"kind": "pump_fight", "counter": int(m.group(1))}
-    return None
+    profile = {"kind": "pump_fight", "counter": int(m.group(1))} if m else None
+    _fight_profile_memo[grp_id] = profile
+    return dict(profile) if profile is not None else None
 
 
 def our_creatures(

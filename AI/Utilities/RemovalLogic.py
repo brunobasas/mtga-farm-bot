@@ -53,17 +53,44 @@ MANUAL_PROFILES: dict[int, dict] = {
 }
 
 
+_removal_profile_memo: dict[int, dict | None] = {}
+
+
+def _removal_profile_lookup(grp_id: int) -> dict | None:
+    if grp_id in MANUAL_PROFILES:
+        return MANUAL_PROFILES[grp_id]
+    if grp_id in _removal_profile_memo:
+        return _removal_profile_memo[grp_id]
+    try:
+        text = CardInfo.get_oracle_text(grp_id) or ""
+    except Exception:
+        text = ""
+    profile = detect_profile_from_oracle(grp_id) if text else None
+    if text:
+        # Only memoize once we actually got oracle text. An empty result can be a
+        # transient Scryfall failure (see CardInfo's own negative-cache note), and
+        # caching that here would make the miss permanent even after the network
+        # recovers -- defeating the whole point of that cache being time-limited.
+        _removal_profile_memo[grp_id] = profile
+    return profile
+
+
 def get_removal_profile(grp_id: int | None) -> dict | None:
-    """Resolve a removal profile for a card: manual table first, else oracle."""
+    """Resolve a removal profile for a card: manual table first, else oracle.
+
+    A card's profile never changes within a process once real oracle text is
+    available, and this is called per-candidate-card on every AI decision and
+    every enemy-creature evaluation, so the oracle-based lookup is memoized; a
+    fresh dict is returned each call so callers can't mutate the cached entry.
+    """
     if grp_id is None:
         return None
     try:
         grp_id = int(grp_id)
     except Exception:
         return None
-    if grp_id in MANUAL_PROFILES:
-        return dict(MANUAL_PROFILES[grp_id])
-    return detect_profile_from_oracle(grp_id)
+    profile = _removal_profile_lookup(grp_id)
+    return dict(profile) if profile is not None else None
 
 
 # --- Self-target pump/protect tricks ---
@@ -77,6 +104,31 @@ SELF_BUFF_GRPIDS: set[int] = {80230, 90433, 92991, 93887}
 _RE_SELF_BUFF = re.compile(r"target creature gets \+\d+/", re.I)
 
 
+_self_buff_memo: dict[int, bool] = {}
+
+
+def _is_self_buff_lookup(grp_id: int) -> bool:
+    if grp_id in SELF_BUFF_GRPIDS:
+        return True
+    if grp_id in _self_buff_memo:
+        return _self_buff_memo[grp_id]
+    try:
+        text = str(CardInfo.get_oracle_text(grp_id) or "")
+    except Exception:
+        text = ""
+    # A card that is removal is not a self-buff, even if its text mentions a buff.
+    if text and get_removal_profile(grp_id):
+        result = False
+    else:
+        result = bool(_RE_SELF_BUFF.search(text))
+    if text:
+        # Same rationale as _removal_profile_lookup: only memoize once real
+        # oracle text was available, so a transient fetch failure doesn't
+        # permanently misclassify the card.
+        _self_buff_memo[grp_id] = result
+    return result
+
+
 def is_self_buff(grp_id) -> bool:
     """True if the card is a pump/protect trick to cast on our own creature."""
     if grp_id is None:
@@ -85,16 +137,7 @@ def is_self_buff(grp_id) -> bool:
         grp_id = int(grp_id)
     except Exception:
         return False
-    if grp_id in SELF_BUFF_GRPIDS:
-        return True
-    # A card that is removal is not a self-buff, even if its text mentions a buff.
-    if get_removal_profile(grp_id):
-        return False
-    try:
-        text = str(CardInfo.get_oracle_text(grp_id) or "")
-    except Exception:
-        return False
-    return bool(_RE_SELF_BUFF.search(text))
+    return _is_self_buff_lookup(grp_id)
 
 
 # --- Layer 1b: auto-detection from oracle text ---
@@ -260,6 +303,25 @@ def can_kill(profile: dict, creature: dict) -> bool:
         return effective_toughness(creature) <= int(profile.get("amount", 0))
 
     return False
+
+
+def battlefield_zone_ids(full_state: dict) -> set[int]:
+    """zoneIds of every ZoneType_Battlefield zone (both players' battlefields).
+
+    Was copy-pasted inline at four call sites (Controller.py's pay-costs,
+    removal-target and chooser-target handlers, and DummyAI.generate_move),
+    each wrapped in its own try/except-reset-to-empty-set; centralized here
+    next to CounterLogic.stack_zone_ids, which is the same pattern for the
+    stack zone.
+    """
+    ids: set[int] = set()
+    try:
+        for zone in (full_state or {}).get("zones", []) or []:
+            if zone.get("type") == "ZoneType_Battlefield" and zone.get("zoneId") is not None:
+                ids.add(zone.get("zoneId"))
+    except Exception:
+        return set()
+    return ids
 
 
 def opponent_creatures(

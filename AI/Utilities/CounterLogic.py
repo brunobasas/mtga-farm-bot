@@ -34,23 +34,10 @@ _RE_COUNTER_NONCREATURE = re.compile(r"counter target noncreature spell", re.I)
 _RE_COUNTER_ANY = re.compile(r"counter target spell", re.I)
 
 
-def get_counter_profile(grp_id) -> dict | None:
-    """Resolve a counter profile for a card, or None if it is not a counter."""
-    if grp_id is None:
-        return None
-    try:
-        grp_id = int(grp_id)
-    except Exception:
-        return None
-    if grp_id in MANUAL_PROFILES:
-        return dict(MANUAL_PROFILES[grp_id])
-    text = ""
-    try:
-        text = CardInfo.get_oracle_text(grp_id) or ""
-    except Exception:
-        text = ""
-    if not text:
-        return None
+_counter_profile_memo: dict[int, dict | None] = {}
+
+
+def _detect_counter_profile(text: str) -> dict | None:
     t = text.replace("\n", " ")
     if _RE_COUNTER_CREATURE.search(t):
         return {"restrict": "creature"}
@@ -59,6 +46,35 @@ def get_counter_profile(grp_id) -> dict | None:
     if _RE_COUNTER_ANY.search(t):
         return {"restrict": "any"}
     return None
+
+
+def get_counter_profile(grp_id) -> dict | None:
+    """Resolve a counter profile for a card, or None if it is not a counter.
+
+    Called per-candidate-card on every AI decision, so the oracle-based result
+    is memoized once real oracle text is available (never for a transient
+    fetch failure -- see RemovalLogic's identical rationale).
+    """
+    if grp_id is None:
+        return None
+    try:
+        grp_id = int(grp_id)
+    except Exception:
+        return None
+    if grp_id in MANUAL_PROFILES:
+        return dict(MANUAL_PROFILES[grp_id])
+    if grp_id in _counter_profile_memo:
+        profile = _counter_profile_memo[grp_id]
+        return dict(profile) if profile is not None else None
+    try:
+        text = CardInfo.get_oracle_text(grp_id) or ""
+    except Exception:
+        text = ""
+    if not text:
+        return None
+    profile = _detect_counter_profile(text)
+    _counter_profile_memo[grp_id] = profile
+    return dict(profile) if profile is not None else None
 
 
 def stack_zone_ids(full_state: dict) -> set[int]:
@@ -90,6 +106,13 @@ def opponent_spells_on_stack(
         if obj.get("controllerSeatId") == my_seat:
             continue
         if obj.get("instanceId") is None:
+            continue
+        # Triggered/activated abilities also live on the stack as objects with
+        # type "GameObjectType_Ability" (see Controller.py's stack-selection
+        # handling). "Counter target spell" cannot legally target those, so
+        # excluding them here keeps the AI from casting a counter at something
+        # MTGA will never offer as a legal target.
+        if str(obj.get("type") or "") == "GameObjectType_Ability":
             continue
         out.append(obj)
     return out

@@ -11,6 +11,7 @@ from pathlib import Path
 from Controller.ControllerInterface import ControllerSecondary
 import AI.Utilities.RemovalLogic as RemovalLogic
 import AI.Utilities.FightLogic as FightLogic
+import AI.Utilities.CounterLogic as CounterLogic
 import AI.Utilities.CardInfo as CardInfo
 from Controller.MTGAController.LogReader import LogReader
 from Controller.Utilities.GameState import GameState
@@ -340,6 +341,12 @@ class Controller(ControllerSecondary):
         self._account_start_quest_ids: set[str] | None = None
         self._daily_wins_this_account = 0
         self._win_counted_this_match = False
+        # The screenName that owns this account's quests block, latched from the
+        # first block we see after (re)start / account switch. Comparing against
+        # this fixed value -- instead of "whichever screenName is last in the log
+        # tail" -- avoids misreading an opponent's screenName (match-room events
+        # log both players' names) as a sign that the account changed.
+        self._current_account_screen_name: str | None = None
         bot_logger.log_info(
             "Account-switch config: mode={} time_min={} main_quests={} daily_wins={}".format(
                 self._account_switch_mode,
@@ -1795,24 +1802,31 @@ class Controller(ControllerSecondary):
         # Account-safety: a "quests" block belongs to whichever account was logged
         # in when MTGA wrote it. After an account switch the PREVIOUS account's
         # block is still in the log tail, and using it makes the bot farm the wrong
-        # account's quests (its colors/deck). Reject the block when the account
-        # that owns it (last screenName logged before it) differs from the current
-        # account (last screenName in the tail). No screenName -> single session,
-        # use it as before.
+        # account's quests (its colors/deck). We latch the owning screenName once
+        # per account session (the first quests block we parse after a fresh start
+        # / switch) and compare every later block against that fixed value.
+        #
+        # We deliberately do NOT use "the last screenName anywhere in the log
+        # tail" as "the current account": match-room events log BOTH players'
+        # screenNames (reservedPlayers), so after a single match the last
+        # occurrence is frequently the opponent's, which would make every
+        # subsequent (genuinely current) quests block look stale forever.
         try:
             name_matches = list(re.finditer(r'"screenName"\s*:\s*"([^"]+)"', log_tail))
-            if name_matches:
-                current_account = name_matches[-1].group(1)
-                owner = None
-                for m in name_matches:
-                    if m.start() < idx:
-                        owner = m.group(1)
-                    else:
-                        break
-                if owner is not None and owner != current_account:
+            owner = None
+            for m in name_matches:
+                if m.start() < idx:
+                    owner = m.group(1)
+                else:
+                    break
+            if owner is not None:
+                if self._current_account_screen_name is None:
+                    self._current_account_screen_name = owner
+                elif owner != self._current_account_screen_name:
                     bot_logger.log_info(
-                        f"Quests block ignored: belongs to '{owner}' but current account "
-                        f"is '{current_account}' (stale after account switch)."
+                        f"Quests block ignored: belongs to '{owner}' but this session's "
+                        f"account is '{self._current_account_screen_name}' (stale after "
+                        f"account switch)."
                     )
                     return None
         except Exception:
@@ -1869,7 +1883,7 @@ class Controller(ControllerSecondary):
         return False
 
     def _select_best_quest(self) -> dict | None:
-        quests = self._extract_latest_quests()
+        quests = self._extract_latest_quests() or []
         bot_logger.log_info(f"Post-login: parsed {len(quests)} quest entries from player.log.")
         guild_quests = self._parse_guild_quests(quests)
         if guild_quests:
@@ -2560,6 +2574,21 @@ class Controller(ControllerSecondary):
         self._click_abs(box_target[0], box_target[1], "STARTER_DECK_BOX")
         time.sleep(1.3)
 
+        # 1b) Verify the chooser actually opened before clicking the fixed grid
+        # position blindly. The Submit Deck button only renders while the chooser
+        # is open, so its presence is a reliable, deck-independent anchor; a miss
+        # here means the deck-box click did not land (or something else covers the
+        # event page), so we abort and keep the current deck rather than clicking
+        # the grid coordinates on whatever screen is actually showing.
+        submit_btn = os.path.join(self._buttons_dir(), "submit_deck.PNG")
+        if os.path.exists(submit_btn) and self._locate_image_center_in_scaled_arena_region(
+            submit_btn, "STARTER_DECK_CHOOSER_PROBE", rel_region=None, confidence=0.80, timeout=2.0,
+        ) is None:
+            bot_logger.log_error(
+                "Starter: deck chooser did not open (Submit Deck not found); keeping current deck."
+            )
+            return
+
         # 2) Select the quest deck at its fixed grid position.
         deck_target, deck_src = self._map_abs_point_to_arena(
             grid_base, label=f"STARTER_DECK_PICK_{desired_name}"
@@ -2573,7 +2602,6 @@ class Controller(ControllerSecondary):
 
         # 3) Confirm via Submit Deck. Prefer the template (exact), fall back to the
         #    fixed button position.
-        submit_btn = os.path.join(self._buttons_dir(), "submit_deck.PNG")
         if os.path.exists(submit_btn) and self._click_image_in_scaled_arena_region(
             submit_btn, "STARTER_SUBMIT_DECK", rel_region=None, confidence=0.80, timeout=1.5,
         ):
@@ -5135,6 +5163,10 @@ class Controller(ControllerSecondary):
         self._account_start_quest_ids = None
         self._daily_wins_this_account = 0
         self._win_counted_this_match = False
+        # Forget the previous account's screenName so the next quests block we
+        # parse (the new account's) is latched as the new owner instead of being
+        # rejected as stale.
+        self._current_account_screen_name = None
         runtime_status.clear_intentional_wait()
         runtime_status.set_mode("account_switch", bot_state=str(self._get_state_from_log()))
         queued_after_login = False
@@ -6201,13 +6233,7 @@ class Controller(ControllerSecondary):
                 obj_by_id = {
                     o.get("instanceId"): o for o in game_objects if isinstance(o, dict)
                 }
-                bf_zone_ids = set()
-                try:
-                    for zone in self.updated_game_state.get_full_state().get("zones", []) or []:
-                        if zone.get("type") == "ZoneType_Battlefield" and zone.get("zoneId") is not None:
-                            bf_zone_ids.add(zone.get("zoneId"))
-                except Exception:
-                    bf_zone_ids = set()
+                bf_zone_ids = RemovalLogic.battlefield_zone_ids(self.updated_game_state.get_full_state())
 
                 def _on_our_battlefield(cid: int) -> bool:
                     obj = obj_by_id.get(cid)
@@ -6370,7 +6396,17 @@ class Controller(ControllerSecondary):
                 snap_ti.get("step"), snap_ti.get("decisionPlayer"),
             )
 
+            # PayCostsReq marker at the moment we schedule the click: if picking
+            # "Sacrifice a creature" immediately opens the cost-selection picker
+            # (a PayCostsReq newer than this timestamp), the ChooseOrCost dialog
+            # is gone and any retry click must not hit the button again -- the
+            # picker sits at the same bottom-right screen area and a stray click
+            # there could cancel the cost selection instead of confirming it.
+            click_scheduled_ts = now
+
             def _dialog_still_open() -> bool:
+                if self.__pending_pay_costs_ts > click_scheduled_ts:
+                    return False
                 try:
                     ti = self.updated_game_state.get_turn_info() or {}
                 except Exception:
@@ -6439,10 +6475,12 @@ class Controller(ControllerSecondary):
                 # single-target paths.
                 if self.__try_handle_fight_targets(req):
                     return
-                chooser_target = self.__pick_chooser_target(req)
-                if chooser_target is not None:
+                chooser_pick = self.__pick_chooser_target(req)
+                if chooser_pick is not None:
+                    chooser_target, is_stack_target = chooser_pick
                     self.__schedule_chooser_target_selection(
-                        source_id, chooser_target, reason="SelectTargetsReq(chooser)"
+                        source_id, chooser_target, reason="SelectTargetsReq(chooser)",
+                        is_stack_target=is_stack_target,
                     )
                 else:
                     opp_creatures, own_creatures, face_legal = self.__analyze_legal_targets(req)
@@ -7012,13 +7050,7 @@ class Controller(ControllerSecondary):
             profile = RemovalLogic.get_removal_profile(grp_id)
             if not profile:
                 return None
-            bf_ids = set()
-            try:
-                for zone in self.updated_game_state.get_full_state().get("zones", []) or []:
-                    if zone.get("type") == "ZoneType_Battlefield" and zone.get("zoneId") is not None:
-                        bf_ids.add(zone.get("zoneId"))
-            except Exception:
-                bf_ids = set()
+            bf_ids = RemovalLogic.battlefield_zone_ids(self.updated_game_state.get_full_state())
             opp_life = RemovalLogic.opponent_life_from_players(
                 self.updated_game_state.get_players(), self.__system_seat_id
             )
@@ -7285,19 +7317,25 @@ class Controller(ControllerSecondary):
         finally:
             bot_logger.set_hover_logging(False)
 
-    def __pick_chooser_target(self, req):
+    def __pick_chooser_target(self, req) -> tuple[int, bool] | None:
         """If a SelectTargetsReq's legal target is a card off the battlefield
-        (graveyard/exile/limbo -> shown in a central overlay), return its
-        instanceId; otherwise None (normal battlefield/face targeting)."""
+        (graveyard/exile/limbo/stack), return (instanceId, is_stack_target);
+        otherwise None (normal battlefield/face targeting).
+
+        Off-battlefield targets render in two different places: a spell on the
+        stack (e.g. what a counterspell targets) is shown in the stack region
+        (stack_scan_p1/p2, already used by select_stack_item), while
+        graveyard/exile/limbo targets render in the central chooser overlay
+        (chooser_scan_p1/p2). Conflating the two routes counterspell targets to
+        the wrong scan region and the click never finds the card."""
         try:
             game_objects = self.updated_game_state.get_game_objects() or []
             obj_by_id = {
                 o.get("instanceId"): o for o in game_objects if isinstance(o, dict)
             }
-            bf_ids = set()
-            for zone in self.updated_game_state.get_full_state().get("zones", []) or []:
-                if zone.get("type") == "ZoneType_Battlefield" and zone.get("zoneId") is not None:
-                    bf_ids.add(zone.get("zoneId"))
+            full_state = self.updated_game_state.get_full_state()
+            bf_ids = RemovalLogic.battlefield_zone_ids(full_state)
+            stack_ids = CounterLogic.stack_zone_ids(full_state)
             for group in req.get("targets", []) or []:
                 for tgt in group.get("targets", []) or []:
                     if tgt.get("legalAction") != "SelectAction_Select":
@@ -7310,13 +7348,13 @@ class Controller(ControllerSecondary):
                         continue  # e.g. a player target -> not a card overlay
                     zid = obj.get("zoneId")
                     if zid is not None and zid not in bf_ids:
-                        return int(tid)
+                        return int(tid), (zid in stack_ids)
             return None
         except Exception as e:
             bot_logger.log_error(f"pick_chooser_target failed: {e}")
             return None
 
-    def __schedule_chooser_target_selection(self, source_id, target_id, reason):
+    def __schedule_chooser_target_selection(self, source_id, target_id, reason, *, is_stack_target=False):
         if self._suppress_selections or self._stop_requested:
             return
         # Dedup: both SelectTargetsReq entry points (raw pattern + game-state
@@ -7328,23 +7366,33 @@ class Controller(ControllerSecondary):
             return
         self.__last_target_select_source_id = norm_source
         self.__last_target_select_ts = now
-        bot_logger.log_info(f"{reason}: choosing card instanceId={target_id} from overlay")
+        where = "stack" if is_stack_target else "overlay"
+        bot_logger.log_info(f"{reason}: choosing card instanceId={target_id} from {where}")
 
         def _do(attempt: int = 0) -> None:
             if self._suppress_selections or self._stop_requested:
                 return
             found = False
             try:
-                found = self.select_chooser_card(target_id, clicks=1)
+                if is_stack_target:
+                    found = self.select_stack_item(target_id, clicks=1)
+                else:
+                    found = self.select_chooser_card(target_id, clicks=1)
             except Exception as e:
                 bot_logger.log_error(f"Chooser target click failed: {e}")
             bot_logger.log_info(
-                f"CHOOSER_TARGET click: id={target_id} found={found} attempt={attempt}"
+                f"CHOOSER_TARGET click: id={target_id} where={where} found={found} attempt={attempt}"
             )
-            time.sleep(0.5)
-            self.submit_selection(reason="chooser_target_submit", force=True)
-            if not found and attempt < 2 and not (self._suppress_selections or self._stop_requested):
+            if found:
+                time.sleep(0.5)
+                self.submit_selection(reason="chooser_target_submit", force=True)
+            elif attempt < 2 and not (self._suppress_selections or self._stop_requested):
                 threading.Timer(1.0, lambda: _do(attempt + 1)).start()
+            else:
+                bot_logger.log_error(
+                    f"CHOOSER_TARGET: giving up on id={target_id} after {attempt + 1} attempt(s); "
+                    "not submitting an unresolved selection."
+                )
 
         delay = self.__get_delay_timer_remaining()
         start_delay = 0.8 if delay <= 0.05 else delay + 0.4
@@ -7812,14 +7860,17 @@ class Controller(ControllerSecondary):
                 if self.__try_handle_fight_targets(req):
                     return
                 # Off-battlefield targets (a spell on the stack for a counter, a
-                # card in graveyard/exile) are shown in a central overlay, not on
-                # a battlefield row -- route them to the chooser click. Mirrors
-                # __handle_select_targets_req so both entry points behave alike.
-                chooser_target = self.__pick_chooser_target(req)
-                if chooser_target is not None:
+                # card in graveyard/exile) are shown in the stack region or a
+                # central overlay, not on a battlefield row -- route them
+                # accordingly. Mirrors __handle_select_targets_req so both entry
+                # points behave alike.
+                chooser_pick = self.__pick_chooser_target(req)
+                if chooser_pick is not None:
+                    chooser_target, is_stack_target = chooser_pick
                     self.__schedule_chooser_target_selection(
                         source_id, chooser_target,
                         reason="SelectTargetsReq (from game state, chooser)",
+                        is_stack_target=is_stack_target,
                     )
                     return
                 opp_creatures, own_creatures, face_legal = self.__analyze_legal_targets(req)
