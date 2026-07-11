@@ -2357,6 +2357,18 @@ class Controller(ControllerSecondary):
         # the swap below only fires when we have a concrete color target.
         target_colors = self._resolve_starter_target_colors()
 
+        # The very first time this event is entered (no deck ever picked for it
+        # yet on this account), MTGA drops the player directly onto the full-page
+        # deck-grid picker instead of the normal Home/Play-blade screens. None of
+        # the Play/Events/banner steps below apply there -- clicking them fails
+        # every cycle and the queue loop spins forever without ever picking a
+        # deck. Detect that screen up front (Submit Deck button visible) and
+        # handle it directly.
+        if self._starter_deck_picker_open():
+            bot_logger.log_info("Starter: deck picker already open; selecting quest deck directly.")
+            self._swap_starter_deck_for_quest(target_colors)
+            return True
+
         buttons_dir = self._buttons_dir()
         assets_dir = self._app_path("assets", "assert")
         play_btn = os.path.join(buttons_dir, "play_btn.png")
@@ -2543,6 +2555,25 @@ class Controller(ControllerSecondary):
             return None
         return (self._STARTER_DECK_COL_X[col], self._STARTER_DECK_ROW_Y[row])
 
+    def _starter_deck_picker_open(self) -> bool:
+        """True if the Starter Deck Duel deck-grid chooser is currently on
+        screen. The Submit Deck button only renders while that chooser is
+        open, so its presence is a reliable, deck-independent anchor -- used
+        both to verify the chooser opened after a deck-box click, and to
+        detect the first-time entry case where MTGA shows this chooser
+        directly (see _swap_starter_deck_for_quest and _navigate_starter_deck).
+        """
+        submit_btn = os.path.join(self._buttons_dir(), "submit_deck.PNG")
+        # 0.72 (not 0.80): this is a detection-only probe, not a click target --
+        # measured live, the Submit Deck template only scores ~0.78 at this
+        # window's actual scale (0.80 made this probe never fire at all,
+        # leaving the bot unable to tell it was already on the chooser).
+        # Matches the threshold already used for the similarly-purposed
+        # STARTER_BANNER anchor above.
+        return os.path.exists(submit_btn) and self._locate_image_center_in_scaled_arena_region(
+            submit_btn, "STARTER_DECK_CHOOSER_PROBE", rel_region=None, confidence=0.72, timeout=2.0,
+        ) is not None
+
     def _swap_starter_deck_for_quest(self, target_colors: str) -> None:
         """Change the selected starter deck to one matching the quest colors.
 
@@ -2563,31 +2594,39 @@ class Controller(ControllerSecondary):
             return
 
         # 1) Open the deck chooser by clicking the current-deck box (fixed square,
-        #    same position regardless of which deck art it currently shows).
-        box_target, box_src = self._map_abs_point_to_arena(
-            self._STARTER_DECK_BOX_BASE, label="STARTER_DECK_BOX"
-        )
-        bot_logger.log_info(
-            f"Starter: opening deck chooser via deck box base={self._STARTER_DECK_BOX_BASE} "
-            f"-> {box_target} ({box_src})."
-        )
-        self._click_abs(box_target[0], box_target[1], "STARTER_DECK_BOX")
-        time.sleep(1.3)
-
-        # 1b) Verify the chooser actually opened before clicking the fixed grid
-        # position blindly. The Submit Deck button only renders while the chooser
-        # is open, so its presence is a reliable, deck-independent anchor; a miss
-        # here means the deck-box click did not land (or something else covers the
-        # event page), so we abort and keep the current deck rather than clicking
-        # the grid coordinates on whatever screen is actually showing.
+        #    same position regardless of which deck art it currently shows) --
+        #    but only if the chooser isn't already open. The very first time this
+        #    event is entered (no deck ever picked for it yet) MTGA drops the
+        #    player directly onto this full-page deck grid instead of the normal
+        #    event-detail page with a small deck box, so clicking the deck-box
+        #    coordinate here would either miss or land on an unrelated deck card.
+        # The Submit Deck button only renders while the chooser is open, so its
+        # presence is a reliable, deck-independent anchor for "already open".
         submit_btn = os.path.join(self._buttons_dir(), "submit_deck.PNG")
-        if os.path.exists(submit_btn) and self._locate_image_center_in_scaled_arena_region(
-            submit_btn, "STARTER_DECK_CHOOSER_PROBE", rel_region=None, confidence=0.80, timeout=2.0,
-        ) is None:
-            bot_logger.log_error(
-                "Starter: deck chooser did not open (Submit Deck not found); keeping current deck."
+
+        if not self._starter_deck_picker_open():
+            box_target, box_src = self._map_abs_point_to_arena(
+                self._STARTER_DECK_BOX_BASE, label="STARTER_DECK_BOX"
             )
-            return
+            bot_logger.log_info(
+                f"Starter: opening deck chooser via deck box base={self._STARTER_DECK_BOX_BASE} "
+                f"-> {box_target} ({box_src})."
+            )
+            self._click_abs(box_target[0], box_target[1], "STARTER_DECK_BOX")
+            time.sleep(1.3)
+
+            # 1b) Verify the chooser actually opened before clicking the fixed
+            # grid position blindly. A miss here means the deck-box click did not
+            # land (or something else covers the event page), so we abort and
+            # keep the current deck rather than clicking the grid coordinates on
+            # whatever screen is actually showing.
+            if not self._starter_deck_picker_open():
+                bot_logger.log_error(
+                    "Starter: deck chooser did not open (Submit Deck not found); keeping current deck."
+                )
+                return
+        else:
+            bot_logger.log_info("Starter: deck chooser already open (first-time deck pick); skipping box click.")
 
         # 2) Select the quest deck at its fixed grid position.
         deck_target, deck_src = self._map_abs_point_to_arena(
