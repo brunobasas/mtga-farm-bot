@@ -11,6 +11,7 @@ import json
 import threading
 import runtime_status
 import update_checker
+from version import __version__ as APP_VERSION
 from Controller.Utilities.input_controller import InputControllerError, create_input_controller
 from runtime_paths import runtime_file
 from vision.window_locator import ArenaDetectionResult, run_arena_setup_check, supported_16x9_message
@@ -4248,7 +4249,16 @@ class SettingsWindow(tk.Toplevel):
         )
         self._settings_canvas.pack(fill=tk.BOTH, expand=True)
 
-        self._title_item = None
+        parent_ui = getattr(self, "master", None)
+        title_font = getattr(parent_ui, "ui_theme", {}).get("font", {}).get("title") if parent_ui else None
+        self._title_item = self._settings_canvas.create_text(
+            0,
+            0,
+            text=f"v{APP_VERSION}",
+            fill=c["text_muted"],
+            font=title_font or ("Segoe UI", 14, "bold"),
+            anchor="n",
+        )
 
         self._settings_buttons = {}
         self._settings_button_order = []
@@ -4445,6 +4455,8 @@ class SettingsWindow(tk.Toplevel):
         x = cw // 2
         y_start = s(62)
         y_step = s(76)
+        if getattr(self, "_title_item", None):
+            self._settings_canvas.coords(self._title_item, x, s(14))
         for idx, name in enumerate(self._settings_button_order):
             btn = self._settings_buttons.get(name)
             if not btn:
