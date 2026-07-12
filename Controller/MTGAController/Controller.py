@@ -2259,6 +2259,56 @@ class Controller(ControllerSecondary):
                 return full
         return None
 
+    # Center of the first deck tile in the Historic "My Decks" grid (the tile
+    # right after the "+" add-deck tile), in the 1920x1080 arena reference
+    # frame. Used as a coordinate fallback when an account folder has no deck
+    # thumbnail screenshots to template-match against -- MTGA always lists an
+    # account's decks starting from this fixed top-left slot on a fresh,
+    # unscrolled "My Decks" view (the same page this is clicked from).
+    _MY_DECKS_FIRST_SLOT_BASE = (456, 552)
+
+    def _my_decks_grid_open(self) -> bool:
+        """True if the My Decks grid is already expanded (the "+" add-deck
+        tile is visible). "My Decks" is a collapsible section that MTGA may
+        remember as already-open from a previous session; clicking its header
+        again would COLLAPSE it instead of opening it. Callers must check this
+        before clicking the header, and skip the click if it's already open."""
+        anchor = os.path.join(self._buttons_dir(), "my_decks_grid_open.png")
+        return os.path.exists(anchor) and self._locate_image_center_in_scaled_arena_region(
+            anchor, "MY_DECKS_GRID_OPEN_PROBE", rel_region=None, confidence=0.80, timeout=1.5,
+        ) is not None
+
+    def _click_first_deck_slot(self) -> bool:
+        """Click the first (top-left) deck tile in the My Decks grid.
+
+        Fallback for accounts with no deck thumbnail screenshots configured:
+        rather than fail with no deck selected, just pick whatever deck MTGA
+        lists first."""
+        if not self._my_decks_grid_open():
+            # A prior click may have collapsed the section (see
+            # _my_decks_grid_open's docstring) -- try once to (re-)open it via
+            # its header before giving up, rather than clicking blind.
+            decks_btn = os.path.join(self._buttons_dir(), "my_decks.png")
+            self._click_image_in_scaled_arena_region(
+                decks_btn, "POST_LOGIN_FIRST_DECK_REOPEN", rel_region=None, confidence=0.80, timeout=1.5
+            )
+            time.sleep(1.0)
+            if not self._my_decks_grid_open():
+                bot_logger.log_info(
+                    "Post-login: My Decks grid not visible before first-deck fallback; "
+                    "keeping current deck rather than clicking blind."
+                )
+                return False
+        target, source = self._map_abs_point_to_arena(
+            self._MY_DECKS_FIRST_SLOT_BASE, label="POST_LOGIN_FIRST_DECK"
+        )
+        bot_logger.log_info(
+            f"Post-login: no deck thumbnails configured; selecting first deck in the list "
+            f"base={self._MY_DECKS_FIRST_SLOT_BASE} -> {target} ({source})."
+        )
+        self._click_abs(target[0], target[1], "POST_LOGIN_FIRST_DECK")
+        return True
+
     def _choose_deck_image(
         self,
         account: dict,
@@ -2274,7 +2324,7 @@ class Controller(ControllerSecondary):
             if name.lower().endswith((".png", ".jpg", ".jpeg")):
                 images.append(name)
         if not images:
-            bot_logger.log_error("Post-login: no deck images found in account folder.")
+            bot_logger.log_info("Post-login: no deck images configured in account folder.")
             return None
         if forced_filename:
             force_lower = forced_filename.lower()
@@ -2854,6 +2904,7 @@ class Controller(ControllerSecondary):
         if not self._run_post_login_navigation_oob():
             bot_logger.log_info("Post-login: oob navigation failed, falling back to legacy full-screen image search.")
             find_btn = os.path.join(buttons_dir, "find_match_btn.png")
+            play_subtab_btn = os.path.join(buttons_dir, "play_format_tab.png")
             hist_btn = os.path.join(buttons_dir, "hist_play_btn.png")
             decks_btn = os.path.join(buttons_dir, "my_decks.png")
             if not self._click_image_in_scaled_arena_region(
@@ -2868,12 +2919,24 @@ class Controller(ControllerSecondary):
             if not self._click_image_in_scaled_arena_region(find_btn, "POST_LOGIN_FIND_MATCH", rel_region=None, confidence=0.80, timeout=1.5) and not self._click_image(find_btn, "POST_LOGIN_FIND_MATCH"):
                 return False
             time.sleep(1.0)
+            # The Find Match panel has 3 sub-tabs (Ranked / Play / Brawl); MTGA
+            # remembers whichever one this account last had open, so "Historic
+            # Play" is only visible once "Play" is selected. Best-effort: a miss
+            # just means it was already selected, so it is not a failure.
+            if self._click_image_in_scaled_arena_region(
+                play_subtab_btn, "POST_LOGIN_PLAY_SUBTAB", rel_region=None, confidence=0.75, timeout=1.5
+            ):
+                bot_logger.log_info("Post-login: Play format sub-tab selected.")
+                time.sleep(0.8)
             if not self._click_image_in_scaled_arena_region(hist_btn, "POST_LOGIN_HIST_PLAY", rel_region=None, confidence=0.80, timeout=1.5) and not self._click_image(hist_btn, "POST_LOGIN_HIST_PLAY"):
                 return False
             time.sleep(1.0)
-            if not self._click_image_in_scaled_arena_region(decks_btn, "POST_LOGIN_MY_DECKS", rel_region=None, confidence=0.80, timeout=1.5) and not self._click_image(decks_btn, "POST_LOGIN_MY_DECKS"):
-                return False
-            time.sleep(1.0)
+            if not self._my_decks_grid_open():
+                if not self._click_image_in_scaled_arena_region(decks_btn, "POST_LOGIN_MY_DECKS", rel_region=None, confidence=0.80, timeout=1.5) and not self._click_image(decks_btn, "POST_LOGIN_MY_DECKS"):
+                    return False
+                time.sleep(1.0)
+            else:
+                bot_logger.log_info("Post-login: My Decks grid already open; not clicking the header.")
 
         # Primary attempt uses the planned account folder; if mismatch occurred during login,
         # automatically try other account folders before failing.
@@ -2881,11 +2944,13 @@ class Controller(ControllerSecondary):
         selected_deck = None
         selected_account_name = None
         planned_name = str(account.get("name", "")).strip() or str(account.get("folder", "")).strip()
+        any_images_found = False
         for candidate in candidate_accounts:
             candidate_name = str(candidate.get("name", "")).strip() or str(candidate.get("folder", "")).strip()
             deck_image = self._choose_deck_image(candidate, colors, forced_filename)
             if not deck_image:
                 continue
+            any_images_found = True
             bot_logger.log_info(
                 f"Post-login: trying deck image {os.path.basename(deck_image)} from account '{candidate_name}'."
             )
@@ -2897,8 +2962,22 @@ class Controller(ControllerSecondary):
                 f"Post-login: deck image {os.path.basename(deck_image)} from account '{candidate_name}' not found on screen."
             )
         if not selected_deck:
-            bot_logger.log_error("Post-login: failed to select a deck image from any account folder.")
-            return False
+            # Either no account has any deck thumbnail screenshots configured,
+            # or none of the configured ones matched what's actually on screen
+            # (e.g. a stale screenshot from before a client UI refresh/reskin).
+            # Either way, we are on the My Decks grid with nothing usable to
+            # match against -- rather than stall forever, just pick whatever
+            # deck MTGA lists first for the planned account.
+            if any_images_found:
+                bot_logger.log_error(
+                    "Post-login: no configured deck image matched on screen "
+                    "(stale thumbnail screenshots?); selecting the first deck in the list instead."
+                )
+            if not self._click_first_deck_slot():
+                bot_logger.log_error("Post-login: could not confirm the My Decks grid was open; aborting.")
+                return False
+            selected_deck = "<first deck in list>"
+            selected_account_name = planned_name
 
         if selected_account_name and planned_name and selected_account_name != planned_name:
             bot_logger.log_info(
@@ -2978,6 +3057,9 @@ class Controller(ControllerSecondary):
             # navigation is self-limiting when not on the home/Play blade screen.
             self._navigate_starter_deck()
             return
+        # Historic mode: the user picks their format and deck themselves in
+        # MTGA; the bot just re-queues from Home like Play button, same as a
+        # human clicking Play again for the same, already-selected deck.
         current_state = self._get_state_from_log()
         bot_logger.log_info(f"Queue pre-check state={current_state}")
         if current_state == BotState.STORE:

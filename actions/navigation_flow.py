@@ -21,6 +21,8 @@ def build_post_login_navigation_actions(*, assets_dir: str, buttons_dir: str) ->
     home_play_roi = (1450, 820, 440, 220)
     find_match_roi = (1320, 760, 560, 280)
     center_right_roi = (1180, 460, 700, 520)
+    # Ranked / Play / Brawl sub-tab row, top-right of the Find Match panel.
+    play_subtab_roi = (1500, 180, 420, 180)
 
     return [
         ActionSpec(
@@ -45,6 +47,20 @@ def build_post_login_navigation_actions(*, assets_dir: str, buttons_dir: str) ->
             post_assert_template=a("find_match_anchor.png"),
             post_assert_roi_rel=(40, 20, 520, 210),
             threshold=0.82,
+        ),
+        ActionSpec(
+            name="POST_LOGIN_PLAY_SUBTAB",
+            # The Find Match panel has 3 sub-tabs (Ranked / Play / Brawl); MTGA
+            # remembers whichever one this account last had open, and "Historic
+            # Play" is only listed under "Play". The icon looks the same
+            # selected or not (only a glow differs), so this click is
+            # idempotent -- safe to click even when Play is already selected.
+            required_state=BotState.FIND_MATCH,
+            click_template=b("play_format_tab.png"),
+            click_search_roi_rel=play_subtab_roi,
+            post_expected_state=BotState.FIND_MATCH,
+            threshold=0.75,
+            post_timeout_sec=3.0,
         ),
         ActionSpec(
             name="POST_LOGIN_HIST_PLAY",
