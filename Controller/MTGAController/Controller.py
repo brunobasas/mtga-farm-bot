@@ -363,6 +363,18 @@ class Controller(ControllerSecondary):
         # One-shot: read this account's quests from Home before the first queue,
         # so the switch check reflects real state on landing. Reset per account.
         self._home_quest_check_done = False
+        # One-shot per account: whether _navigate_starter_deck's "chooser already
+        # open" fast path has been tried yet. That shortcut trusts the mere
+        # presence of a "Submit Deck" button as proof we landed directly on the
+        # Starter Deck Duel chooser -- but MTGA reuses that same button on other
+        # formats' deckbuilders too (e.g. Draft), so blindly trusting it on every
+        # queue cycle risks clicking the fixed Starter Deck Duel grid coordinates
+        # on an unrelated event's screen if the player has one open/in-progress.
+        # Limiting it to a single try per account matches the shortcut's actual
+        # purpose (MTGA drops a brand-new account directly onto this chooser
+        # the very first time only); every later cycle uses the verified
+        # Play > Events > banner-click navigation instead.
+        self._starter_picker_shortcut_tried = False
         # Anti-storm guard: consecutive account switches with no match played in
         # between. If it reaches the number of configured accounts, every account
         # already meets the criteria -> stop cycling (a logout/login loop is worse
@@ -2496,18 +2508,6 @@ class Controller(ControllerSecondary):
         # the swap below only fires when we have a concrete color target.
         target_colors = self._resolve_starter_target_colors()
 
-        # The very first time this event is entered (no deck ever picked for it
-        # yet on this account), MTGA drops the player directly onto the full-page
-        # deck-grid picker instead of the normal Home/Play-blade screens. None of
-        # the Play/Events/banner steps below apply there -- clicking them fails
-        # every cycle and the queue loop spins forever without ever picking a
-        # deck. Detect that screen up front (Submit Deck button visible) and
-        # handle it directly.
-        if self._starter_deck_picker_open():
-            bot_logger.log_info("Starter: deck picker already open; selecting quest deck directly.")
-            self._swap_starter_deck_for_quest(target_colors)
-            return True
-
         buttons_dir = self._buttons_dir()
         assets_dir = self._app_path("assets", "assert")
         play_btn = os.path.join(buttons_dir, "play_btn.png")
@@ -2543,6 +2543,26 @@ class Controller(ControllerSecondary):
             # button instead of stalling.
             if self._queue_from_event_landing(target_colors):
                 return True
+            # Last resort: the very first time this event is entered (no deck
+            # ever picked for it yet on this account), MTGA drops the player
+            # directly onto the full-page deck-grid picker instead of the normal
+            # Home/Play-blade screens, so neither the Play button nor the Events
+            # tab is present there -- only try this once we have positively
+            # confirmed BOTH are missing (not just on the very first check of the
+            # session), and only once per account. "Submit Deck" is a generic
+            # button MTGA also shows on other formats' deckbuilders (e.g. Draft),
+            # so trusting it before ruling out normal navigation risks clicking
+            # the fixed Starter Deck Duel grid coordinates on an unrelated event
+            # the player has open/in-progress.
+            if not self._starter_picker_shortcut_tried:
+                self._starter_picker_shortcut_tried = True
+                if self._starter_deck_picker_open():
+                    bot_logger.log_info(
+                        "Starter: no Play/Events chrome found but deck picker is open; "
+                        "selecting quest deck directly (first-time entry)."
+                    )
+                    self._swap_starter_deck_for_quest(target_colors)
+                    return True
             bot_logger.log_info("Starter: Events tab not found (not in Play blade yet); will retry.")
             return False
         time.sleep(0.8)
@@ -5435,6 +5455,7 @@ class Controller(ControllerSecondary):
         # Home quest check. Count this switch for the anti-storm guard.
         self._last_valid_quest_active_incomplete = None
         self._home_quest_check_done = False
+        self._starter_picker_shortcut_tried = False
         self._switches_without_match += 1
         # Reset post-match marker so the incoming account is treated as "no match
         # played yet": if it already meets the criteria on landing, the queue loop

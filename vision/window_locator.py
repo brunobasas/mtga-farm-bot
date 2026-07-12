@@ -1060,6 +1060,31 @@ def _estimate_macos_client_rect(window_rect: WindowRect) -> WindowRect:
     return best
 
 
+def _get_process_exe_name_windows(hwnd: int) -> str | None:
+    """Executable filename (e.g. "MTGA.exe") that owns this window, or None on
+    failure. Used to reject windows that merely mention "MTGA"/"Magic the
+    Gathering Arena" in their title (a browser tab on this repo's GitHub page,
+    a Discord channel name, etc.) instead of being the actual game client."""
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    pid = wintypes.DWORD(0)
+    user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
+    if not pid.value:
+        return None
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if not handle:
+        return None
+    try:
+        buff = ctypes.create_unicode_buffer(260)
+        size = wintypes.DWORD(260)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buff, ctypes.byref(size)):
+            return None
+        return os.path.basename(str(buff.value or "")).strip()
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _list_mtga_window_rects_windows() -> list[dict[str, Any]]:
     user32 = ctypes.windll.user32
 
@@ -1081,6 +1106,11 @@ def _list_mtga_window_rects_windows() -> list[dict[str, Any]]:
             return True
         low = title.lower()
         if "mtga" in low or "magic: the gathering arena" in low or "magic the gathering arena" in low:
+            exe_name = _get_process_exe_name_windows(int(hwnd))
+            if exe_name is not None and exe_name.lower() != "mtga.exe":
+                # Title mentions MTGA but the window doesn't belong to the game
+                # process itself (e.g. a browser tab, chat app) -- skip it.
+                return True
             client_rect = _get_client_rect_windows(int(hwnd))
             if client_rect is None:
                 return True
