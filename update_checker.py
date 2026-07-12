@@ -36,10 +36,11 @@ def is_git_checkout() -> bool:
 
 
 def check_for_update() -> UpdateCheckResult:
-    """Read-only check: compares local HEAD against the remote branch tip.
+    """Compares local HEAD against the remote branch tip.
 
-    Never mutates the local checkout (no fetch/pull here) so it is safe to
-    call from a background thread at startup.
+    Only updates the local `.git` metadata (fetches the remote-tracking ref
+    for `branch`) - it never touches the working tree, so it is safe to call
+    from a background thread at startup.
     """
     if not is_git_checkout():
         return UpdateCheckResult(update_available=False, error="not a git checkout")
@@ -57,16 +58,27 @@ def check_for_update() -> UpdateCheckResult:
             return UpdateCheckResult(update_available=False, error=local_proc.stderr.strip())
         local_sha = local_proc.stdout.strip()
 
-        remote_proc = _run_git(["ls-remote", "origin", f"refs/heads/{branch}"])
+        fetch_proc = _run_git(["fetch", "--quiet", "origin", branch])
+        if fetch_proc.returncode != 0:
+            return UpdateCheckResult(update_available=False, error=fetch_proc.stderr.strip())
+
+        remote_proc = _run_git(["rev-parse", "FETCH_HEAD"])
         if remote_proc.returncode != 0:
             return UpdateCheckResult(update_available=False, error=remote_proc.stderr.strip())
-        remote_line = remote_proc.stdout.strip()
-        if not remote_line:
-            return UpdateCheckResult(update_available=False, error="branch not found on origin")
-        remote_sha = remote_line.split()[0]
+        remote_sha = remote_proc.stdout.strip()
+
+        if remote_sha == local_sha:
+            return UpdateCheckResult(update_available=False, branch=branch, local_sha=local_sha, remote_sha=remote_sha)
+
+        # Only offer an update when the remote tip is actually ahead of local
+        # (a fast-forward pull would apply). If local has unpushed commits or
+        # the two have diverged, remote_sha != local_sha but there is nothing
+        # useful to pull, so don't show a misleading "update available" dialog.
+        ancestor_proc = _run_git(["merge-base", "--is-ancestor", local_sha, remote_sha])
+        update_available = ancestor_proc.returncode == 0
 
         return UpdateCheckResult(
-            update_available=remote_sha != local_sha,
+            update_available=update_available,
             branch=branch,
             local_sha=local_sha,
             remote_sha=remote_sha,
@@ -86,14 +98,20 @@ def apply_update(branch: str) -> UpdateResult:
     """Pulls the latest changes and reinstalls requirements if they changed."""
     repo_root = get_repo_root()
     req_path = repo_root / "requirements.txt"
-    req_before = str(req_path.read_text(encoding="utf-8")) if req_path.exists() else None
 
     try:
+        req_before = str(req_path.read_text(encoding="utf-8")) if req_path.exists() else None
+
         status_proc = _run_git(["status", "--porcelain"])
         if status_proc.returncode == 0 and status_proc.stdout.strip():
+            dirty_files = [line[3:].strip() for line in status_proc.stdout.splitlines() if line.strip()]
+            file_list = "\n".join(dirty_files[:10])
             return UpdateResult(
                 success=False,
-                message="Local changes detected in the bot folder. Update aborted to avoid overwriting them.",
+                message=(
+                    "Local changes detected in the bot folder. Update aborted to avoid overwriting them.\n\n"
+                    f"Affected file(s):\n{file_list}"
+                ),
             )
 
         pull_proc = _run_git(["pull", "--ff-only", "origin", branch], timeout=60)

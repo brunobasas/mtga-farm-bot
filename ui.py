@@ -2051,7 +2051,10 @@ class MTGBotUI(tk.Tk):
         threading.Thread(target=self._check_for_update_worker, daemon=True).start()
 
     def _check_for_update_worker(self) -> None:
-        result = update_checker.check_for_update()
+        try:
+            result = update_checker.check_for_update()
+        except Exception:
+            return
         if result.update_available:
             self.after(0, lambda: self._on_update_available(result))
 
@@ -2066,13 +2069,18 @@ class MTGBotUI(tk.Tk):
         threading.Thread(target=self._apply_update_worker, args=(result.branch,), daemon=True).start()
 
     def _apply_update_worker(self, branch: str) -> None:
-        update_result = update_checker.apply_update(branch)
+        try:
+            update_result = update_checker.apply_update(branch)
+        except Exception as exc:
+            update_result = update_checker.UpdateResult(success=False, message=str(exc))
         self.after(0, lambda: self._on_update_applied(update_result))
 
     def _on_update_applied(self, update_result: "update_checker.UpdateResult") -> None:
         if not update_result.success:
             messagebox.showerror("Update Failed", update_result.message, parent=self)
             return
+        if self.bot_running:
+            self._stop_bot()
         messagebox.showinfo("Update Installed", "Update installed successfully. Burning Lotus will now restart.", parent=self)
         update_checker.restart_application()
 
@@ -4199,10 +4207,11 @@ class SettingsWindow(tk.Toplevel):
         self._apply_content_minsize()
 
     def _apply_content_minsize(self):
+        exclude_items = {item for item in (self._settings_bg_canvas_item, self._title_item) if item}
         _fit_window_to_canvas_content(
             self,
             self._settings_canvas,
-            exclude_items={self._settings_bg_canvas_item} if self._settings_bg_canvas_item else None,
+            exclude_items=exclude_items or None,
             pad_x=self._s(22),
             pad_y=self._s(22),
             floor_w=self._s(340),
