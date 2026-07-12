@@ -2925,9 +2925,14 @@ class Controller(ControllerSecondary):
         # account already meets the switch criteria, the check below triggers the
         # switch before we ever queue -- and the next account repeats this on its
         # own Home. Self-healing: on failure the absolute count stays unknown and
-        # the bot just plays normally.
+        # the bot just plays normally. Gated on account_switch_enabled too: this
+        # dips to Home and polls for a fresh quests block for up to 8s (see
+        # _refresh_quests_from_home), so skip it whenever switching is off,
+        # regardless of what mode is configured -- otherwise every bot start
+        # pays that ~8s cost for a switch decision that can never fire.
         if (
-            self._account_switch_mode == "quests"
+            self._account_switch_enabled
+            and self._account_switch_mode == "quests"
             and not self._home_quest_check_done
             and not self._account_switch_in_progress
             and not self._stop_requested
