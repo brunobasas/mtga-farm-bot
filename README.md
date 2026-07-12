@@ -86,6 +86,10 @@ python -m venv .venv
 .venv/bin/python ui.py                       # Windows: .venv\Scripts\python ui.py
 ```
 
+### Updates
+
+If the bot was started from a `git clone` of this repository, it checks GitHub for a newer commit on startup. When one is found, a dialog offers to pull and install it, then restarts the bot automatically. The check is read-only and silently skipped if the folder isn't a git checkout (e.g. a plain ZIP download) or if there's no network access. If you have local, uncommitted changes in the bot folder, the update is aborted rather than overwriting them.
+
 ## Configuration
 
 ### Input backend

@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageStat, ImageTk
 import json
 import threading
 import runtime_status
+import update_checker
 from Controller.Utilities.input_controller import InputControllerError, create_input_controller
 from runtime_paths import runtime_file
 from vision.window_locator import ArenaDetectionResult, run_arena_setup_check, supported_16x9_message
@@ -2043,6 +2044,36 @@ class MTGBotUI(tk.Tk):
         self._setup_ui()
         self.apply_window_topmost_mode(self.config_manager.get_ui_windows_topmost())
         self._setup_stop_hotkey()
+        self.after(1500, self._start_update_check)
+
+    def _start_update_check(self) -> None:
+        threading.Thread(target=self._check_for_update_worker, daemon=True).start()
+
+    def _check_for_update_worker(self) -> None:
+        result = update_checker.check_for_update()
+        if result.update_available:
+            self.after(0, lambda: self._on_update_available(result))
+
+    def _on_update_available(self, result: "update_checker.UpdateCheckResult") -> None:
+        want_update = messagebox.askyesno(
+            "Update Available",
+            "A new version of Burning Lotus is available.\n\nDo you want to update now?",
+            parent=self,
+        )
+        if not want_update:
+            return
+        threading.Thread(target=self._apply_update_worker, args=(result.branch,), daemon=True).start()
+
+    def _apply_update_worker(self, branch: str) -> None:
+        update_result = update_checker.apply_update(branch)
+        self.after(0, lambda: self._on_update_applied(update_result))
+
+    def _on_update_applied(self, update_result: "update_checker.UpdateResult") -> None:
+        if not update_result.success:
+            messagebox.showerror("Update Failed", update_result.message, parent=self)
+            return
+        messagebox.showinfo("Update Installed", "Update installed successfully. Burning Lotus will now restart.", parent=self)
+        update_checker.restart_application()
 
     def _ensure_player_log_path_configured(self) -> bool:
         current_log = str(self.config_manager.get_log_path() or "").strip()
