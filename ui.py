@@ -1523,6 +1523,12 @@ class ConfigManager:
             # auto-detect a standard Steam/Wizards install location. Empty means
             # "not set yet / rely on auto-detect".
             "mtga_data_dir": "",
+            # Master on/off for account switching, toggled from the main UI.
+            # Independent of the account data and of the time/quest thresholds, so
+            # switching can be paused without deleting accounts or zeroing the
+            # thresholds. Default True preserves prior behavior (switching driven
+            # by the thresholds below).
+            "account_switch_enabled": True,
             "account_switch_minutes": 0,
             # Account-switch trigger: "time" (every N minutes) or "quests"
             # (when main-quest completions and daily wins reach the thresholds).
@@ -1530,6 +1536,10 @@ class ConfigManager:
             "account_switch_mode": "time",
             "account_switch_main_quests": 0,   # 0-3 main quests to complete
             "account_switch_daily_wins": 0,    # 0-15 daily wins to reach
+            # Estimated gold credited per match won in the "Current Session"
+            # per-account gold list (the real reward is not in the log). 0 = only
+            # count completed-quest gold, no per-win estimate.
+            "gold_per_win": 25,
             "managed_accounts": [],
             "account_cycle_index": 0,
             "account_play_order": [],
@@ -1662,6 +1672,13 @@ class ConfigManager:
         self.config["game_mode"] = value
         self._save_config()
 
+    def get_account_switch_enabled(self) -> bool:
+        return bool(self.config.get("account_switch_enabled", True))
+
+    def set_account_switch_enabled(self, enabled: bool) -> None:
+        self.config["account_switch_enabled"] = bool(enabled)
+        self._save_config()
+
     def get_account_switch_minutes(self) -> int:
         try:
             return int(self.config.get("account_switch_minutes", 0))
@@ -1747,6 +1764,20 @@ class ConfigManager:
         except (TypeError, ValueError):
             return
         self.config["account_switch_daily_wins"] = max(0, min(15, value))
+        self._save_config()
+
+    def get_gold_per_win(self) -> int:
+        try:
+            return max(0, int(self.config.get("gold_per_win", 25)))
+        except (TypeError, ValueError):
+            return 25
+
+    def set_gold_per_win(self, gold: int) -> None:
+        try:
+            value = int(gold)
+        except (TypeError, ValueError):
+            return
+        self.config["gold_per_win"] = max(0, value)
         self._save_config()
 
     def _repo_root(self) -> str:
@@ -2791,6 +2822,28 @@ class MTGBotUI(tk.Tk):
             self._quest_items.append(item)
         self._quests_poll_signature = None
         self.after(1500, self._poll_quests_display)
+
+        # Account-switch master on/off toggle (checkbox style, matching the
+        # "Keep Window on Top" control). Independent of the account data and the
+        # time/quest thresholds -- pauses switching without deleting accounts.
+        self._account_switch_var = tk.BooleanVar(value=bool(self.config_manager.get_account_switch_enabled()))
+        self._account_switch_box_item = self._card_canvas.create_rectangle(
+            0, 0, 0, 0, fill="#320a02", outline="#ffb841", width=max(1, self._scale_value(1)),
+        )
+        self._account_switch_tick_item = self._card_canvas.create_text(
+            0, 0, text="X", fill="#ffb841",
+            font=("Segoe UI", max(10, self._scale_value(11)), "bold"), anchor="center",
+        )
+        self._account_switch_label_item = self._card_canvas.create_text(
+            0, 0, text="Account Switch", fill="#ffb841",
+            font=("Segoe UI", max(9, self._scale_value(10))), anchor="w",
+        )
+        for item in (self._account_switch_box_item, self._account_switch_tick_item, self._account_switch_label_item):
+            self._card_canvas.tag_bind(item, "<Button-1>", self._toggle_account_switch)
+            self._card_canvas.tag_bind(item, "<Enter>", lambda _e: self._card_canvas.configure(cursor="hand2"))
+            self._card_canvas.tag_bind(item, "<Leave>", lambda _e: self._card_canvas.configure(cursor=""))
+        self._refresh_account_switch_state()
+
         self._main_topmost_var = tk.BooleanVar(value=bool(self.config_manager.get_ui_windows_topmost()))
         self._main_topmost_panel_item = self._card_canvas.create_rectangle(
             0,
@@ -2878,6 +2931,10 @@ class MTGBotUI(tk.Tk):
         quest_h = quest_font.metrics("linespace")
         quest_rows = 1 + len(getattr(self, "_quest_items", []))  # title + rows
         total_h += (quest_h + sp["xs"]) * quest_rows
+        # Reserve space for the Account Switch checkbox row so it is not pushed
+        # under the footer (which would hide it behind the footer panel).
+        if hasattr(self, "_account_switch_box_item"):
+            total_h += self._scale_value(18) + sp["xs"]
         max_content_y = (canvas_h - footer_h) - footer_gap - total_h
         # Pull the whole main stack slightly upward (~1 cm) to reduce top logo whitespace.
         top_offset = int(self.winfo_fpixels("10m"))
@@ -2922,6 +2979,22 @@ class MTGBotUI(tk.Tk):
         self._card_canvas.coords(self._queue_mode_item, center_x, y)
         self._card_canvas.tag_raise(self._queue_mode_item)
         y += body_h + sp["xs"]
+        # Account-switch on/off checkbox, directly below the Queue line.
+        if hasattr(self, "_account_switch_box_item"):
+            as_box = self._scale_value(18)
+            as_gap = self._scale_value(10)
+            as_font = tkfont.Font(font=("Segoe UI", max(9, self._scale_value(10))))
+            as_label = "Account Switch"
+            as_label_w = max(1, as_font.measure(as_label))
+            as_group_w = as_box + as_gap + as_label_w
+            as_x = center_x - (as_group_w // 2)
+            self._card_canvas.coords(self._account_switch_box_item, as_x, y, as_x + as_box, y + as_box)
+            self._card_canvas.coords(self._account_switch_tick_item, as_x + (as_box // 2), y + (as_box // 2))
+            self._card_canvas.coords(self._account_switch_label_item, as_x + as_box + as_gap, y + (as_box // 2))
+            self._card_canvas.tag_raise(self._account_switch_box_item)
+            self._card_canvas.tag_raise(self._account_switch_tick_item)
+            self._card_canvas.tag_raise(self._account_switch_label_item)
+            y += as_box + sp["xs"]
         if hasattr(self, "_quest_title_item"):
             self._card_canvas.coords(self._quest_title_item, center_x, y)
             self._card_canvas.tag_raise(self._quest_title_item)
@@ -2974,14 +3047,54 @@ class MTGBotUI(tk.Tk):
         )
         self._switch_eta_text = self._get_configured_switch_eta_text()
 
+    def _configured_switch_disabled(self) -> bool:
+        """Whether account switching is effectively OFF for the configured mode.
+
+        Time mode is off when minutes <= 0. Quests mode is off only when BOTH the
+        main-quest and daily-win thresholds are 0 (mirrors
+        Controller._account_switch_due). Checking only the minutes -- which are 0
+        in quests mode -- is what made the label read "off" for a correctly
+        configured quest-based switch."""
+        try:
+            if not self.config_manager.get_account_switch_enabled():
+                return True  # master toggle off
+        except Exception:
+            pass
+        try:
+            mode = self.config_manager.get_account_switch_mode()
+        except Exception:
+            mode = "time"
+        try:
+            if mode == "quests":
+                return (
+                    self.config_manager.get_account_switch_main_quests() <= 0
+                    and self.config_manager.get_account_switch_daily_wins() <= 0
+                )
+            return self.config_manager.get_account_switch_minutes() <= 0
+        except Exception:
+            return True
+
+    def _quests_switch_label(self) -> str:
+        try:
+            m = self.config_manager.get_account_switch_main_quests()
+            w = self.config_manager.get_account_switch_daily_wins()
+        except Exception:
+            m, w = 0, 0
+        return f"Account switch: on (quests: {m} main / {w} wins)"
+
     def _get_configured_switch_eta_text(self) -> str:
-        minutes = 0
+        if self._configured_switch_disabled():
+            return "Account switch: off"
+        try:
+            mode = self.config_manager.get_account_switch_mode()
+        except Exception:
+            mode = "time"
+        if mode == "quests":
+            return self._quests_switch_label()
         try:
             minutes = int(self.config_manager.get_account_switch_minutes())
         except Exception:
             minutes = 0
-        if minutes <= 0:
-            return "Account switch: off"
         return f"{minutes} Min till Account Switch"
 
     def _set_startup_loading(self, loading: bool):
@@ -3087,11 +3200,39 @@ class MTGBotUI(tk.Tk):
         tick_state = "normal" if is_enabled else "hidden"
         self._card_canvas.itemconfigure(self._main_topmost_tick_item, state=tick_state)
 
+    def _toggle_account_switch(self, _event=None) -> None:
+        enabled = not bool(self._account_switch_var.get())
+        self._account_switch_var.set(enabled)
+        self.config_manager.set_account_switch_enabled(enabled)
+        # Apply live to a running bot so it takes effect without a restart.
+        controller = getattr(self, "_controller", None)
+        if controller is not None:
+            try:
+                controller.set_account_switch_enabled(enabled)
+            except Exception:
+                pass
+        self._refresh_account_switch_state()
+        # Reflect immediately in the Current Session switch line.
+        self._switch_eta_text = self._get_configured_switch_eta_text()
+        self._update_current_session_window()
+        self._card_canvas.configure(cursor="")
+
+    def _refresh_account_switch_state(self) -> None:
+        is_enabled = bool(self._account_switch_var.get())
+        tick_state = "normal" if is_enabled else "hidden"
+        self._card_canvas.itemconfigure(self._account_switch_tick_item, state=tick_state)
+
     def _start_bot(self):
         if self.bot_running:
             return
 
-        setup_ok = self._run_arena_setup_check(show_success=False)
+        # Retry the arena setup check for a few seconds: MTGA's game-start /
+        # turn-start animations transiently distort the in-game anchor (observed
+        # ingame_anchor score ~0.71 vs 0.78 threshold during the opening swirl),
+        # which would otherwise abort Start if the user presses it while a match
+        # animation is playing. The common case (anchors match immediately) still
+        # returns on the first attempt with zero added delay.
+        setup_ok = self._run_arena_setup_check(show_success=False, attempts=8, retry_delay=1.0)
         if not setup_ok:
             return
 
@@ -3107,26 +3248,45 @@ class MTGBotUI(tk.Tk):
     def _check_arena_setup(self):
         self._run_arena_setup_check(show_success=True)
 
-    def _run_arena_setup_check(self, *, show_success: bool) -> bool:
-        try:
-            result = run_arena_setup_check(
-                assets_dir=_app_path("assets", "assert"),
-                expected_size=(1920, 1080),
-                write_debug_on_fail=True,
-            )
-        except Exception as exc:
-            messagebox.showerror(
-                "Arena Setup",
-                f"Arena setup check failed unexpectedly.\n\n{exc}",
-                parent=self,
-            )
-            return False
+    def _run_arena_setup_check(self, *, show_success: bool, attempts: int = 1, retry_delay: float = 1.0) -> bool:
+        attempts = max(1, int(attempts))
+        result = None
+        for attempt in range(attempts):
+            is_last = attempt == attempts - 1
+            try:
+                result = run_arena_setup_check(
+                    assets_dir=_app_path("assets", "assert"),
+                    expected_size=(1920, 1080),
+                    # Only persist a debug bundle on the final failed attempt so a
+                    # transient animation retry does not spam runtime/debug.
+                    write_debug_on_fail=is_last,
+                )
+            except Exception as exc:
+                if is_last:
+                    messagebox.showerror(
+                        "Arena Setup",
+                        f"Arena setup check failed unexpectedly.\n\n{exc}",
+                        parent=self,
+                    )
+                    return False
+                time.sleep(retry_delay)
+                continue
 
-        if result.ok:
-            self._handle_arena_setup_success(result, show_success=show_success)
-            return True
+            if result.ok:
+                self._handle_arena_setup_success(result, show_success=show_success)
+                return True
 
-        self._handle_arena_setup_failure(result)
+            if not is_last:
+                # Keep the Tk UI responsive during the retry window instead of a
+                # hard blocking sleep, then re-check (animation likely settled).
+                try:
+                    self.update()
+                except Exception:
+                    pass
+                time.sleep(retry_delay)
+
+        if result is not None:
+            self._handle_arena_setup_failure(result)
         return False
 
     def _handle_arena_setup_success(self, result: ArenaDetectionResult, *, show_success: bool) -> None:
@@ -3247,6 +3407,8 @@ class MTGBotUI(tk.Tk):
             account_cycle_index = self.config_manager.get_account_cycle_index()
             account_play_order = self.config_manager.get_account_play_order()
             game_mode = self.config_manager.get_game_mode()
+            gold_per_win = self.config_manager.get_gold_per_win()
+            account_switch_enabled = self.config_manager.get_account_switch_enabled()
             bot_logger.log_info(
                 "UI start: init controller log_path={} screen_bounds={} input_backend={} account_switch_minutes={} game_mode={}".format(
                     log_path,
@@ -3264,7 +3426,9 @@ class MTGBotUI(tk.Tk):
                                    account_switch_daily_wins=account_switch_daily_wins,
                                    account_cycle_index=account_cycle_index,
                                    account_play_order=account_play_order,
-                                   game_mode=game_mode)
+                                   game_mode=game_mode,
+                                   gold_per_win=gold_per_win,
+                                   account_switch_enabled=account_switch_enabled)
             self._controller = controller
             ai = DummyAI()
             self.game = Game(controller, ai, data_dir_prompt=self._resolve_mtga_data_dir)
@@ -3417,18 +3581,23 @@ class MTGBotUI(tk.Tk):
     def _update_switch_eta(self):
         if not self.bot_running:
             return
-        minutes = 0
-        interval_minutes = self.config_manager.get_account_switch_minutes()
         try:
-            if getattr(self, "_controller", None):
-                remaining_sec = self._controller.get_account_switch_remaining_sec()
-                minutes = int((remaining_sec + 59) / 60) if remaining_sec > 0 else 0
-                interval_minutes = self._controller.get_account_switch_interval_minutes()
+            mode = self.config_manager.get_account_switch_mode()
         except Exception:
-            minutes = 0
-        if interval_minutes <= 0:
+            mode = "time"
+        if self._configured_switch_disabled():
             self._switch_eta_text = "Account switch: off"
+        elif mode == "quests":
+            # Quests mode has no time countdown; show that it is on + thresholds.
+            self._switch_eta_text = self._quests_switch_label()
         else:
+            minutes = 0
+            try:
+                if getattr(self, "_controller", None):
+                    remaining_sec = self._controller.get_account_switch_remaining_sec()
+                    minutes = int((remaining_sec + 59) / 60) if remaining_sec > 0 else 0
+            except Exception:
+                minutes = 0
             self._switch_eta_text = f"{minutes} Min till Account Switch"
         self._update_current_session_window()
         self.after(10000, self._update_switch_eta)
@@ -3469,6 +3638,15 @@ class CurrentSessionWindow(tk.Toplevel):
         self._bg_canvas_item = None
         self._stats_panel_photo = None
         self._stats_panel_size = (0, 0)
+        # Window geometry we preserve while growing the height to fit the
+        # per-account gold list.
+        self._win_x, self._win_y, self._win_w = x, y, width
+        # Per-account farmed gold, list of (screenName, gold), polled from
+        # status.json, plus the screenName -> configured alias map.
+        self._gold_rows: list[tuple[str, int]] = []
+        self._gold_aliases: dict[str, str] = {}
+        self._gold_panel_photo = None
+        self._gold_panel_size = (0, 0)
         self._canvas = tk.Canvas(self, bg=self._theme["bg"], highlightthickness=0, bd=0)
         self._canvas.pack(fill=tk.BOTH, expand=True)
         self._canvas.bind("<Configure>", self._on_canvas_resize_background)
@@ -3483,6 +3661,16 @@ class CurrentSessionWindow(tk.Toplevel):
             justify="left",
             fill=self._theme["card_body"],
         )
+        # Per-account gold list: a title, a framed panel, and its text rows.
+        self._gold_panel_item = self._canvas.create_image(0, 0, anchor="nw")
+        self._gold_title_item = self._canvas.create_text(
+            0, 0, text="Gold farmed per account", font=("Segoe UI", 11, "bold"),
+            anchor="nw", fill=self._theme["card_border"],
+        )
+        self._gold_text_item = self._canvas.create_text(
+            0, 0, text="No gold farmed yet.", font=("Consolas", 10), anchor="nw",
+            justify="left", fill=self._theme["card_body"],
+        )
         self._back_btn = None
 
         self._load_background_image()
@@ -3492,9 +3680,17 @@ class CurrentSessionWindow(tk.Toplevel):
         self.update_stats(games, wins, "Account switch: off")
         self.after(40, self._refresh_scene)
         self.after(160, self._refresh_scene)
+        self._poll_gold()
 
     def _s(self, value: int | float) -> int:
         return max(1, int(round(float(value) * float(self._ui_scale))))
+
+    def _font(self, base: int, *, bold: bool = False, mono: bool = False) -> tuple:
+        # Fonts must scale with the UI like the boxes do; fixed sizes overflow the
+        # scaled panels at ui_scale < 1 (text spills over / overlaps).
+        family = "Consolas" if mono else "Segoe UI"
+        size = max(8, int(round(base * float(self._ui_scale))))
+        return (family, size, "bold") if bold else (family, size)
 
     def _load_background_image(self):
         self._bg_source_image = None
@@ -3596,6 +3792,56 @@ class CurrentSessionWindow(tk.Toplevel):
         self._stats_panel_size = (width, height)
         self._canvas.itemconfigure(self._stats_panel_item, image=self._stats_panel_photo)
 
+    def _render_gold_panel(self, width: int, height: int):
+        if width <= 2 or height <= 2:
+            return
+        if self._gold_panel_photo is not None and self._gold_panel_size == (width, height):
+            return
+        panel = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(panel)
+        draw.rectangle((0, 0, width - 1, height - 1), fill=(50, 10, 2, 210), outline=(255, 147, 24, 255), width=3)
+        self._gold_panel_photo = ImageTk.PhotoImage(panel)
+        self._gold_panel_size = (width, height)
+        self._canvas.itemconfigure(self._gold_panel_item, image=self._gold_panel_photo)
+
+    def _gold_text_block(self) -> str:
+        if not self._gold_rows:
+            return "No gold farmed yet."
+        # Align the gold value to the right of a fixed-width label column. Prefer
+        # the configured alias; fall back to the raw screenName.
+        label_w = 22
+        lines = []
+        for screen_name, gold in self._gold_rows:
+            name = str(self._gold_aliases.get(screen_name) or screen_name)
+            if len(name) > label_w:
+                name = name[: label_w - 1] + "…"
+            lines.append(f"{name:<{label_w}} {int(gold):>6} gold")
+        return "\n".join(lines)
+
+    def _poll_gold(self):
+        if not self.winfo_exists():
+            return
+        try:
+            status = runtime_status.read_status() or {}
+            gold = status.get("gold_farmed") or {}
+            aliases = status.get("account_aliases") or {}
+            if isinstance(gold, dict):
+                rows = [(str(k), int(v or 0)) for k, v in gold.items()]
+                # Highest gold first, then alphabetical for stability.
+                rows.sort(key=lambda kv: (-kv[1], kv[0].casefold()))
+                aliases = {str(k): str(v) for k, v in aliases.items()} if isinstance(aliases, dict) else {}
+                if rows != self._gold_rows or aliases != self._gold_aliases:
+                    self._gold_rows = rows
+                    self._gold_aliases = aliases
+                    self._canvas.itemconfigure(self._gold_text_item, text=self._gold_text_block())
+                    self._layout_scene()
+        except Exception:
+            pass
+        try:
+            self.after(2500, self._poll_gold)
+        except Exception:
+            pass
+
     def _refresh_back_button_state(self):
         btn = self._back_btn
         if not btn:
@@ -3653,19 +3899,92 @@ class CurrentSessionWindow(tk.Toplevel):
         if not self._canvas or not self._canvas.winfo_exists():
             return
         s = self._s
-        cw = max(2, int(self._canvas.winfo_width()))
-        box_w = min(s(408), max(s(320), cw - s(48)))
+        pad = s(14)
+        inner = s(10)
+
+        # Scale every font with the UI, then size boxes from the REAL line height
+        # (fixed fonts + scaled boxes = overlap at ui_scale < 1).
+        stats_font = self._font(11)
+        title_font = self._font(11, bold=True)
+        gold_font = self._font(10, mono=True)
+        self._canvas.itemconfigure(self._stats_text_item, font=stats_font)
+        self._canvas.itemconfigure(self._gold_title_item, font=title_font)
+        self._canvas.itemconfigure(self._gold_text_item, font=gold_font)
+        sf = tkfont.Font(font=stats_font)
+        gf = tkfont.Font(font=gold_font)
+        tf = tkfont.Font(font=title_font)
+        stats_lh = sf.metrics("linespace")
+        gold_lh = gf.metrics("linespace")
+        title_lh = tf.metrics("linespace")
+
+        # Size the window WIDTH to the widest actual line so nothing is clipped
+        # (the switch line "Account switch: on (quests: N main / M wins)" is the
+        # long one). Measure the real rendered text of each element.
+        stats_text = self._canvas.itemcget(self._stats_text_item, "text")
+        gold_text = self._canvas.itemcget(self._gold_text_item, "text")
+        title_text = self._canvas.itemcget(self._gold_title_item, "text")
+        content_w = 0
+        for line in str(stats_text).split("\n"):
+            content_w = max(content_w, sf.measure(line))
+        for line in str(gold_text).split("\n"):
+            content_w = max(content_w, gf.measure(line))
+        content_w = max(content_w, tf.measure(str(title_text)))
+        box_w = content_w + 2 * inner
+        back_w = int(self._back_btn["width"]) if self._back_btn else 0
+        win_w = max(s(340), box_w + 2 * pad, back_w + 2 * pad)
+        win_w = min(win_w, self.winfo_screenwidth() - s(20))
+        box_w = min(box_w, win_w - 2 * pad)
+        cw = win_w
         box_x = (cw - box_w) // 2
-        box_y = s(38)
-        box_h = s(146)
-        self._render_stats_panel(box_w, box_h)
-        self._canvas.coords(self._stats_panel_item, box_x, box_y)
-        self._canvas.coords(self._stats_text_item, box_x + s(20), box_y + s(16))
+
+        y = s(14)
+
+        # Stats panel (3 lines: switch / games / wins).
+        stats_h = inner * 2 + stats_lh * 3
+        self._render_stats_panel(box_w, stats_h)
+        self._canvas.coords(self._stats_panel_item, box_x, y)
+        self._canvas.coords(self._stats_text_item, box_x + inner, y + inner)
         self._canvas.tag_raise(self._stats_text_item)
+        y += stats_h + s(12)
+
+        # Gold list title.
+        self._canvas.coords(self._gold_title_item, box_x + s(2), y)
+        self._canvas.tag_raise(self._gold_title_item)
+        y += title_lh + s(4)
+
+        # Gold list panel (one row per account).
+        rows = max(1, len(self._gold_rows))
+        gold_h = inner * 2 + gold_lh * rows
+        self._render_gold_panel(box_w, gold_h)
+        self._canvas.coords(self._gold_panel_item, box_x, y)
+        self._canvas.coords(self._gold_text_item, box_x + inner, y + inner)
+        self._canvas.tag_raise(self._gold_text_item)
+        y += gold_h + s(12)
+
+        # Close button.
         if self._back_btn:
-            y = box_y + box_h + s(22)
             self._canvas.coords(self._back_btn["bg_item"], cw // 2, y)
             self._canvas.coords(self._back_btn["text_item"], cw // 2, y + self._back_btn["height"] // 2 - 2)
+            y += self._back_btn["height"]
+        self._apply_desired_size(cw, y + s(14))
+
+    def _apply_desired_size(self, width: int, height: int):
+        """Grow/shrink the window to fit its content (width to the widest line,
+        height to the stacked rows), preserving x/y. Guarded so the canvas
+        <Configure> it triggers converges instead of looping."""
+        try:
+            width = int(width)
+            height = int(height)
+            if abs(int(self.winfo_width()) - width) <= 2 and abs(int(self.winfo_height()) - height) <= 2:
+                return
+            self._win_w = width
+            max_x = max(0, self.winfo_screenwidth() - width)
+            max_y = max(0, self.winfo_screenheight() - height)
+            x = min(max(0, int(self._win_x)), max_x)
+            yy = min(max(0, int(self._win_y)), max_y)
+            self.geometry(f"{width}x{height}+{x}+{yy}")
+        except Exception:
+            pass
 
     def update_stats(self, games: int, wins: int, switch_eta_text: str | None = None):
         switch_line = switch_eta_text if switch_eta_text is not None else "Account switch: off"

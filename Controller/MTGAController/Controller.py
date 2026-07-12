@@ -48,6 +48,10 @@ _MY_TIMER_TYPES = {
 
 class Controller(ControllerSecondary):
 
+    # MTGA holds up to 3 daily quests; completed ones drop out of the list. Used
+    # to derive absolute completions (slots - remaining) for the switch decision.
+    _DAILY_QUEST_SLOTS = 3
+
     def __init__(
         self,
         log_path,
@@ -61,6 +65,8 @@ class Controller(ControllerSecondary):
         account_cycle_index: int | None = None,
         account_play_order: list[str] | None = None,
         game_mode: str | None = None,
+        gold_per_win: int | None = None,
+        account_switch_enabled: bool = True,
     ):
         self.__decision_callback = None
         self.__mulligan_decision_callback = None
@@ -333,6 +339,9 @@ class Controller(ControllerSecondary):
         # Mutually exclusive -- only one mode drives the switch.
         _sw_mode = str(account_switch_mode or "time").strip().lower()
         self._account_switch_mode = _sw_mode if _sw_mode in ("time", "quests") else "time"
+        # Master on/off toggled from the main UI. When False, no switching happens
+        # regardless of thresholds or configured accounts.
+        self._account_switch_enabled = bool(account_switch_enabled)
         self._account_switch_main_quests = max(0, min(3, int(account_switch_main_quests or 0)))
         self._account_switch_daily_wins = max(0, min(15, int(account_switch_daily_wins or 0)))
         # Quest-mode tracking: the quest ids present when this account started
@@ -341,12 +350,54 @@ class Controller(ControllerSecondary):
         self._account_start_quest_ids: set[str] | None = None
         self._daily_wins_this_account = 0
         self._win_counted_this_match = False
+        # ABSOLUTE quest state for the account-switch decision: the number of
+        # still-incomplete daily quests from the last VALID Home read (None until
+        # we have read one). MTGA holds up to _DAILY_QUEST_SLOTS daily quests and
+        # completed ones drop out of the list, so completed(absolute) = slots -
+        # incomplete. This counts quests done by anyone (bot OR human), which is
+        # what "switch if the account already meets the criteria at start" needs.
+        # None means "not read yet" -> never switch on a guess.
+        self._last_valid_quest_active_incomplete: int | None = None
+        # One-shot: read this account's quests from Home before the first queue,
+        # so the switch check reflects real state on landing. Reset per account.
+        self._home_quest_check_done = False
+        # Anti-storm guard: consecutive account switches with no match played in
+        # between. If it reaches the number of configured accounts, every account
+        # already meets the criteria -> stop cycling (a logout/login loop is worse
+        # than playing). Reset whenever a match completes.
+        self._switches_without_match = 0
+        self._known_account_count = 0
         # The screenName that owns this account's quests block, latched from the
         # first block we see after (re)start / account switch. Comparing against
         # this fixed value -- instead of "whichever screenName is last in the log
         # tail" -- avoids misreading an opponent's screenName (match-room events
         # log both players' names) as a sign that the account changed.
         self._current_account_screen_name: str | None = None
+        # Per-account gold farmed this SESSION. The controller is recreated every
+        # time the bot is started, so this dict naturally starts empty (each
+        # account resets to 0 on bot open, as required). Keyed by the account's
+        # MTGA screenName -- the only account identity the log exposes reliably
+        # for both the initial and every switched-in account. Published to
+        # runtime_status so the "Current Session" window can list it.
+        #
+        # The real gold balance is NOT in the player.log, so "farmed" is derived
+        # from what the bot does see: the gold reward of each daily quest it
+        # completes, plus a fixed estimate per match won (gold_per_win).
+        self._gold_per_win = max(0, int(gold_per_win or 0))
+        self._gold_farmed_by_account: dict[str, int] = {}
+        # Gold reward of each of the current account's quests, captured while the
+        # quest is still in the list so we still know its value once it completes
+        # and drops out. Reset on account switch.
+        self._account_quest_gold: dict[str, int] = {}
+        # Quest ids already credited as completed for the current account (credit
+        # a completed quest once). Reset on account switch.
+        self._credited_quest_ids: set[str] = set()
+        # Map screenName -> configured alias, so the UI can show the alias the
+        # user configured instead of (or beside) the raw in-game name. Built
+        # reliably from switches: when we switch TO alias A and then latch the
+        # screenName of the account that logs in, we know screenName -> A.
+        self._screenname_to_alias: dict[str, str] = {}
+        self._pending_switch_alias: str | None = None
         bot_logger.log_info(
             "Account-switch config: mode={} time_min={} main_quests={} daily_wins={}".format(
                 self._account_switch_mode,
@@ -1822,6 +1873,7 @@ class Controller(ControllerSecondary):
             if owner is not None:
                 if self._current_account_screen_name is None:
                     self._current_account_screen_name = owner
+                    self._register_current_account_for_gold()
                 elif owner != self._current_account_screen_name:
                     bot_logger.log_info(
                         f"Quests block ignored: belongs to '{owner}' but this session's "
@@ -1946,6 +1998,79 @@ class Controller(ControllerSecondary):
             })
         return view
 
+    def _current_account_key(self) -> str:
+        """Label used to attribute farmed gold. The MTGA screenName is the only
+        identity the log exposes for every account (initial + switched-in); fall
+        back to a generic label until it is latched from the first quests block."""
+        return self._current_account_screen_name or "(current account)"
+
+    def _publish_gold_farmed(self) -> None:
+        try:
+            runtime_status.update_status(
+                gold_farmed=dict(self._gold_farmed_by_account),
+                account_aliases=dict(self._screenname_to_alias),
+            )
+        except Exception:
+            pass
+
+    def set_gold_per_win(self, gold: int) -> None:
+        """Live-adjust the per-win gold estimate (edited from the Current Session
+        window). Only affects future credits."""
+        try:
+            self._gold_per_win = max(0, int(gold))
+        except (TypeError, ValueError):
+            pass
+
+    def _match_configured_alias(self, screen_name: str) -> str | None:
+        """Best-effort alias for an account we did NOT switch into (e.g. the one
+        already logged in at startup): match the screenName against a configured
+        account name, case-insensitively. Returns None when there's no exact hit
+        (we never guess)."""
+        try:
+            for acc in (self._load_accounts_from_dirs() or []):
+                name = str(acc.get("name") or "")
+                if name and name.casefold() == str(screen_name).casefold():
+                    return name
+        except Exception:
+            pass
+        return None
+
+    def _register_current_account_for_gold(self) -> None:
+        """Ensure the current account has a (0-gold) row as soon as its screenName
+        is known, map it to its configured alias when we can, and fold in any gold
+        credited before it was latched (a win that landed under the fallback key)."""
+        key = self._current_account_key()
+        if key != "(current account)" and key not in self._screenname_to_alias:
+            alias = self._pending_switch_alias or self._match_configured_alias(key)
+            if alias:
+                self._screenname_to_alias[key] = alias
+        self._pending_switch_alias = None
+        pending = self._gold_farmed_by_account.pop("(current account)", 0) if key != "(current account)" else 0
+        self._gold_farmed_by_account[key] = self._gold_farmed_by_account.get(key, 0) + int(pending or 0)
+        self._publish_gold_farmed()
+
+    def _credit_gold(self, amount: int, reason: str = "") -> None:
+        amount = int(amount or 0)
+        if amount <= 0:
+            return
+        key = self._current_account_key()
+        self._gold_farmed_by_account[key] = self._gold_farmed_by_account.get(key, 0) + amount
+        bot_logger.log_info(
+            "Gold farmed +{} ({}) for '{}': session total {}.".format(
+                amount, reason or "reward", key, self._gold_farmed_by_account[key]
+            )
+        )
+        self._publish_gold_farmed()
+
+    def _credit_completed_quest_gold(self, current_ids: set[str]) -> None:
+        """Credit the gold of any tracked quest that has dropped out of the list
+        (i.e. was completed) and hasn't been credited yet for this account."""
+        for quest_id, gold in self._account_quest_gold.items():
+            if quest_id in current_ids or quest_id in self._credited_quest_ids:
+                continue
+            self._credited_quest_ids.add(quest_id)
+            self._credit_gold(gold, reason=f"quest {quest_id} completed")
+
     def refresh_quests_cache(self) -> list[dict]:
         """Parse the account's quests once and cache them for local reuse.
 
@@ -1961,14 +2086,32 @@ class Controller(ControllerSecondary):
         # quests may be an empty list here, meaning all daily quests are done.
         view = self._build_quest_view(quests)
 
+        # This is a VALID read (a quests block was parsed), so update the absolute
+        # incomplete-quest count used by the switch decision. A listed quest at/
+        # past its goal (rare -- usually it has dropped out) is NOT counted as
+        # incomplete; an empty list means every daily quest is done -> 0.
+        self._last_valid_quest_active_incomplete = sum(
+            1 for v in view
+            if not (v.get("goal") and v.get("progress", 0) >= v.get("goal", 0))
+        )
+
+        current_ids = {str(v.get("id")) for v in view if v.get("id")}
         # Snapshot the quest ids present when this account first shows quests, so
         # quest-mode account switching can count completions (a completed daily
         # quest drops out of the list -> its id disappears).
         if self._account_start_quest_ids is None:
-            ids = {str(v.get("id")) for v in view if v.get("id")}
-            if ids:
-                self._account_start_quest_ids = ids
-                bot_logger.log_info(f"Account start quest ids captured: {sorted(ids)}")
+            if current_ids:
+                self._account_start_quest_ids = set(current_ids)
+                bot_logger.log_info(f"Account start quest ids captured: {sorted(current_ids)}")
+        # Record each quest's gold reward while it is still listed, so we still
+        # know its value once it completes (drops out), then credit "gold farmed"
+        # for any tracked quest that has since disappeared.
+        for v in view:
+            qid = str(v.get("id") or "")
+            if qid:
+                self._account_quest_gold[qid] = int(v.get("gold") or 0)
+        if self._account_quest_gold:
+            self._credit_completed_quest_gold(current_ids)
 
         # Active quest = the one whose colors we play. Mirror _select_best_quest:
         # the highest-gold guild (two-color) quest -- but skip quests already at
@@ -2760,6 +2903,41 @@ class Controller(ControllerSecondary):
         return True
 
     def start_game_from_home_screen(self):
+        # Quests-mode switch decision must reflect THIS account's real quest state
+        # on landing (done by bot or human), not a stale/empty cache. Before the
+        # first queue for each account, read its quests from Home once. If the
+        # account already meets the switch criteria, the check below triggers the
+        # switch before we ever queue -- and the next account repeats this on its
+        # own Home. Self-healing: on failure the absolute count stays unknown and
+        # the bot just plays normally.
+        if (
+            self._game_mode == "starter"
+            and self._account_switch_mode == "quests"
+            and not self._home_quest_check_done
+            and not self._account_switch_in_progress
+            and not self._stop_requested
+        ):
+            self._home_quest_check_done = True
+            try:
+                self._refresh_quests_from_home()
+            except Exception as e:
+                bot_logger.log_error(f"Startup/home quest check error: {e}")
+            # Diagnostic: make the switch decision visible in the log on landing.
+            completed = self._main_quests_completed_absolute()
+            bot_logger.log_info(
+                "SWITCH CHECK (account='{}'): enabled={} mode={} | quests completed(abs)={} "
+                "(active_incomplete={}) need>={} | wins={} need>={} | due={}".format(
+                    self._current_account_key(),
+                    self._account_switch_enabled,
+                    self._account_switch_mode,
+                    completed if completed is not None else "unknown",
+                    self._last_valid_quest_active_incomplete,
+                    self._account_switch_main_quests,
+                    self._daily_wins_this_account,
+                    self._account_switch_daily_wins,
+                    self._account_switch_due(),
+                )
+            )
         if self._account_switch_in_progress or self._account_switch_due():
             self._account_switch_pending = True
             bot_logger.log_info("Account switch pending; skipping queue click.")
@@ -4531,6 +4709,9 @@ class Controller(ControllerSecondary):
             bot_logger.log_info(
                 f"Daily win counted: {self._daily_wins_this_account} win(s) this account."
             )
+            # Estimated gold from the daily-win reward track (the exact amount is
+            # not in the log). Configurable via gold_per_win; 0 disables it.
+            self._credit_gold(self._gold_per_win, reason="match won")
         self._post_match_ready_ts = time.time()
         threading.Timer(self._post_match_delay_sec, self._maybe_post_match_action).start()
         if self._queue_ready:
@@ -4778,6 +4959,8 @@ class Controller(ControllerSecondary):
             if outcome is not None:
                 self.__last_match_won = outcome
             self.__log_match_summary(line_containing_pattern)
+            # A match was played -> reset the anti-storm switch guard.
+            self._switches_without_match = 0
             self._match_end_dismissed = False
             self._post_match_ready_ts = None
             # Wait a moment for end screen to fully appear, then dismiss it
@@ -4851,14 +5034,45 @@ class Controller(ControllerSecondary):
         current_ids = {str(v.get("id")) for v in (self._cached_quests or []) if v.get("id")}
         return len(self._account_start_quest_ids - current_ids)
 
+    def _main_quests_completed_absolute(self) -> int | None:
+        """Daily quests this account has completed RIGHT NOW (by bot or human),
+        derived from the current Home quest list: slots - still-incomplete.
+        Returns None when no valid Home read has happened yet (so callers don't
+        act on an empty/stale cache)."""
+        incomplete = self._last_valid_quest_active_incomplete
+        if incomplete is None:
+            return None
+        return max(0, min(self._DAILY_QUEST_SLOTS, self._DAILY_QUEST_SLOTS - int(incomplete)))
+
+    def set_account_switch_enabled(self, enabled: bool) -> None:
+        """Live master on/off from the main UI toggle."""
+        self._account_switch_enabled = bool(enabled)
+        bot_logger.log_info(f"Account switching {'ENABLED' if self._account_switch_enabled else 'DISABLED'} (UI toggle).")
+
     def _account_switch_due(self) -> bool:
+        # Master switch off -> never switch, whatever the thresholds/accounts are.
+        if not self._account_switch_enabled:
+            return False
         # Quest mode: switch once the configured number of main quests are
         # completed AND the configured daily wins are reached. A 0 threshold means
         # "no requirement" for that dimension; if both are 0 the mode is disabled.
         if self._account_switch_mode == "quests":
             if self._account_switch_main_quests <= 0 and self._account_switch_daily_wins <= 0:
                 return False
-            main_ok = self._main_quests_completed() >= self._account_switch_main_quests
+            # Anti-storm: if we've already cycled through every configured account
+            # without playing a single match, they all meet the criteria -> stop
+            # switching and just play, instead of an endless logout/login loop.
+            if self._known_account_count and self._switches_without_match >= self._known_account_count:
+                return False
+            main_req = self._account_switch_main_quests
+            if main_req <= 0:
+                main_ok = True
+            else:
+                completed = self._main_quests_completed_absolute()
+                if completed is None:
+                    # Quest state not read from Home yet -> never switch on a guess.
+                    return False
+                main_ok = completed >= main_req
             wins_ok = self._daily_wins_this_account >= self._account_switch_daily_wins
             return main_ok and wins_ok
         # Time mode (default): switch every N minutes.
@@ -5188,7 +5402,15 @@ class Controller(ControllerSecondary):
                 return
             if self._account_switch_due():
                 self._account_switch_pending = True
-                bot_logger.log_info("Account switch due; stopping queue spam and waiting for queue-ready marker.")
+                if self._post_match_ready_ts is None:
+                    # Switch became due BEFORE any match finished (e.g. the account
+                    # already meets the criteria at start). The post-match path
+                    # never runs here, so trigger the switch directly -- otherwise
+                    # the loop would just stop and nothing would perform it.
+                    bot_logger.log_info("Account switch due before a match finished; performing switch now.")
+                    threading.Thread(target=self._perform_account_switch, daemon=True).start()
+                else:
+                    bot_logger.log_info("Account switch due; stopping queue spam; post-match flow will perform it.")
                 return
             self.start_game_from_home_screen()
             time.sleep(3.0)
@@ -5202,6 +5424,23 @@ class Controller(ControllerSecondary):
         self._account_start_quest_ids = None
         self._daily_wins_this_account = 0
         self._win_counted_this_match = False
+        # Re-evaluate the incoming account's quest state fresh from its own Home:
+        # forget the previous account's absolute count and re-arm the one-shot
+        # Home quest check. Count this switch for the anti-storm guard.
+        self._last_valid_quest_active_incomplete = None
+        self._home_quest_check_done = False
+        self._switches_without_match += 1
+        # Reset post-match marker so the incoming account is treated as "no match
+        # played yet": if it already meets the criteria on landing, the queue loop
+        # performs the switch immediately instead of waiting for a match that the
+        # post-match path would need.
+        self._post_match_ready_ts = None
+        # Per-account gold tracking is measured fresh for the incoming account.
+        # The accumulated per-account totals (_gold_farmed_by_account) are kept:
+        # they are keyed by screenName, so each account keeps its own running
+        # session total across switches.
+        self._account_quest_gold = {}
+        self._credited_quest_ids = set()
         # Forget the previous account's screenName so the next quests block we
         # parse (the new account's) is latched as the new owner instead of being
         # rejected as stale.
@@ -5224,6 +5463,8 @@ class Controller(ControllerSecondary):
                 bot_logger.log_error("Account switch failed: no account credentials found in account folders.")
                 self._account_switch_pending = False
                 return
+            # Remember how many accounts exist, for the anti-storm guard.
+            self._known_account_count = len(accounts)
             bot_logger.log_info(
                 "Accounts loaded: count={} names={}".format(
                     len(accounts), [a.get("name") for a in accounts]
@@ -5258,6 +5499,9 @@ class Controller(ControllerSecondary):
             account_name = str(account.get("name", "")).strip() or str(account.get("folder", "")).strip()
 
             bot_logger.log_info(f"Switching account to '{account_name}'")
+            # Remember which alias we're switching to, so the next quests block we
+            # latch (the new account's) can be mapped screenName -> alias.
+            self._pending_switch_alias = account_name or None
             if custom_order:
                 next_cycle = (next_pos + 1) % len(custom_order)
                 bot_logger.log_info(f"Account cycle index (order pos): {self._account_cycle_index} -> {next_cycle}")
@@ -5928,6 +6172,16 @@ class Controller(ControllerSecondary):
                         )
                 elif use_battlefield_selection and not use_hand_selection:
                     ids = ids_on_my_battlefield
+                    # If this is a sacrifice, keep protected creatures (e.g.
+                    # Perforating Artist) last so they are only chosen when nothing
+                    # else is available. Order-only change; the id set is unchanged.
+                    if sacrifice_context and len(ids) > 1:
+                        ids = sorted(
+                            ids,
+                            key=lambda cid: 1 if RemovalLogic.is_protected_from_sacrifice(
+                                (game_objects_by_id.get(cid) or {}).get("grpId")
+                            ) else 0,
+                        )
                     bot_logger.log_info(
                         f"SelectN using battlefield selection for ids={ids}"
                     )
@@ -6285,13 +6539,17 @@ class Controller(ControllerSecondary):
                 hand_candidates = [cid for cid in ids if cid in hand_ids]
                 bf_candidates = [cid for cid in ids if _on_our_battlefield(cid)]
 
-                # Sacrifice fodder first (creatures whose death is beneficial or
-                # who recur -- Infestation Sage, Reassembling Skeleton, Infernal
-                # Vessel), then the least valuable creature (keep our bombs).
+                # Protected creatures last (never sacrifice unless it's the only
+                # legal choice -- e.g. Perforating Artist to Vampire Gourmand), then
+                # sacrifice fodder first (creatures whose death is beneficial or who
+                # recur -- Infestation Sage, Reassembling Skeleton, Infernal Vessel),
+                # then the least valuable creature (keep our bombs).
                 def _sac_value(cid: int):
                     obj = obj_by_id.get(cid) or {}
+                    protected = 1 if RemovalLogic.is_protected_from_sacrifice(obj.get("grpId")) else 0
                     fodder = 0 if RemovalLogic.is_sacrifice_fodder(obj.get("grpId")) else 1
                     return (
+                        protected,
                         fodder,
                         RemovalLogic.effective_toughness(obj) + RemovalLogic._stat(obj.get("power")),
                         RemovalLogic._stat(obj.get("power")),
@@ -6349,6 +6607,11 @@ class Controller(ControllerSecondary):
             bot_logger.log_error(f"Failed to handle PayCostsReq: {e}")
             threading.Timer(0.6, lambda: self.submit_selection(reason="pay_costs_error_fallback", force=True)).start()
 
+    # Modal "Choose one" spells whose SECOND (right) plate is the mode we want.
+    # Valorous Stance (all printings): always take "Destroy target creature with
+    # toughness 4 or greater", never the indestructible mode.
+    _MODAL_PICK_SECOND_GRPIDS = {72198, 78825, 93566, 94011, 98299}
+
     def __handle_casting_time_options_req(self, line: str) -> None:
         # Kicker & friends: after clicking a card with optional casting-time
         # costs, MTGA blocks the cast behind a mid-screen "Choose One" dialog
@@ -6376,6 +6639,7 @@ class Controller(ControllerSecondary):
             messages = payload.get("greToClientEvent", {}).get("greToClientMessages", [])
             option_summaries = []
             is_choose_or_cost = False
+            prefer_second_modal = False
             saw_req = False
             saw_our_req = False
             for message in messages:
@@ -6389,11 +6653,22 @@ class Controller(ControllerSecondary):
                 saw_our_req = True
                 req = message.get("castingTimeOptionsReq", {}) or {}
                 for option in req.get("castingTimeOptionReq", []) or []:
-                    if option.get("castingTimeOptionType") == "CastingTimeOptionType_ChooseOrCost":
+                    otype = option.get("castingTimeOptionType")
+                    if otype == "CastingTimeOptionType_ChooseOrCost":
                         # "Choose an additional cost" -- e.g. Eaten Alive's
                         # "sacrifice a creature or pay {3}{B}". We prefer to
                         # sacrifice (saves mana; fodder creatures are expendable).
                         is_choose_or_cost = True
+                    # Modal "Choose one" spells whose SECOND (right) mode is the one
+                    # we want -- Valorous Stance: pick "Destroy target creature with
+                    # toughness 4+", never "gains indestructible" (which would buff
+                    # the enemy). Keyed on grpId.
+                    if otype == "CastingTimeOptionType_Modal":
+                        try:
+                            if int(option.get("grpId") or 0) in self._MODAL_PICK_SECOND_GRPIDS:
+                                prefer_second_modal = True
+                        except (TypeError, ValueError):
+                            pass
                     option_summaries.append(
                         "type={} ctoId={} grpId={} required={}".format(
                             option.get("castingTimeOptionType"),
@@ -6413,6 +6688,13 @@ class Controller(ControllerSecondary):
                 label = "CASTING_TIME_OPTION_SACRIFICE"
                 base_point = (1775, 978)  # bottom-right "Sacrifice a creature" button
                 choice_desc = "sacrifice-a-creature (bottom button)"
+            elif prefer_second_modal:
+                # Two mode plates side by side (indestructible left, destroy right).
+                # Click the RIGHT plate (the "destroy" mode). Measured centre in the
+                # 1920x1080 arena frame; mirrors the left plate at (750, 505).
+                label = "CASTING_TIME_OPTION_MODAL_SECOND"
+                base_point = (1185, 505)
+                choice_desc = "second/right modal option (e.g. Valorous Stance destroy)"
             else:
                 label = "CASTING_TIME_OPTION_PLAIN"
                 base_point = (750, 505)   # leftmost (plain, non-kicked) plate
@@ -6827,6 +7109,24 @@ class Controller(ControllerSecondary):
 
     def __get_effective_decision_delay(self) -> float:
         delay = max(0.0, float(self.__decision_delay or 0.0))
+        # During the OPPONENT's turn we only ever pass priority (the bot does not
+        # cast reactively; blocking is driven by explicit SelectTargets/DeclareBlock
+        # prompts, not by this settle timer). Applying the full 4s delay to every
+        # priority window of the opponent's turn stacks into ~20s of apparent freeze
+        # across a single combat — which reads as "stuck" and pushed users to press
+        # Resolve manually. Pass quickly on the opponent's turn instead.
+        try:
+            ti = self.updated_game_state.get_turn_info() or {}
+            my_seat = self.__system_seat_id
+            active_player = ti.get("activePlayer")
+            if (
+                my_seat is not None
+                and active_player is not None
+                and int(active_player) != int(my_seat)
+            ):
+                delay = min(delay, 0.8)
+        except Exception:
+            pass
         lowest_remaining = None
         for timer_state in self.__my_timer_state.values():
             if not timer_state.get("running", False):

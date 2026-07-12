@@ -60,6 +60,11 @@ def reset_status(*, log_path: str | None = None) -> dict[str, Any]:
         "quests": [],
         "active_quest_id": "",
         "active_quest_colors": "",
+        # Per-account gold farmed this session, {screenName: gold}. Reset here
+        # so the "Current Session" window starts every account at 0 on bot open.
+        "gold_farmed": {},
+        # Map screenName -> configured alias, filled in as accounts are switched.
+        "account_aliases": {},
     }
     return _write_payload(payload)
 

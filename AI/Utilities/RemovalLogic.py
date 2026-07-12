@@ -144,6 +144,12 @@ def is_self_buff(grp_id) -> bool:
 _CREATURE_TARGET = r"target (?:attacking |blocking |tapped |untapped )?creature"
 
 _RE_DESTROY = re.compile(r"destroy " + _CREATURE_TARGET, re.I)
+# Conditional destroy that only hits big creatures, e.g. Valorous Stance:
+# "Destroy target creature with toughness 4 or greater." The min stat is a
+# targeting restriction -- the bot must only aim it at creatures that satisfy it.
+_RE_DESTROY_MIN = re.compile(
+    r"destroy target creature with (toughness|power) (\d+) or greater", re.I
+)
 _RE_EXILE = re.compile(r"exile " + _CREATURE_TARGET, re.I)
 # "target creature ... gets -X/-Y"
 _RE_MINUS = re.compile(_CREATURE_TARGET + r"[^.]*?gets\s*[+-]?\d+/(-\d+)", re.I)
@@ -178,6 +184,14 @@ def detect_profile_from_oracle(grp_id: int) -> dict | None:
     # Prefer the unconditional kill if a card does several things.
     if _RE_EXILE.search(t):
         return {"kind": "exile"}
+    # Conditional destroy (e.g. Valorous Stance) must be checked before the plain
+    # destroy so its targeting restriction is captured.
+    m_min = _RE_DESTROY_MIN.search(t)
+    if m_min:
+        stat = m_min.group(1).lower()
+        amount = int(m_min.group(2))
+        key = "min_toughness" if stat == "toughness" else "min_power"
+        return {"kind": "destroy", key: amount}
     if _RE_DESTROY.search(t):
         return {"kind": "destroy"}
 
@@ -262,6 +276,29 @@ def is_sacrifice_fodder(grp_id) -> bool:
     return "this creature dies" in text or "from your graveyard" in text
 
 
+# High-value creatures we must NOT feed to a sacrifice cost/effect (e.g. Vampire
+# Gourmand's "sacrifice another creature" ability) unless there is literally no
+# other legal choice. Perforating Artist is a repeatable damage engine (its Raid
+# ability drains the opponent every combat), so sacrificing it for a few counters
+# is a bad trade. Keyed by grpId because these cards have no oracle text in the
+# offline DB.
+_SAC_PROTECTED_GRPIDS = {
+    93837,  # Perforating Artist
+}
+
+
+def is_protected_from_sacrifice(grp_id) -> bool:
+    """True if this creature should be kept off the sacrifice-cost chopping block
+    whenever any other creature is available to sacrifice instead."""
+    if grp_id is None:
+        return False
+    try:
+        grp_id = int(grp_id)
+    except Exception:
+        return False
+    return grp_id in _SAC_PROTECTED_GRPIDS
+
+
 def _creature_keywords(creature: dict) -> set[str]:
     """Printed keywords for the creature's card (best-effort; keywords granted
     by other effects are not visible here)."""
@@ -289,7 +326,17 @@ def can_kill(profile: dict, creature: dict) -> bool:
         return True
 
     if kind == "destroy":
-        return "indestructible" not in kws
+        if "indestructible" in kws:
+            return False
+        # Conditional destroy (e.g. Valorous Stance: toughness 4+) is only a legal
+        # target when the creature meets the minimum stat, using current stats.
+        min_t = int(profile.get("min_toughness", 0) or 0)
+        if min_t > 0 and _stat(creature.get("toughness")) < min_t:
+            return False
+        min_p = int(profile.get("min_power", 0) or 0)
+        if min_p > 0 and _stat(creature.get("power")) < min_p:
+            return False
+        return True
 
     if kind == "minus_toughness":
         # Toughness <= 0 is a state-based kill; indestructible does NOT save it.
