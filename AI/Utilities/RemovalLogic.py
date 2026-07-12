@@ -330,11 +330,14 @@ def can_kill(profile: dict, creature: dict) -> bool:
             return False
         # Conditional destroy (e.g. Valorous Stance: toughness 4+) is only a legal
         # target when the creature meets the minimum stat, using current stats.
+        # A missing/not-yet-populated stat (e.g. a creature instance whose first
+        # GRE diff hasn't reported toughness/power yet) is treated as unknown,
+        # not 0 -- otherwise a brand-new creature would wrongly look unkillable.
         min_t = int(profile.get("min_toughness", 0) or 0)
-        if min_t > 0 and _stat(creature.get("toughness")) < min_t:
+        if min_t > 0 and creature.get("toughness") is not None and _stat(creature.get("toughness")) < min_t:
             return False
         min_p = int(profile.get("min_power", 0) or 0)
-        if min_p > 0 and _stat(creature.get("power")) < min_p:
+        if min_p > 0 and creature.get("power") is not None and _stat(creature.get("power")) < min_p:
             return False
         return True
 

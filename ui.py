@@ -3082,6 +3082,38 @@ class MTGBotUI(tk.Tk):
             m, w = 0, 0
         return f"Account switch: on (quests: {m} main / {w} wins)"
 
+    def _live_switch_disabled(self, controller) -> bool:
+        """Mirror of _configured_switch_disabled but read from the LIVE, running
+        controller instead of the on-disk config, which may have been edited
+        mid-session without restarting the bot. Keeps the label truthful about
+        what the running bot will actually do."""
+        try:
+            if not controller.get_account_switch_enabled():
+                return True
+        except Exception:
+            pass
+        try:
+            mode = controller.get_account_switch_mode()
+        except Exception:
+            mode = "time"
+        try:
+            if mode == "quests":
+                return (
+                    controller.get_account_switch_main_quests() <= 0
+                    and controller.get_account_switch_daily_wins() <= 0
+                )
+            return controller.get_account_switch_interval_minutes() <= 0
+        except Exception:
+            return True
+
+    def _live_quests_switch_label(self, controller) -> str:
+        try:
+            m = controller.get_account_switch_main_quests()
+            w = controller.get_account_switch_daily_wins()
+        except Exception:
+            m, w = 0, 0
+        return f"Account switch: on (quests: {m} main / {w} wins)"
+
     def _get_configured_switch_eta_text(self) -> str:
         if self._configured_switch_disabled():
             return "Account switch: off"
@@ -3231,11 +3263,18 @@ class MTGBotUI(tk.Tk):
         # ingame_anchor score ~0.71 vs 0.78 threshold during the opening swirl),
         # which would otherwise abort Start if the user presses it while a match
         # animation is playing. The common case (anchors match immediately) still
-        # returns on the first attempt with zero added delay.
-        setup_ok = self._run_arena_setup_check(show_success=False, attempts=8, retry_delay=1.0)
+        # returns on the first attempt with zero added delay. Runs via self.after
+        # (not a blocking sleep loop) so the UI stays responsive during retries.
+        self._run_arena_setup_check_async(
+            show_success=False,
+            attempts=8,
+            retry_delay=1.0,
+            on_done=self._on_start_bot_setup_check_done,
+        )
+
+    def _on_start_bot_setup_check_done(self, setup_ok: bool) -> None:
         if not setup_ok:
             return
-
         self.bot_running = True
         self._set_running_state(True)
         self._set_startup_loading(True)
@@ -3247,6 +3286,57 @@ class MTGBotUI(tk.Tk):
 
     def _check_arena_setup(self):
         self._run_arena_setup_check(show_success=True)
+
+    def _run_arena_setup_check_async(
+        self, *, show_success: bool, attempts: int = 1, retry_delay: float = 1.0, on_done=None
+    ) -> None:
+        """Non-blocking equivalent of _run_arena_setup_check: retries are
+        scheduled via self.after() instead of time.sleep(), so the Tk main
+        thread (which this runs on) never freezes during the retry window."""
+        attempts = max(1, int(attempts))
+        state = {"attempt": 0}
+
+        def try_once():
+            attempt = state["attempt"]
+            is_last = attempt == attempts - 1
+            try:
+                result = run_arena_setup_check(
+                    assets_dir=_app_path("assets", "assert"),
+                    expected_size=(1920, 1080),
+                    # Only persist a debug bundle on the final failed attempt so a
+                    # transient animation retry does not spam runtime/debug.
+                    write_debug_on_fail=is_last,
+                )
+            except Exception as exc:
+                if is_last:
+                    messagebox.showerror(
+                        "Arena Setup",
+                        f"Arena setup check failed unexpectedly.\n\n{exc}",
+                        parent=self,
+                    )
+                    if on_done is not None:
+                        on_done(False)
+                    return
+                state["attempt"] += 1
+                self.after(int(retry_delay * 1000), try_once)
+                return
+
+            if result.ok:
+                self._handle_arena_setup_success(result, show_success=show_success)
+                if on_done is not None:
+                    on_done(True)
+                return
+
+            if not is_last:
+                state["attempt"] += 1
+                self.after(int(retry_delay * 1000), try_once)
+                return
+
+            self._handle_arena_setup_failure(result)
+            if on_done is not None:
+                on_done(False)
+
+        try_once()
 
     def _run_arena_setup_check(self, *, show_success: bool, attempts: int = 1, retry_delay: float = 1.0) -> bool:
         attempts = max(1, int(attempts))
@@ -3581,21 +3671,28 @@ class MTGBotUI(tk.Tk):
     def _update_switch_eta(self):
         if not self.bot_running:
             return
+        controller = getattr(self, "_controller", None)
+        if controller is None:
+            # Shouldn't normally happen while bot_running, but fall back to the
+            # configured (on-disk) values defensively.
+            self._switch_eta_text = self._get_configured_switch_eta_text()
+            self._update_current_session_window()
+            self.after(10000, self._update_switch_eta)
+            return
         try:
-            mode = self.config_manager.get_account_switch_mode()
+            mode = controller.get_account_switch_mode()
         except Exception:
             mode = "time"
-        if self._configured_switch_disabled():
+        if self._live_switch_disabled(controller):
             self._switch_eta_text = "Account switch: off"
         elif mode == "quests":
             # Quests mode has no time countdown; show that it is on + thresholds.
-            self._switch_eta_text = self._quests_switch_label()
+            self._switch_eta_text = self._live_quests_switch_label(controller)
         else:
             minutes = 0
             try:
-                if getattr(self, "_controller", None):
-                    remaining_sec = self._controller.get_account_switch_remaining_sec()
-                    minutes = int((remaining_sec + 59) / 60) if remaining_sec > 0 else 0
+                remaining_sec = controller.get_account_switch_remaining_sec()
+                minutes = int((remaining_sec + 59) / 60) if remaining_sec > 0 else 0
             except Exception:
                 minutes = 0
             self._switch_eta_text = f"{minutes} Min till Account Switch"

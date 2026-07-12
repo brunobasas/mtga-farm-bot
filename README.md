@@ -124,6 +124,14 @@ Accounts/
 
 Manage accounts via **Settings → Manage Accounts**. Set a switch timer and play order. When the timer expires and the bot is at a safe screen, it logs out, switches account, and resumes.
 
+Account switching can be toggled on/off live from the main window without restarting the bot, and runs in one of two modes:
+- **Time**: switch every N minutes (configurable).
+- **Quests**: switch once the configured number of daily quests and/or daily wins are completed *during the current bot session* on that account.
+
+### Gold Tracking
+
+The bot estimates gold earned per match win (configurable, `gold_per_win` in settings) and tracks it per account for the current run. Open **Current Session** from the main window to see gold farmed per account, alongside games/wins for the session.
+
 ### Quest-Based Deck Selection
 
 After each account switch the bot picks a deck based on active quests. Place deck screenshot images in the account folder named by color letters:

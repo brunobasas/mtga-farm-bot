@@ -344,10 +344,12 @@ class Controller(ControllerSecondary):
         self._account_switch_enabled = bool(account_switch_enabled)
         self._account_switch_main_quests = max(0, min(3, int(account_switch_main_quests or 0)))
         self._account_switch_daily_wins = max(0, min(15, int(account_switch_daily_wins or 0)))
-        # Quest-mode tracking: the quest ids present when this account started
-        # (a daily quest is "completed" once its id drops out of the list), and a
-        # local win counter (the bot knows every match result).
-        self._account_start_quest_ids: set[str] | None = None
+        # Quest-mode tracking: a local win counter (the bot knows every match
+        # result) and the absolute completed-quest count captured at the first
+        # valid Home read this session, used as a baseline so the switch check
+        # only counts quests completed DURING this session (see
+        # _main_quests_completed_this_session).
+        self._account_start_quests_completed_absolute: int | None = None
         self._daily_wins_this_account = 0
         self._win_counted_this_match = False
         # ABSOLUTE quest state for the account-switch decision: the number of
@@ -2014,8 +2016,9 @@ class Controller(ControllerSecondary):
             pass
 
     def set_gold_per_win(self, gold: int) -> None:
-        """Live-adjust the per-win gold estimate (edited from the Current Session
-        window). Only affects future credits."""
+        """Live-adjust the per-win gold estimate. Not currently called from any
+        UI control (the Current Session window is read-only) -- kept for a
+        future live-editable setting. Only affects future credits."""
         try:
             self._gold_per_win = max(0, int(gold))
         except (TypeError, ValueError):
@@ -2096,13 +2099,6 @@ class Controller(ControllerSecondary):
         )
 
         current_ids = {str(v.get("id")) for v in view if v.get("id")}
-        # Snapshot the quest ids present when this account first shows quests, so
-        # quest-mode account switching can count completions (a completed daily
-        # quest drops out of the list -> its id disappears).
-        if self._account_start_quest_ids is None:
-            if current_ids:
-                self._account_start_quest_ids = set(current_ids)
-                bot_logger.log_info(f"Account start quest ids captured: {sorted(current_ids)}")
         # Record each quest's gold reward while it is still listed, so we still
         # know its value once it completes (drops out), then credit "gold farmed"
         # for any tracked quest that has since disappeared.
@@ -2911,8 +2907,7 @@ class Controller(ControllerSecondary):
         # own Home. Self-healing: on failure the absolute count stays unknown and
         # the bot just plays normally.
         if (
-            self._game_mode == "starter"
-            and self._account_switch_mode == "quests"
+            self._account_switch_mode == "quests"
             and not self._home_quest_check_done
             and not self._account_switch_in_progress
             and not self._stop_requested
@@ -2923,9 +2918,9 @@ class Controller(ControllerSecondary):
             except Exception as e:
                 bot_logger.log_error(f"Startup/home quest check error: {e}")
             # Diagnostic: make the switch decision visible in the log on landing.
-            completed = self._main_quests_completed_absolute()
+            completed = self._main_quests_completed_this_session()
             bot_logger.log_info(
-                "SWITCH CHECK (account='{}'): enabled={} mode={} | quests completed(abs)={} "
+                "SWITCH CHECK (account='{}'): enabled={} mode={} | quests completed(session)={} "
                 "(active_incomplete={}) need>={} | wins={} need>={} | due={}".format(
                     self._current_account_key(),
                     self._account_switch_enabled,
@@ -5019,21 +5014,6 @@ class Controller(ControllerSecondary):
                 "phase strip / stops UI instead of the intended target (misclick signal)."
             )
 
-    def _main_quests_completed(self) -> int:
-        """How many of this account's starting daily quests are now completed.
-
-        A completed daily quest drops out of the quest list, so completions =
-        starting quest ids that are no longer present. Uses the cached quest list
-        (refreshed between matches) so it stays cheap in the frequently-called
-        switch check; relies only on quest ids, which the log exposes reliably."""
-        if not self._account_start_quest_ids:
-            return 0
-        # _cached_quests is [] only when a valid empty block was parsed (all daily
-        # quests done); a failed refresh keeps the previous non-empty cache, so an
-        # empty current set here genuinely means every starting quest is completed.
-        current_ids = {str(v.get("id")) for v in (self._cached_quests or []) if v.get("id")}
-        return len(self._account_start_quest_ids - current_ids)
-
     def _main_quests_completed_absolute(self) -> int | None:
         """Daily quests this account has completed RIGHT NOW (by bot or human),
         derived from the current Home quest list: slots - still-incomplete.
@@ -5044,10 +5024,36 @@ class Controller(ControllerSecondary):
             return None
         return max(0, min(self._DAILY_QUEST_SLOTS, self._DAILY_QUEST_SLOTS - int(incomplete)))
 
+    def _main_quests_completed_this_session(self) -> int | None:
+        """How many daily quests this account has completed DURING THIS SESSION.
+
+        Uses the absolute count (quests done by anyone, bot or human) minus a
+        baseline captured at the first valid Home read this session, so quests
+        the human already finished before the bot started don't count toward
+        the switch threshold. Returns None until a valid Home read has happened."""
+        absolute = self._main_quests_completed_absolute()
+        if absolute is None:
+            return None
+        if self._account_start_quests_completed_absolute is None:
+            self._account_start_quests_completed_absolute = absolute
+        return max(0, absolute - self._account_start_quests_completed_absolute)
+
     def set_account_switch_enabled(self, enabled: bool) -> None:
         """Live master on/off from the main UI toggle."""
         self._account_switch_enabled = bool(enabled)
         bot_logger.log_info(f"Account switching {'ENABLED' if self._account_switch_enabled else 'DISABLED'} (UI toggle).")
+
+    def get_account_switch_enabled(self) -> bool:
+        return bool(self._account_switch_enabled)
+
+    def get_account_switch_mode(self) -> str:
+        return self._account_switch_mode
+
+    def get_account_switch_main_quests(self) -> int:
+        return self._account_switch_main_quests
+
+    def get_account_switch_daily_wins(self) -> int:
+        return self._account_switch_daily_wins
 
     def _account_switch_due(self) -> bool:
         # Master switch off -> never switch, whatever the thresholds/accounts are.
@@ -5068,7 +5074,7 @@ class Controller(ControllerSecondary):
             if main_req <= 0:
                 main_ok = True
             else:
-                completed = self._main_quests_completed_absolute()
+                completed = self._main_quests_completed_this_session()
                 if completed is None:
                     # Quest state not read from Home yet -> never switch on a guess.
                     return False
@@ -5420,8 +5426,8 @@ class Controller(ControllerSecondary):
             return
         self._account_switch_in_progress = True
         # Reset quest-mode tracking so the incoming account is measured fresh:
-        # re-capture its starting quest ids and restart its daily-win count.
-        self._account_start_quest_ids = None
+        # re-capture its session baseline and restart its daily-win count.
+        self._account_start_quests_completed_absolute = None
         self._daily_wins_this_account = 0
         self._win_counted_this_match = False
         # Re-evaluate the incoming account's quest state fresh from its own Home:
@@ -5453,18 +5459,21 @@ class Controller(ControllerSecondary):
                 bot_logger.log_info("Account switch aborted: stop requested.")
                 return
             bot_logger.log_info("Account switch: starting logout/login flow.")
-            if not self.log_out_btn_coors or not self.log_out_ok_btn_coors:
-                bot_logger.log_error("Account switch failed: missing calibrated button(s).")
-                self._account_switch_pending = False
-                return
-
             accounts = self._load_accounts_from_dirs()
             if not accounts:
                 bot_logger.log_error("Account switch failed: no account credentials found in account folders.")
                 self._account_switch_pending = False
                 return
-            # Remember how many accounts exist, for the anti-storm guard.
+            # Remember how many accounts exist, for the anti-storm guard. Set
+            # this BEFORE the calibration check below so a missing button
+            # calibration (which aborts every switch attempt) still lets the
+            # guard trip instead of leaving _known_account_count at 0 forever
+            # and disabling the anti-storm protection permanently.
             self._known_account_count = len(accounts)
+            if not self.log_out_btn_coors or not self.log_out_ok_btn_coors:
+                bot_logger.log_error("Account switch failed: missing calibrated button(s).")
+                self._account_switch_pending = False
+                return
             bot_logger.log_info(
                 "Accounts loaded: count={} names={}".format(
                     len(accounts), [a.get("name") for a in accounts]
