@@ -132,11 +132,13 @@ Manage accounts via **Settings → Manage Accounts**. Set a switch timer and pla
 
 Account switching can be toggled on/off live from the main window without restarting the bot, and runs in one of two modes:
 - **Time**: switch every N minutes (configurable).
-- **Quests**: switch once the configured number of daily quests and/or daily wins are completed *during the current bot session* on that account.
+- **Quests**: switch once the configured number of daily quests (measured *absolutely* — completed by the bot or by hand, whichever comes first) and/or daily wins seen this session are reached on that account. Once every configured account has completed a round, the bot stops itself instead of cycling back to the first account.
+
+> **Known issue:** in quests mode, if a switch becomes due while the bot is on the Starter Deck Duel event page (`game_mode = starter`), the logout sequence can fail to open the Options menu and misclick into the event page instead of logging out. Time-mode switching from Home is unaffected. A fix (navigate to Home before attempting logout) is planned as a follow-up.
 
 ### Gold Tracking
 
-The bot estimates gold earned per match win (configurable, `gold_per_win` in settings) and tracks it per account for the current run. Open **Current Session** from the main window to see gold farmed per account, alongside games/wins for the session.
+The bot reads each account's real Gold balance from MTGA's own logs and tracks the delta (current balance minus the balance first seen this session) per account — no estimate. Open **Current Session** from the main window to see gold farmed per account, alongside games/wins for the session.
 
 ### Quest-Based Deck Selection
 
