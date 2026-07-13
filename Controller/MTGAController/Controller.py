@@ -51,6 +51,10 @@ class Controller(ControllerSecondary):
     # MTGA holds up to 3 daily quests; completed ones drop out of the list. Used
     # to derive absolute completions (slots - remaining) for the switch decision.
     _DAILY_QUEST_SLOTS = 3
+    # Bounded retries for the per-account landing quest read (see
+    # start_game_from_home_screen). After this many failed attempts the bot gives
+    # up reading and just plays, rather than dipping to Home forever.
+    _HOME_QUEST_CHECK_MAX_ATTEMPTS = 3
 
     def __init__(
         self,
@@ -291,6 +295,9 @@ class Controller(ControllerSecondary):
         self.updated_game_state = GameState()
         self.__inst_id_grp_id_dict = {}
         self.__match_end_callback = None
+        # Optional UI callback used to stop the bot from inside the controller
+        # (e.g. when every configured account has finished its daily quests).
+        self.__stop_bot_callback = None
         self.__last_match_won: bool | None = None
         self.__last_seen_match_id: str | None = None
         self.__attack_target_required = False
@@ -345,11 +352,8 @@ class Controller(ControllerSecondary):
         self._account_switch_main_quests = max(0, min(3, int(account_switch_main_quests or 0)))
         self._account_switch_daily_wins = max(0, min(15, int(account_switch_daily_wins or 0)))
         # Quest-mode tracking: a local win counter (the bot knows every match
-        # result) and the absolute completed-quest count captured at the first
-        # valid Home read this session, used as a baseline so the switch check
-        # only counts quests completed DURING this session (see
-        # _main_quests_completed_this_session).
-        self._account_start_quests_completed_absolute: int | None = None
+        # result). Wins are tracked for stats/gold only -- the switch decision is
+        # driven purely by absolute main-quest completion (see _account_switch_due).
         self._daily_wins_this_account = 0
         self._win_counted_this_match = False
         # ABSOLUTE quest state for the account-switch decision: the number of
@@ -360,9 +364,20 @@ class Controller(ControllerSecondary):
         # what "switch if the account already meets the criteria at start" needs.
         # None means "not read yet" -> never switch on a guess.
         self._last_valid_quest_active_incomplete: int | None = None
+        # After an account switch, only quests blocks written PAST this log offset
+        # belong to the incoming account. The previous account's block lingers in
+        # the 600KB log tail, so gating the read to this offset (until the new
+        # owner screenName is latched) stops it from being mistaken for the new
+        # account's and then rejecting the real block as stale. 0 = read the tail
+        # normally (startup / already latched).
+        self._quests_valid_from_offset = 0
         # One-shot: read this account's quests from Home before the first queue,
         # so the switch check reflects real state on landing. Reset per account.
         self._home_quest_check_done = False
+        # Bounded retries for that landing read: a single transient Home-nav
+        # failure must not permanently consume the one-shot and leave the switch
+        # decision blind. Reset per account.
+        self._home_quest_check_attempts = 0
         # One-shot per account: whether _navigate_starter_deck's "chooser already
         # open" fast path has been tried yet. That shortcut trusts the mere
         # presence of a "Submit Deck" button as proof we landed directly on the
@@ -381,6 +396,13 @@ class Controller(ControllerSecondary):
         # than playing). Reset whenever a match completes.
         self._switches_without_match = 0
         self._known_account_count = 0
+        # Round tracking: screenNames of the accounts whose switch criteria we have
+        # completed this session. When its size reaches the number of configured
+        # accounts, the bot has looped through them all and stops. This is the
+        # primary "stop at end of round" signal and works whether or not switching
+        # requires matches (unlike the anti-storm counter, which only advances when
+        # no match is played). Fresh per Controller (i.e. per bot Start).
+        self._completed_account_keys: set[str] = set()
         # The screenName that owns this account's quests block, latched from the
         # first block we see after (re)start / account switch. Comparing against
         # this fixed value -- instead of "whichever screenName is last in the log
@@ -394,11 +416,22 @@ class Controller(ControllerSecondary):
         # for both the initial and every switched-in account. Published to
         # runtime_status so the "Current Session" window can list it.
         #
-        # The real gold balance is NOT in the player.log, so "farmed" is derived
-        # from what the bot does see: the gold reward of each daily quest it
-        # completes, plus a fixed estimate per match won (gold_per_win).
+        # "Gold farmed" per account is the REAL delta of the account's actual Gold
+        # balance, which MTGA logs in the InventoryInfo event on every Home load
+        # ({"InventoryInfo":{...,"Gold":N,...}}). farmed = current balance - the
+        # first balance we saw for that account this session. This covers wins AND
+        # quests exactly, with no per-win estimate. (_gold_per_win is kept for the
+        # config plumbing but no longer used for crediting.)
         self._gold_per_win = max(0, int(gold_per_win or 0))
         self._gold_farmed_by_account: dict[str, int] = {}
+        # First Gold balance seen for each account this session (screenName -> gold),
+        # the baseline the per-account "farmed" delta is measured from. Set once per
+        # account (first sighting) so the delta accumulates across revisits; kept
+        # across account switches; reset only on a fresh bot start.
+        self._account_initial_gold: dict[str, int] = {}
+        # Throttle for the wide log read used to find the startup account's login
+        # screenName when it has scrolled past the normal quests tail.
+        self._last_login_wide_scan_ts = 0.0
         # Gold reward of each of the current account's quests, captured while the
         # quest is still in the list so we still know its value once it completes
         # and drops out. Reset on account switch.
@@ -411,6 +444,7 @@ class Controller(ControllerSecondary):
         # reliably from switches: when we switch TO alias A and then latch the
         # screenName of the account that logs in, we know screenName -> A.
         self._screenname_to_alias: dict[str, str] = {}
+        self._load_persisted_aliases()
         self._pending_switch_alias: str | None = None
         bot_logger.log_info(
             "Account-switch config: mode={} time_min={} main_quests={} daily_wins={}".format(
@@ -1864,57 +1898,74 @@ class Controller(ControllerSecondary):
         switch must be able to see."""
         if not self._log_path:
             return None
-        log_tail = self._read_log_tail(self._log_path)
+        # While we have not yet latched the incoming account's screenName after a
+        # switch, read only the log written since the switch so the previous
+        # account's block (still in the 600KB tail) can't be latched as the new
+        # owner. Once latched, the screenName comparison guards staleness and we
+        # go back to the normal tail read.
+        if self._current_account_screen_name is None and self._quests_valid_from_offset > 0:
+            log_tail = self._read_log_since(
+                self._log_path,
+                start_offset=self._quests_valid_from_offset,
+                max_bytes=2_000_000,
+            )
+        else:
+            log_tail = self._read_log_tail(self._log_path)
         if not log_tail:
             return None
         idx = log_tail.rfind('"quests"')
         if idx == -1:
             return None
-        # Account-safety: a "quests" block belongs to whichever account was logged
-        # in when MTGA wrote it. After an account switch the PREVIOUS account's
-        # block is still in the log tail, and using it makes the bot farm the wrong
-        # account's quests (its colors/deck). We latch the owning screenName once
-        # per account session (the first quests block we parse after a fresh start
-        # / switch) and compare every later block against that fixed value.
-        #
-        # We deliberately do NOT use "the last screenName anywhere in the log
-        # tail" as "the current account": match-room events log BOTH players'
-        # screenNames (reservedPlayers), so after a single match the last
-        # occurrence is frequently the opponent's, which would make every
-        # subsequent (genuinely current) quests block look stale forever.
-        try:
-            name_matches = list(re.finditer(r'"screenName"\s*:\s*"([^"]+)"', log_tail))
-            owner = None
-            for m in name_matches:
-                if m.start() < idx:
-                    owner = m.group(1)
-                else:
-                    break
-            if owner is not None:
-                if self._current_account_screen_name is None:
-                    self._current_account_screen_name = owner
-                    self._register_current_account_for_gold()
-                elif owner != self._current_account_screen_name:
-                    bot_logger.log_info(
-                        f"Quests block ignored: belongs to '{owner}' but this session's "
-                        f"account is '{self._current_account_screen_name}' (stale after "
-                        f"account switch)."
-                    )
-                    return None
-        except Exception:
-            pass
         start = log_tail.rfind("{", 0, idx)
         if start == -1:
             return None
         decoder = json.JSONDecoder()
         try:
-            payload, _ = decoder.raw_decode(log_tail[start:])
+            payload, end = decoder.raw_decode(log_tail[start:])
         except Exception:
             return None
         quests = payload.get("quests", [])
-        if isinstance(quests, list):
-            return quests
-        return None
+        if not isinstance(quests, list):
+            return None
+        # Latch the current account's own screenName. The QuestGetQuests response
+        # carries NO account identity, and match events log BOTH players' names
+        # (unreliable). The account's own name IS logged reliably in the login
+        # event: {"authenticateResponse":{...,"screenName":"X"}}. Take the latest
+        # one (the most recent login = current account). Post-switch staleness is
+        # already handled by the offset gate above, so we just latch/refresh the
+        # identity here for gold attribution and round tracking.
+        self._latch_account_screen_name_from(log_tail)
+        return quests
+
+    @staticmethod
+    def _find_latest_login_screenname(text: str) -> str | None:
+        owner = None
+        for m in re.finditer(
+            r'"authenticateResponse"\s*:\s*\{[^}]*?"screenName"\s*:\s*"([^"]+)"',
+            text or "",
+        ):
+            owner = m.group(1)
+        return owner
+
+    def _latch_account_screen_name_from(self, log_tail: str) -> None:
+        try:
+            owner = self._find_latest_login_screenname(log_tail)
+            # The login can scroll past the normal tail during long play. While we
+            # still have no identity (startup account), read a wider slice to find
+            # it -- throttled so a persistent miss can't wide-read on a tight loop.
+            # Once latched we never do the wide read again.
+            if owner is None and self._current_account_screen_name is None:
+                now = time.time()
+                if now - self._last_login_wide_scan_ts >= 10.0:
+                    self._last_login_wide_scan_ts = now
+                    owner = self._find_latest_login_screenname(
+                        self._read_log_tail(self._log_path, max_bytes=8_000_000)
+                    )
+            if owner and owner != self._current_account_screen_name:
+                self._current_account_screen_name = owner
+                self._register_current_account_for_gold()
+        except Exception:
+            pass
 
     def _parse_guild_quests(self, quests: list[dict]) -> list[dict]:
         parsed = []
@@ -2056,6 +2107,34 @@ class Controller(ControllerSecondary):
             pass
         return None
 
+    def _account_aliases_path(self) -> str:
+        return str(runtime_file("config", "account_aliases.json"))
+
+    def _load_persisted_aliases(self) -> None:
+        """Load screenName -> configured-alias mappings learned in earlier sessions.
+        Lets the STARTUP account (already logged in, no switch-in this session)
+        still resolve to its friendly alias in the gold panel."""
+        try:
+            path = self._account_aliases_path()
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if k and v and str(k) not in self._screenname_to_alias:
+                            self._screenname_to_alias[str(k)] = str(v)
+        except Exception:
+            pass
+
+    def _persist_aliases(self) -> None:
+        try:
+            path = self._account_aliases_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._screenname_to_alias, f, indent=2)
+        except Exception:
+            pass
+
     def _register_current_account_for_gold(self) -> None:
         """Ensure the current account has a (0-gold) row as soon as its screenName
         is known, map it to its configured alias when we can, and fold in any gold
@@ -2065,32 +2144,63 @@ class Controller(ControllerSecondary):
             alias = self._pending_switch_alias or self._match_configured_alias(key)
             if alias:
                 self._screenname_to_alias[key] = alias
+                # Remember it so this account resolves to its alias next session,
+                # even as the STARTUP account (no switch-in to teach it then).
+                self._persist_aliases()
         self._pending_switch_alias = None
         pending = self._gold_farmed_by_account.pop("(current account)", 0) if key != "(current account)" else 0
         self._gold_farmed_by_account[key] = self._gold_farmed_by_account.get(key, 0) + int(pending or 0)
         self._publish_gold_farmed()
 
-    def _credit_gold(self, amount: int, reason: str = "") -> None:
-        amount = int(amount or 0)
-        if amount <= 0:
+    def _read_latest_inventory_gold(self) -> int | None:
+        """The current account's real Gold balance from the latest InventoryInfo
+        log event ({"InventoryInfo":{...,"Gold":N,...}}), or None if none is
+        readable. Uses the same post-switch offset gate as the quests read so we
+        never pick up the PREVIOUS account's balance right after a switch."""
+        if not self._log_path:
+            return None
+        if self._current_account_screen_name is None and self._quests_valid_from_offset > 0:
+            log_tail = self._read_log_since(
+                self._log_path, start_offset=self._quests_valid_from_offset, max_bytes=2_000_000
+            )
+        else:
+            log_tail = self._read_log_tail(self._log_path)
+        if not log_tail:
+            return None
+        idx = log_tail.rfind('"InventoryInfo"')
+        if idx == -1:
+            return None
+        m = re.search(r'"Gold"\s*:\s*(\d+)', log_tail[idx:idx + 3000])
+        if not m:
+            return None
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+
+    def _update_gold_from_inventory(self) -> None:
+        """Refresh this account's farmed-gold total from its REAL balance delta:
+        farmed = current balance - the first balance seen for the account this
+        session. Covers wins and quests exactly; no per-win estimate. Skips until
+        the account's screenName is latched so the delta is attributed correctly."""
+        gold = self._read_latest_inventory_gold()
+        if gold is None:
             return
         key = self._current_account_key()
-        self._gold_farmed_by_account[key] = self._gold_farmed_by_account.get(key, 0) + amount
-        bot_logger.log_info(
-            "Gold farmed +{} ({}) for '{}': session total {}.".format(
-                amount, reason or "reward", key, self._gold_farmed_by_account[key]
+        if key == "(current account)":
+            return
+        if key not in self._account_initial_gold:
+            self._account_initial_gold[key] = gold
+            bot_logger.log_info(f"Gold baseline for '{key}': {gold} (session start balance).")
+        farmed = max(0, gold - self._account_initial_gold[key])
+        if self._gold_farmed_by_account.get(key) != farmed:
+            self._gold_farmed_by_account[key] = farmed
+            bot_logger.log_info(
+                "Gold farmed (real): '{}' balance={} baseline={} farmed={}.".format(
+                    key, gold, self._account_initial_gold[key], farmed
+                )
             )
-        )
-        self._publish_gold_farmed()
-
-    def _credit_completed_quest_gold(self, current_ids: set[str]) -> None:
-        """Credit the gold of any tracked quest that has dropped out of the list
-        (i.e. was completed) and hasn't been credited yet for this account."""
-        for quest_id, gold in self._account_quest_gold.items():
-            if quest_id in current_ids or quest_id in self._credited_quest_ids:
-                continue
-            self._credited_quest_ids.add(quest_id)
-            self._credit_gold(gold, reason=f"quest {quest_id} completed")
+            self._publish_gold_farmed()
 
     def refresh_quests_cache(self) -> list[dict]:
         """Parse the account's quests once and cache them for local reuse.
@@ -2116,16 +2226,10 @@ class Controller(ControllerSecondary):
             if not (v.get("goal") and v.get("progress", 0) >= v.get("goal", 0))
         )
 
-        current_ids = {str(v.get("id")) for v in view if v.get("id")}
-        # Record each quest's gold reward while it is still listed, so we still
-        # know its value once it completes (drops out), then credit "gold farmed"
-        # for any tracked quest that has since disappeared.
-        for v in view:
-            qid = str(v.get("id") or "")
-            if qid:
-                self._account_quest_gold[qid] = int(v.get("gold") or 0)
-        if self._account_quest_gold:
-            self._credit_completed_quest_gold(current_ids)
+        # This Home read has the account's real Gold balance in the adjacent
+        # InventoryInfo event; refresh the farmed-gold delta from it (covers wins
+        # and quests exactly, no estimate).
+        self._update_gold_from_inventory()
 
         # Active quest = the one whose colors we play. Mirror _select_best_quest:
         # the highest-gold guild (two-color) quest -- but skip quests already at
@@ -3062,16 +3166,24 @@ class Controller(ControllerSecondary):
             and not self._account_switch_in_progress
             and not self._stop_requested
         ):
-            self._home_quest_check_done = True
             try:
                 self._refresh_quests_from_home()
             except Exception as e:
                 bot_logger.log_error(f"Startup/home quest check error: {e}")
+            # Only retire the one-shot once we actually have a valid quest read (or
+            # we have exhausted the bounded retries). A single transient Home-nav
+            # failure otherwise leaves the switch decision permanently blind.
+            self._home_quest_check_attempts += 1
+            if (
+                self._last_valid_quest_active_incomplete is not None
+                or self._home_quest_check_attempts >= self._HOME_QUEST_CHECK_MAX_ATTEMPTS
+            ):
+                self._home_quest_check_done = True
             # Diagnostic: make the switch decision visible in the log on landing.
-            completed = self._main_quests_completed_this_session()
+            completed = self._main_quests_completed_absolute()
             bot_logger.log_info(
-                "SWITCH CHECK (account='{}'): enabled={} mode={} | quests completed(session)={} "
-                "(active_incomplete={}) need>={} | wins={} need>={} | due={}".format(
+                "SWITCH CHECK (account='{}'): enabled={} mode={} | quests completed(absolute)={} "
+                "(active_incomplete={}) need>={} | wins(session)={} need>={} | attempt={} | due={}".format(
                     self._current_account_key(),
                     self._account_switch_enabled,
                     self._account_switch_mode,
@@ -3080,6 +3192,7 @@ class Controller(ControllerSecondary):
                     self._account_switch_main_quests,
                     self._daily_wins_this_account,
                     self._account_switch_daily_wins,
+                    self._home_quest_check_attempts,
                     self._account_switch_due(),
                 )
             )
@@ -4857,9 +4970,11 @@ class Controller(ControllerSecondary):
             bot_logger.log_info(
                 f"Daily win counted: {self._daily_wins_this_account} win(s) this account."
             )
-            # Estimated gold from the daily-win reward track (the exact amount is
-            # not in the log). Configurable via gold_per_win; 0 disables it.
-            self._credit_gold(self._gold_per_win, reason="match won")
+        # Refresh farmed gold from the real balance after every match, so the
+        # outgoing account's value is current when a switch fires next. The reward
+        # lands in InventoryInfo on the next Home load; the current-minus-baseline
+        # delta self-corrects once it does, and the Home reads also refresh it.
+        self._update_gold_from_inventory()
         self._post_match_ready_ts = time.time()
         threading.Timer(self._post_match_delay_sec, self._maybe_post_match_action).start()
         if self._queue_ready:
@@ -5177,20 +5292,6 @@ class Controller(ControllerSecondary):
             return None
         return max(0, min(self._DAILY_QUEST_SLOTS, self._DAILY_QUEST_SLOTS - int(incomplete)))
 
-    def _main_quests_completed_this_session(self) -> int | None:
-        """How many daily quests this account has completed DURING THIS SESSION.
-
-        Uses the absolute count (quests done by anyone, bot or human) minus a
-        baseline captured at the first valid Home read this session, so quests
-        the human already finished before the bot started don't count toward
-        the switch threshold. Returns None until a valid Home read has happened."""
-        absolute = self._main_quests_completed_absolute()
-        if absolute is None:
-            return None
-        if self._account_start_quests_completed_absolute is None:
-            self._account_start_quests_completed_absolute = absolute
-        return max(0, absolute - self._account_start_quests_completed_absolute)
-
     def set_account_switch_enabled(self, enabled: bool) -> None:
         """Live master on/off from the main UI toggle."""
         self._account_switch_enabled = bool(enabled)
@@ -5212,32 +5313,58 @@ class Controller(ControllerSecondary):
         # Master switch off -> never switch, whatever the thresholds/accounts are.
         if not self._account_switch_enabled:
             return False
-        # Quest mode: switch once the configured number of main quests are
-        # completed AND the configured daily wins are reached. A 0 threshold means
-        # "no requirement" for that dimension; if both are 0 the mode is disabled.
+        # Quest mode: switch once BOTH criteria are met. Main quests are measured
+        # ABSOLUTELY (done by bot OR human). Daily wins are counted only for what
+        # the bot itself sees this session on this account -- wins finished
+        # manually before the bot started are intentionally NOT counted, so a
+        # fresh account always has to earn its configured wins under the bot. A 0
+        # threshold means "no requirement" for that dimension; both 0 disables it.
         if self._account_switch_mode == "quests":
             if self._account_switch_main_quests <= 0 and self._account_switch_daily_wins <= 0:
                 return False
-            # Anti-storm: if we've already cycled through every configured account
-            # without playing a single match, they all meet the criteria -> stop
-            # switching and just play, instead of an endless logout/login loop.
+            # Anti-storm fallback: the clean "stop at end of round" is driven by
+            # per-account completion tracking in _perform_account_switch
+            # (_completed_account_keys). This guard only matters if that tracking
+            # can't identify accounts (no screenName), so an unrelated inability to
+            # play can't become an endless logout/login loop -- it just plays on.
             if self._known_account_count and self._switches_without_match >= self._known_account_count:
                 return False
-            main_req = self._account_switch_main_quests
-            if main_req <= 0:
+            if self._account_switch_main_quests <= 0:
                 main_ok = True
             else:
-                completed = self._main_quests_completed_this_session()
+                completed = self._main_quests_completed_absolute()
                 if completed is None:
                     # Quest state not read from Home yet -> never switch on a guess.
                     return False
-                main_ok = completed >= main_req
+                main_ok = completed >= self._account_switch_main_quests
             wins_ok = self._daily_wins_this_account >= self._account_switch_daily_wins
             return main_ok and wins_ok
         # Time mode (default): switch every N minutes.
         if self._account_switch_interval <= 0:
             return False
         return (time.time() - self._last_account_switch_ts) >= self._account_switch_interval
+
+    def set_stop_bot_callback(self, method) -> None:
+        """Register a UI callback the controller can use to stop the bot."""
+        self.__stop_bot_callback = method
+
+    def _request_stop_bot(self, reason: str) -> None:
+        """Stop the bot from inside the controller (e.g. round complete)."""
+        bot_logger.log_info(f"Bot stop requested by controller: {reason}.")
+        self._stop_requested = True
+        self._stop_queue_spam = True
+        self._account_switch_pending = False
+        try:
+            runtime_status.clear_intentional_wait()
+            runtime_status.set_mode("stopped", bot_state=str(self._get_state_from_log()))
+        except Exception:
+            pass
+        cb = self.__stop_bot_callback
+        if cb:
+            try:
+                cb(reason)
+            except Exception as e:
+                bot_logger.log_error(f"Stop-bot callback failed: {e}")
 
     def get_account_switch_remaining_sec(self) -> int:
         """Seconds remaining until next account switch (0 if disabled or due)."""
@@ -5578,9 +5705,19 @@ class Controller(ControllerSecondary):
         if self._account_switch_in_progress:
             return
         self._account_switch_in_progress = True
+        # The outgoing account met its switch criteria, so mark it complete for
+        # this round BEFORE the resets below clear its identity. screenName is the
+        # stable per-account key; fall back to the alias we switched in with.
+        outgoing_key = self._current_account_screen_name or self._pending_switch_alias
+        if outgoing_key:
+            self._completed_account_keys.add(str(outgoing_key))
+        else:
+            bot_logger.log_info(
+                "Account switch: outgoing account has no screenName/alias yet; "
+                "round-completion tracking will skip it."
+            )
         # Reset quest-mode tracking so the incoming account is measured fresh:
-        # re-capture its session baseline and restart its daily-win count.
-        self._account_start_quests_completed_absolute = None
+        # restart its daily-win count.
         self._daily_wins_this_account = 0
         self._win_counted_this_match = False
         # Re-evaluate the incoming account's quest state fresh from its own Home:
@@ -5588,6 +5725,18 @@ class Controller(ControllerSecondary):
         # Home quest check. Count this switch for the anti-storm guard.
         self._last_valid_quest_active_incomplete = None
         self._home_quest_check_done = False
+        self._home_quest_check_attempts = 0
+        # Drop the outgoing account's cached quest view so nothing (UI, deck-color
+        # selection, refresh change-detection) reuses it before the incoming
+        # account's quests are read.
+        self._cached_quests = []
+        self._cached_active_quest_id = ""
+        self._cached_active_colors = ""
+        # Gate quest reads to the log written from here on, so the previous
+        # account's block (still in the tail) can't be latched as the new owner.
+        # Captured before logout: the incoming account's first block is written
+        # after login, i.e. strictly past this offset.
+        self._quests_valid_from_offset = self._get_log_size(self._log_path)
         self._starter_picker_shortcut_tried = False
         self._switches_without_match += 1
         # Reset post-match marker so the incoming account is treated as "no match
@@ -5624,6 +5773,23 @@ class Controller(ControllerSecondary):
             # guard trip instead of leaving _known_account_count at 0 forever
             # and disabling the anti-storm protection permanently.
             self._known_account_count = len(accounts)
+            # End of the round: if we have now completed every configured account
+            # this session, stop instead of logging into an account we have already
+            # finished. Quests mode only (time mode never "completes" a round).
+            if (
+                self._account_switch_mode == "quests"
+                and self._known_account_count
+                and len(self._completed_account_keys) >= self._known_account_count
+            ):
+                bot_logger.log_info(
+                    "Round complete: all {} configured account(s) finished this session "
+                    "({}); stopping the bot instead of switching.".format(
+                        self._known_account_count,
+                        sorted(self._completed_account_keys),
+                    )
+                )
+                self._request_stop_bot("all accounts completed this round")
+                return
             if not self.log_out_btn_coors or not self.log_out_ok_btn_coors:
                 bot_logger.log_error("Account switch failed: missing calibrated button(s).")
                 self._account_switch_pending = False
@@ -5801,68 +5967,53 @@ class Controller(ControllerSecondary):
         else:
             time.sleep(1.0)
 
-        log_out_target, log_out_source = self._resolve_target_from_queue_anchor_rebase(
-            config_key="log_out_btn",
-            raw_point=self.log_out_btn_coors,
-            label="LOG_OUT_BTN",
-            force_reacquire=True,
-        )
-        bot_logger.log_info(
-            "Account switch: clicking LOG_OUT_BTN at {} (source={}).".format(
-                log_out_target,
-                log_out_source,
-            )
-        )
-        self._click_abs(int(log_out_target[0]), int(log_out_target[1]), "LOG_OUT_BTN")
-        time.sleep(0.15)
-        self._click_abs(int(log_out_target[0]), int(log_out_target[1]), "LOG_OUT_BTN")
-        time.sleep(0.8)
+        # Click "Log Out" (a centered text link on the Options screen). Image match
+        # is PRIMARY: the hardcoded/legacy coords do not match the current Options
+        # layout (the link is centered, not bottom-right), and clicking the wrong
+        # spot first used to dismiss the menu before the image fallback ran. Only
+        # fall back to coords if the template can't be found.
+        logout_img = os.path.join(self._buttons_dir(), "log_out_btn.png")
         if self._click_image_in_scaled_arena_region(
-            os.path.join(self._buttons_dir(), "log_out_btn.png"),
-            "LOG_OUT_BTN_IMG",
-            rel_region=None,
-            confidence=0.84,
-            timeout=1.2,
-        ) or self._click_logout_image_if_visible(
-            "log_out_btn.png",
-            label="LOG_OUT_BTN_IMG_FALLBACK",
-            confidence=0.84,
-            timeout_sec=1.2,
-            region=self._region_around_point(log_out_target, width=520, height=260),
+            logout_img, "LOG_OUT_BTN_IMG", rel_region=None, confidence=0.80, timeout=2.5,
         ):
-            time.sleep(0.8)
+            bot_logger.log_info("Account switch: LOG_OUT_BTN clicked via image match.")
+        else:
+            log_out_target, log_out_source = self._resolve_target_from_queue_anchor_rebase(
+                config_key="log_out_btn",
+                raw_point=self.log_out_btn_coors,
+                label="LOG_OUT_BTN",
+                force_reacquire=True,
+            )
+            bot_logger.log_info(
+                "Account switch: LOG_OUT_BTN image match failed; clicking coords {} (source={}).".format(
+                    log_out_target, log_out_source,
+                )
+            )
+            self._click_abs(int(log_out_target[0]), int(log_out_target[1]), "LOG_OUT_BTN")
+            time.sleep(0.15)
+            self._click_abs(int(log_out_target[0]), int(log_out_target[1]), "LOG_OUT_BTN")
+        # Let the confirm dialog ("Would you like to log out of your account?")
+        # animate in.
+        time.sleep(1.0)
 
-        log_out_ok_target, log_out_ok_source = self._resolve_target_from_queue_anchor_rebase(
-            config_key="log_out_ok_btn",
-            raw_point=self.log_out_ok_btn_coors,
-            label="LOG_OUT_OK_BTN",
-            force_reacquire=True,
-        )
+        # Click its "OK" button. This is a DARK, centred modal button (NOT the
+        # orange okay_btn.png template, which false-matches the orange Play/Claim
+        # button in the dimmed background). The dialog is a fixed centred modal, so
+        # click its measured position (1116, 622 in the 1920x1080 game frame; OK is
+        # right, Cancel is left). The button is ~270px wide, so this is forgiving.
+        ok_base = (1116, 622)
+        ok_target, ok_source = self._map_abs_point_to_arena(ok_base, label="LOG_OUT_OK")
         bot_logger.log_info(
-            "Account switch: clicking LOG_OUT_OK_BTN at {} (source={}).".format(
-                log_out_ok_target,
-                log_out_ok_source,
+            "Account switch: clicking LOG_OUT_OK at {} (base={} source={}).".format(
+                ok_target, ok_base, ok_source,
             )
         )
-        self._click_abs(int(log_out_ok_target[0]), int(log_out_ok_target[1]), "LOG_OUT_OK_BTN")
-        time.sleep(0.15)
-        self._click_abs(int(log_out_ok_target[0]), int(log_out_ok_target[1]), "LOG_OUT_OK_BTN")
-        time.sleep(0.35)
-        self._click_abs(int(log_out_ok_target[0]), int(log_out_ok_target[1]), "LOG_OUT_OK_BTN")
+        # Use _click_abs (proper left_down/hold/left_up press, same as every other
+        # bot click) -- a bare move+left_click did not register on the modal.
+        self._click_abs(int(ok_target[0]), int(ok_target[1]), "LOG_OUT_OK")
+        time.sleep(0.4)
+        self._click_abs(int(ok_target[0]), int(ok_target[1]), "LOG_OUT_OK")
         time.sleep(0.5)
-        self._click_image_in_scaled_arena_region(
-            os.path.join(self._buttons_dir(), "okay_btn.png"),
-            "LOG_OUT_OK_IMG",
-            rel_region=None,
-            confidence=0.86,
-            timeout=0.9,
-        ) or self._click_logout_image_if_visible(
-            "okay_btn.png",
-            label="LOG_OUT_OK_IMG_FALLBACK",
-            confidence=0.86,
-            timeout_sec=0.9,
-            region=self._region_around_point(log_out_ok_target, width=420, height=220),
-        )
 
     def run_mapped_logout_sequence_for_test(self) -> bool:
         """Run only the built-in macOS-style logout sequence (no account/login steps)."""
