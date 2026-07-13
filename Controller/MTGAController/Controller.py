@@ -6064,7 +6064,7 @@ class Controller(ControllerSecondary):
                         # real captures: scry's Done button centres at (960, 878),
                         # surveil's ~47px lower at (960, 925). Pick by context so a
                         # template miss still lands on the right overlay's button.
-                        base_point = (960, 878) if "scry" in context.lower() else (960, 925)
+                        base_point = (960, 878) if "scry" in str(context or "").lower() else (960, 925)
                         target, src = self._map_abs_point_to_arena(base_point, label="SCRY_DONE")
                         bot_logger.log_info(
                             f"GROUP_REQ Done click (fallback fixed, context={context}): base={base_point} target={target} src={src}"
