@@ -3582,6 +3582,17 @@ class MTGBotUI(tk.Tk):
 
             controller.set_match_end_callback(_on_match_end)
 
+            # Let the controller stop the bot itself (e.g. once every configured
+            # account has finished its daily quests). Marshal onto the UI thread.
+            def _on_controller_stop(reason=None):
+                try:
+                    bot_logger.log_info(f"Controller requested bot stop ({reason}).")
+                except Exception:
+                    pass
+                self.after(0, self._stop_bot)
+
+            controller.set_stop_bot_callback(_on_controller_stop)
+
             # Keep running while bot is active
             while self.bot_running:
                 import time
