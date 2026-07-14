@@ -5889,6 +5889,9 @@ class Controller(ControllerSecondary):
                     )
                     self._write_nav_debug_bundle("logout_failed_home_visible")
                     self._account_switch_pending = False
+                    # Stayed on the current account -> don't attribute its next
+                    # quests block to the account we were switching TO.
+                    self._pending_switch_alias = None
                     self._last_account_switch_ts = time.time()
                     self._account_switch_in_progress = False
                     runtime_status.clear_intentional_wait()
@@ -5908,9 +5911,23 @@ class Controller(ControllerSecondary):
                 )
                 self._write_nav_debug_bundle("logout_failed_no_login_screen")
                 self._account_switch_pending = False
+                # Clear the outgoing-switch alias: we stayed on the CURRENT account,
+                # so the next quests block must NOT be attributed to the account we
+                # were switching TO (that would corrupt completed-account tracking
+                # and per-account gold totals).
+                self._pending_switch_alias = None
                 self._last_account_switch_ts = time.time()
                 self._account_switch_in_progress = False
                 runtime_status.clear_intentional_wait()
+                # We could not confirm Home and the logout half-ran, so a modal
+                # (Options / logout-confirm) may still be up. Best-effort return to
+                # a clean Home before resuming so the queue loop doesn't act on top
+                # of an overlay. _navigate_to_home clicks the fixed Home-tab point
+                # and verifies; it is safe/no-op on any main screen.
+                try:
+                    self._navigate_to_home()
+                except Exception as exc:
+                    bot_logger.log_error(f"Post-failed-logout home nav error (continuing): {exc}")
                 self._set_runtime_home_mode("home_ready")
                 self.start_queueing()
                 queued_after_login = True
