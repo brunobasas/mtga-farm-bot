@@ -5878,9 +5878,24 @@ class Controller(ControllerSecondary):
                     self.start_queueing()
                     queued_after_login = True
                     return
-                bot_logger.log_error("Account switch failed: logout did not reach the login screen.")
+                # Logout failed and we could not positively confirm Home either.
+                # Do NOT idle: the logout almost certainly left us still signed in
+                # on the current account, so resume queueing there instead of
+                # leaving the bot dead. The anti-storm guard (_switches_without_match
+                # >= _known_account_count) bounds repeated failed attempts, after
+                # which _account_switch_due() returns False and we just keep playing.
+                bot_logger.log_error(
+                    "Account switch failed: logout did not reach the login screen; "
+                    "resuming queue on the current account instead of idling."
+                )
                 self._write_nav_debug_bundle("logout_failed_no_login_screen")
                 self._account_switch_pending = False
+                self._last_account_switch_ts = time.time()
+                self._account_switch_in_progress = False
+                runtime_status.clear_intentional_wait()
+                self._set_runtime_home_mode("home_ready")
+                self.start_queueing()
+                queued_after_login = True
                 return
             if self._stop_requested:
                 bot_logger.log_info("Account switch aborted after logout: stop requested.")
@@ -5955,6 +5970,13 @@ class Controller(ControllerSecondary):
 
     def _run_mapped_logout_sequence(self) -> None:
         bot_logger.log_info("Account switch: using built-in macOS-style logout sequence.")
+        # ESC is a keyboard event -> it only reaches MTGA if MTGA has focus. When a
+        # switch is due right at startup (before any in-game click has focused the
+        # window), the launcher UI/terminal still holds focus, so the ESC is lost
+        # and the Options menu never opens -> logout fails on Home. Focus MTGA first.
+        if focus_mtga_window():
+            bot_logger.log_info("Account switch: focused MTGA window before logout ESC.")
+            time.sleep(0.3)
         bot_logger.log_info("Account switch: pressing ESC to open options menu.")
         self.input.tap_escape()
         time.sleep(1.0)
