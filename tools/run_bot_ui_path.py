@@ -34,15 +34,24 @@ def main() -> int:
     screen_bounds = config_manager.get_screen_bounds()
     input_backend = config_manager.get_input_backend()
     account_switch_minutes = config_manager.get_account_switch_minutes()
+    account_switch_mode = config_manager.get_account_switch_mode()
+    account_switch_main_quests = config_manager.get_account_switch_main_quests()
+    account_switch_daily_wins = config_manager.get_account_switch_daily_wins()
     account_cycle_index = config_manager.get_account_cycle_index()
     account_play_order = config_manager.get_account_play_order()
+    game_mode = config_manager.get_game_mode()
+    gold_per_win = config_manager.get_gold_per_win()
+    account_switch_enabled = config_manager.get_account_switch_enabled()
 
     bot_logger.log_info(
-        "UI-path runner: init controller log_path={} screen_bounds={} input_backend={} account_switch_minutes={}".format(
+        "UI-path runner: init controller log_path={} screen_bounds={} input_backend={} "
+        "account_switch_minutes={} account_switch_mode={} game_mode={}".format(
             log_path,
             screen_bounds,
             input_backend,
             account_switch_minutes,
+            account_switch_mode,
+            game_mode,
         )
     )
 
@@ -52,8 +61,14 @@ def main() -> int:
         click_targets=click_targets,
         input_backend=input_backend,
         account_switch_minutes=account_switch_minutes,
+        account_switch_mode=account_switch_mode,
+        account_switch_main_quests=account_switch_main_quests,
+        account_switch_daily_wins=account_switch_daily_wins,
         account_cycle_index=account_cycle_index,
         account_play_order=account_play_order,
+        game_mode=game_mode,
+        gold_per_win=gold_per_win,
+        account_switch_enabled=account_switch_enabled,
     )
     ai = DummyAI()
     game = Game(controller, ai)
