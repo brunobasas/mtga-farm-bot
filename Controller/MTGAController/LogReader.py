@@ -80,7 +80,13 @@ class LogReader:
     def __monitor_log_file(self):
         # debug: print(self.__log_path)
         try:
-            with open(self.__log_path, "r") as log_file:
+            # Player.log is UTF-8 and contains non-Latin card/player names (e.g.
+            # Japanese opponents). Without encoding="utf-8", Windows opens it as
+            # cp1252 and a single undecodable byte raises UnicodeDecodeError,
+            # killing the monitor thread and blinding the bot for the rest of the
+            # session. errors="replace" keeps reading past any stray byte; the
+            # patterns we match are ASCII JSON keys, so replacements are harmless.
+            with open(self.__log_path, "r", encoding="utf-8", errors="replace") as log_file:
                 log_lines = self.__follow(log_file)
                 for line in log_lines:
                     if self.__stop_monitor:
@@ -143,7 +149,7 @@ class LogReader:
     def full_log_read(self):
         """ Full read of the log so far """
         if not self.is_monitoring():
-            log_file = open(self.__log_path, "r")
+            log_file = open(self.__log_path, "r", encoding="utf-8", errors="replace")
             line = log_file.readline()
             while line:
                 for pattern in self.__lines_containing_pattern:
