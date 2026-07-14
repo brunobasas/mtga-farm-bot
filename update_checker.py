@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -128,6 +129,10 @@ def check_for_updates() -> UpdateCheckResult:
     """
     if is_git_checkout():
         return check_for_update()
+    if getattr(sys, "frozen", False):
+        # A frozen build can't be updated by overlaying .py files next to the
+        # exe; it needs its own installer. Skip rather than nag every startup.
+        return UpdateCheckResult(update_available=False, kind="release", error="frozen build not updatable via archive")
     return check_for_release_update()
 
 
@@ -156,6 +161,16 @@ def _is_newer(candidate: str, current: str) -> bool:
 
 
 def _local_version() -> str:
+    # Prefer the version the running process actually loaded (also works in a
+    # frozen build where version.py isn't a loose file on disk).
+    try:
+        import version  # noqa: PLC0415
+
+        loaded = getattr(version, "__version__", "")
+        if loaded:
+            return str(loaded).strip()
+    except Exception:
+        pass
     version_path = get_app_root() / "version.py"
     try:
         return _parse_version(version_path.read_text(encoding="utf-8"))
@@ -176,6 +191,10 @@ def check_for_release_update() -> UpdateCheckResult:
     safe to call from a background thread at startup.
     """
     current = _local_version()
+    if not current:
+        # Can't determine what we're running — don't offer a blind "update"
+        # (an empty version would compare as older than everything).
+        return UpdateCheckResult(update_available=False, kind="release", error="could not determine local version")
     try:
         remote_text = _http_get(_RAW_VERSION_URL).decode("utf-8", errors="replace")
     except (urllib.error.URLError, OSError, ValueError) as exc:
@@ -271,6 +290,23 @@ def _archive_top_dir(extract_root: Path) -> Path | None:
     return entries[0] if len(entries) == 1 else None
 
 
+def _atomic_overlay(src: Path, dest: Path) -> None:
+    """Copies src onto dest atomically so a crash can't leave a half-written file.
+
+    Writes to a temp sibling first, then os.replace()s it into place (atomic on
+    the same volume). Clears a read-only bit on an existing dest so the replace
+    can't fail on files copy2 previously marked read-only.
+    """
+    tmp = dest.with_name(dest.name + ".new-update")
+    shutil.copy2(src, tmp)
+    try:
+        os.replace(tmp, dest)
+    except PermissionError:
+        if dest.exists():
+            os.chmod(dest, stat.S_IWRITE)
+        os.replace(tmp, dest)
+
+
 def apply_zip_update(download_url: str = _ARCHIVE_URL) -> UpdateResult:
     """Downloads the `main` branch archive and overlays it onto the install.
 
@@ -299,7 +335,11 @@ def apply_zip_update(download_url: str = _ARCHIVE_URL) -> UpdateResult:
             except (zipfile.BadZipFile, OSError) as exc:
                 return UpdateResult(success=False, message=f"Downloaded archive is invalid: {exc}")
 
-            source_root = _archive_top_dir(extract_root) or extract_root
+            source_root = _archive_top_dir(extract_root)
+            if source_root is None:
+                # Not the expected single-top-folder layout: bail out instead of
+                # silently copying the wrapper folder and reporting success.
+                return UpdateResult(success=False, message="Unexpected archive layout; update aborted.")
 
             # Overlay every file from the archive onto the install directory.
             for src in source_root.rglob("*"):
@@ -311,7 +351,7 @@ def apply_zip_update(download_url: str = _ARCHIVE_URL) -> UpdateResult:
                     dest.mkdir(parents=True, exist_ok=True)
                 else:
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dest)
+                    _atomic_overlay(src, dest)
 
         req_after = str(req_path.read_text(encoding="utf-8")) if req_path.exists() else None
         requirements_changed = req_before != req_after
