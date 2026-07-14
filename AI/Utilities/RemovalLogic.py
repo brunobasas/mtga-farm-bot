@@ -102,6 +102,12 @@ def get_removal_profile(grp_id: int | None) -> dict | None:
 SELF_BUFF_GRPIDS: set[int] = {80230, 90433, 92991, 93887}
 
 _RE_SELF_BUFF = re.compile(r"target creature gets \+\d+/", re.I)
+# Beneficial Auras (e.g. Angelic Destiny, Ethereal Armor) read "Enchant creature"
+# + "Enchanted creature gets +N/+M". They must land on OUR creature, not an
+# enemy's -- otherwise MTGA raises an "Are You Sure?" confirm that the bot cannot
+# answer and the match stalls. Detrimental auras (Pacifism "-X/-X", "can't attack")
+# are excluded by the removal-profile guard in _is_self_buff_lookup below.
+_RE_BUFF_AURA = re.compile(r"enchanted creature gets \+\d+/\+?\d+", re.I)
 
 
 _self_buff_memo: dict[int, bool] = {}
@@ -120,7 +126,7 @@ def _is_self_buff_lookup(grp_id: int) -> bool:
     if text and get_removal_profile(grp_id):
         result = False
     else:
-        result = bool(_RE_SELF_BUFF.search(text))
+        result = bool(_RE_SELF_BUFF.search(text) or _RE_BUFF_AURA.search(text))
     if text:
         # Same rationale as _removal_profile_lookup: only memoize once real
         # oracle text was available, so a transient fetch failure doesn't
