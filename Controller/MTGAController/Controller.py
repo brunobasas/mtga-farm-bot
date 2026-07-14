@@ -474,7 +474,11 @@ class Controller(ControllerSecondary):
         # event page where the bot re-queues, so quest data/UI would otherwise
         # freeze at startup values. Periodically dip back to Home to refresh.
         self._matches_since_quest_refresh = 0
-        self._quest_refresh_every_n_matches = 3
+        # Refresh quest progress after EVERY match so the active-quest colours (and
+        # thus the chosen starter deck) follow quest completions immediately. A
+        # higher value would keep replaying a completed quest's deck for that many
+        # more matches before noticing.
+        self._quest_refresh_every_n_matches = 1
         self._match_end_dismissed = False
         self._unknown_screen_strikes = 0
         self._post_match_ready_ts = None
@@ -2316,6 +2320,15 @@ class Controller(ControllerSecondary):
         if self._get_state_from_log() == BotState.IN_GAME:
             return False
         bot_logger.log_info("Quest refresh: dipping to Home to re-fetch quest progress.")
+        prev_active = self._cached_active_quest_id
+        prev_progress = {q.get("id"): q.get("progress") for q in self._cached_quests}
+        # Click the Home tab (best effort). The vision-anchor verification inside
+        # _navigate_to_home is flaky on the event / new-UI screens and used to hard-
+        # abort the whole refresh ("Home tab not found"), freezing quest data -- so
+        # the bot kept replaying a completed quest's deck for the rest of a session.
+        # The REAL success signal is MTGA logging a fresh quests block on Home load,
+        # which we read from Player.log. So click Home, then poll the log for updated
+        # quest data regardless of whether the template happened to verify.
         reached = False
         for _ in range(3):
             if self._stop_requested:
@@ -2324,25 +2337,30 @@ class Controller(ControllerSecondary):
                 reached = True
                 break
             time.sleep(0.8)
-        if not reached:
-            bot_logger.log_info("Quest refresh: Home tab not found; will retry after more matches.")
-            return False
         # Give MTGA a moment to land on Home and log a fresh quests block, polling
         # the parser until it picks the new data up (or a short timeout elapses).
-        prev_active = self._cached_active_quest_id
-        prev_progress = {q.get("id"): q.get("progress") for q in self._cached_quests}
         deadline = time.time() + 8.0
+        updated = False
         while time.time() < deadline and not self._stop_requested:
             time.sleep(1.0)
             self.refresh_quests_cache()
             new_progress = {q.get("id"): q.get("progress") for q in self._cached_quests}
             if new_progress != prev_progress or self._cached_active_quest_id != prev_active:
+                updated = True
                 break
+        if not reached and not updated:
+            # Neither the Home anchor verified nor did any fresh quest data arrive:
+            # the click most likely did not navigate Home. Retry after more matches.
+            bot_logger.log_info(
+                "Quest refresh: Home not confirmed and no fresh quest data; will retry after more matches."
+            )
+            return False
         bot_logger.log_info(
-            "Quest refresh: done (active {} -> {}, colors {}).".format(
+            "Quest refresh: done (active {} -> {}, colors {}){}.".format(
                 prev_active or "-",
                 self._cached_active_quest_id or "-",
                 self._cached_active_colors or "-",
+                "" if reached else " [via log; Home anchor unverified]",
             )
         )
         return True
