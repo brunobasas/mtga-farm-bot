@@ -2052,25 +2052,32 @@ class MTGBotUI(tk.Tk):
 
     def _check_for_update_worker(self) -> None:
         try:
-            result = update_checker.check_for_update()
+            result = update_checker.check_for_updates()
         except Exception:
             return
         if result.update_available:
             self.after(0, lambda: self._on_update_available(result))
 
     def _on_update_available(self, result: "update_checker.UpdateCheckResult") -> None:
+        if result.kind == "release" and result.latest_version:
+            detail = (
+                f"A new version of Burning Lotus is available "
+                f"(v{result.current_version or '?'} → v{result.latest_version})."
+            )
+        else:
+            detail = "A new version of Burning Lotus is available."
         want_update = messagebox.askyesno(
             "Update Available",
-            "A new version of Burning Lotus is available.\n\nDo you want to update now?",
+            f"{detail}\n\nDo you want to update now?",
             parent=self,
         )
         if not want_update:
             return
-        threading.Thread(target=self._apply_update_worker, args=(result.branch,), daemon=True).start()
+        threading.Thread(target=self._apply_update_worker, args=(result,), daemon=True).start()
 
-    def _apply_update_worker(self, branch: str) -> None:
+    def _apply_update_worker(self, result: "update_checker.UpdateCheckResult") -> None:
         try:
-            update_result = update_checker.apply_update(branch)
+            update_result = update_checker.apply_update_result(result)
         except Exception as exc:
             update_result = update_checker.UpdateResult(success=False, message=str(exc))
         self.after(0, lambda: self._on_update_applied(update_result))

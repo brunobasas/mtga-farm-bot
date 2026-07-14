@@ -1,13 +1,39 @@
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import urllib.error
+import urllib.request
+import zipfile
 from dataclasses import dataclass
+from pathlib import Path
 
-from runtime_paths import get_repo_root
+from runtime_paths import get_app_root, get_repo_root
 
 _GIT_TIMEOUT_SECONDS = 6
+
+# --- Release channel (used when the install is NOT a git checkout) ----------
+# Non-git installs (e.g. users who downloaded a ZIP from GitHub/a website)
+# cannot `git pull`, so they follow `main` via the raw version.py + branch ZIP.
+_GITHUB_OWNER = "Barrylim366"
+_GITHUB_REPO = "mtga-farm-bot"
+_GITHUB_BRANCH = "main"
+_RAW_VERSION_URL = (
+    f"https://raw.githubusercontent.com/{_GITHUB_OWNER}/{_GITHUB_REPO}/{_GITHUB_BRANCH}/version.py"
+)
+_ARCHIVE_URL = (
+    f"https://codeload.github.com/{_GITHUB_OWNER}/{_GITHUB_REPO}/zip/refs/heads/{_GITHUB_BRANCH}"
+)
+_HTTP_TIMEOUT_SECONDS = 15
+_VERSION_RE = re.compile(r"""__version__\s*=\s*['"]([^'"]+)['"]""")
+
+# Belt-and-suspenders: GitHub's archive already omits git-ignored user data,
+# but never let a stray archive entry clobber these local files/dirs.
+_OVERLAY_SKIP = {".git", ".venv", "runtime", "Accounts", "credentials.txt", ".claude"}
 
 
 def _run_git(args: list[str], timeout: int = _GIT_TIMEOUT_SECONDS) -> subprocess.CompletedProcess:
@@ -25,9 +51,15 @@ def _run_git(args: list[str], timeout: int = _GIT_TIMEOUT_SECONDS) -> subprocess
 @dataclass
 class UpdateCheckResult:
     update_available: bool
+    # "git" for git checkouts (git pull), "release" for ZIP installs (branch archive).
+    kind: str = "git"
     branch: str = ""
     local_sha: str = ""
     remote_sha: str = ""
+    # Populated for the "release" (non-git) path.
+    current_version: str = ""
+    latest_version: str = ""
+    download_url: str = ""
     error: str = ""
 
 
@@ -87,6 +119,87 @@ def check_for_update() -> UpdateCheckResult:
         return UpdateCheckResult(update_available=False, error=str(exc))
 
 
+def check_for_updates() -> UpdateCheckResult:
+    """Single entry point for the UI.
+
+    Picks the right update channel automatically: git checkouts pull from
+    their tracked branch; everything else (ZIP downloads) follows `main` via
+    the raw version.py + branch archive.
+    """
+    if is_git_checkout():
+        return check_for_update()
+    return check_for_release_update()
+
+
+# --- Version helpers --------------------------------------------------------
+
+
+def _parse_version(text: str) -> str:
+    match = _VERSION_RE.search(text or "")
+    return match.group(1).strip() if match else ""
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for chunk in (version or "").split("."):
+        digits = re.match(r"\d+", chunk.strip())
+        parts.append(int(digits.group(0)) if digits else 0)
+    return tuple(parts) or (0,)
+
+
+def _is_newer(candidate: str, current: str) -> bool:
+    a, b = _version_tuple(candidate), _version_tuple(current)
+    length = max(len(a), len(b))
+    a += (0,) * (length - len(a))
+    b += (0,) * (length - len(b))
+    return a > b
+
+
+def _local_version() -> str:
+    version_path = get_app_root() / "version.py"
+    try:
+        return _parse_version(version_path.read_text(encoding="utf-8"))
+    except OSError:
+        return ""
+
+
+def _http_get(url: str, timeout: int = _HTTP_TIMEOUT_SECONDS) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": "burning-lotus-updater"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 (trusted GitHub host)
+        return response.read()
+
+
+def check_for_release_update() -> UpdateCheckResult:
+    """Compares the local version.py against the one on `main` at GitHub.
+
+    Network-only and read-only: it never touches the working tree, so it is
+    safe to call from a background thread at startup.
+    """
+    current = _local_version()
+    try:
+        remote_text = _http_get(_RAW_VERSION_URL).decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return UpdateCheckResult(update_available=False, kind="release", current_version=current, error=str(exc))
+
+    latest = _parse_version(remote_text)
+    if not latest:
+        return UpdateCheckResult(
+            update_available=False,
+            kind="release",
+            current_version=current,
+            error="could not read remote version",
+        )
+
+    return UpdateCheckResult(
+        update_available=_is_newer(latest, current),
+        kind="release",
+        branch=_GITHUB_BRANCH,
+        current_version=current,
+        latest_version=latest,
+        download_url=_ARCHIVE_URL,
+    )
+
+
 @dataclass
 class UpdateResult:
     success: bool
@@ -140,6 +253,89 @@ def apply_update(branch: str) -> UpdateResult:
         return UpdateResult(success=True, message="Update installed successfully.", requirements_changed=requirements_changed)
     except (subprocess.TimeoutExpired, OSError) as exc:
         return UpdateResult(success=False, message=str(exc))
+
+
+def _pip_install_requirements(req_path: Path, cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-r", str(req_path)],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+
+def _archive_top_dir(extract_root: Path) -> Path | None:
+    """GitHub branch archives wrap everything in a single top-level folder."""
+    entries = [p for p in extract_root.iterdir() if p.is_dir()]
+    return entries[0] if len(entries) == 1 else None
+
+
+def apply_zip_update(download_url: str = _ARCHIVE_URL) -> UpdateResult:
+    """Downloads the `main` branch archive and overlays it onto the install.
+
+    Used by non-git (ZIP) installs. The archive only contains tracked files,
+    so overlaying it never touches user data (runtime/, Accounts/, .venv,
+    credentials.txt, ...). Files removed upstream are left in place.
+    """
+    app_root = get_app_root()
+    req_path = app_root / "requirements.txt"
+
+    try:
+        req_before = str(req_path.read_text(encoding="utf-8")) if req_path.exists() else None
+
+        with tempfile.TemporaryDirectory(prefix="burning-lotus-update-") as tmp:
+            tmp_path = Path(tmp)
+            zip_path = tmp_path / "update.zip"
+            try:
+                zip_path.write_bytes(_http_get(download_url, timeout=120))
+            except (urllib.error.URLError, OSError) as exc:
+                return UpdateResult(success=False, message=f"Download failed: {exc}")
+
+            extract_root = tmp_path / "extracted"
+            try:
+                with zipfile.ZipFile(zip_path) as zf:
+                    zf.extractall(extract_root)
+            except (zipfile.BadZipFile, OSError) as exc:
+                return UpdateResult(success=False, message=f"Downloaded archive is invalid: {exc}")
+
+            source_root = _archive_top_dir(extract_root) or extract_root
+
+            # Overlay every file from the archive onto the install directory.
+            for src in source_root.rglob("*"):
+                rel = src.relative_to(source_root)
+                if rel.parts and rel.parts[0] in _OVERLAY_SKIP:
+                    continue
+                dest = app_root / rel
+                if src.is_dir():
+                    dest.mkdir(parents=True, exist_ok=True)
+                else:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest)
+
+        req_after = str(req_path.read_text(encoding="utf-8")) if req_path.exists() else None
+        requirements_changed = req_before != req_after
+
+        if requirements_changed and req_path.exists():
+            pip_proc = _pip_install_requirements(req_path, app_root)
+            if pip_proc.returncode != 0:
+                return UpdateResult(
+                    success=False,
+                    message="Update installed, but installing new dependencies failed:\n"
+                    + (pip_proc.stderr.strip() or pip_proc.stdout.strip()),
+                    requirements_changed=True,
+                )
+
+        return UpdateResult(success=True, message="Update installed successfully.", requirements_changed=requirements_changed)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return UpdateResult(success=False, message=str(exc))
+
+
+def apply_update_result(result: UpdateCheckResult) -> UpdateResult:
+    """Applies an update using the channel recorded in the check result."""
+    if result.kind == "release":
+        return apply_zip_update(result.download_url or _ARCHIVE_URL)
+    return apply_update(result.branch)
 
 
 def restart_application() -> None:

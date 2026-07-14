@@ -88,7 +88,12 @@ python -m venv .venv
 
 ### Updates
 
-If the bot was started from a `git clone` of this repository, it checks GitHub for a newer commit on startup. When one is found, a dialog offers to pull and install it, then restarts the bot automatically. The check works purely off git commit history (not the version number below), only fetches when the remote is actually ahead of local, and is silently skipped if the folder isn't a git checkout (e.g. a plain ZIP download) or if there's no network access. If you have local, uncommitted changes in the bot folder, the update is aborted rather than overwriting them, and the dialog lists which file(s) are affected.
+The bot checks GitHub for a newer version on startup and, when one is found, a dialog offers to install it and restarts the bot automatically. There are two channels, picked automatically:
+
+- **Git installs** (started from a `git clone` of this repository): the check works off git commit history (not the version number below), only fetches when the remote is actually ahead of local, and installs via a fast-forward `git pull`. If you have local, uncommitted changes in the bot folder, the update is aborted rather than overwriting them, and the dialog lists which file(s) are affected.
+- **ZIP / website installs** (no `.git` folder): the bot compares its local `version.py` against the one on the `main` branch at GitHub. If `main` has a newer version, it downloads the branch archive and overlays it onto the install folder. The archive only contains tracked source files, so user data (`runtime/`, `Accounts/`, `.venv/`, `credentials.txt`, …) is never touched.
+
+Either check is silently skipped when there's no network access. Dependencies from `requirements.txt` are reinstalled automatically if they changed as part of the update.
 
 The app's current version (`version.py`) is shown in **Settings**, above the Manage Accounts button.
 
