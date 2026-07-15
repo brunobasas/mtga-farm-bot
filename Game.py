@@ -73,15 +73,18 @@ class Game:
 
     def on_match_end(self, won: bool | None = None):
         """Called when a match ends - wait 20 seconds then start a new game"""
-        if self._stop_requested:
-            self._debug("Match ended but stop requested - not restarting")
-            return
-        runtime_status.set_mode("match_end")
+        # Finalize the debug recording first, independently of the restart
+        # logic below -- otherwise stopping the bot at match end (a common case)
+        # would skip the match.json footer and leave the last match unfinalized.
         try:
             result = None if won is None else ("win" if won else "loss")
             debug_recorder.end_match(result)
         except Exception as e:
             self._debug(f"Decision recorder end_match failed: {e}")
+        if self._stop_requested:
+            self._debug("Match ended but stop requested - not restarting")
+            return
+        runtime_status.set_mode("match_end")
         self._debug("Match ended - scheduling restart in 10 seconds")
         # Stop inactivity timer since match ended
         if hasattr(self.controller, 'stop_inactivity_timer'):
@@ -130,6 +133,13 @@ class Game:
         self._stop_requested = True
         self.game_started = False
         runtime_status.set_mode("stopped")
+
+        # Finalize any in-progress debug recording so a mid-match stop still
+        # writes the match.json footer (no-op if already finalized).
+        try:
+            debug_recorder.end_match(None)
+        except Exception:
+            pass
 
         for timer in list(self._timers):
             try:
