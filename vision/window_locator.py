@@ -852,7 +852,7 @@ class ArenaRegionProvider:
         try:
             self._vision.begin_tick()
             full = self._vision.capture(None)
-            self._vision.save_image(full, str(debug_dir / "full_screen.png"))
+            self._vision.save_image(full, str(debug_dir / "full_screen.jpg"))
             if result.region is not None:
                 arena = self._vision.capture(result.region)
                 self._vision.save_image(arena, str(debug_dir / "arena_region.png"))

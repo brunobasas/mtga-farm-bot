@@ -894,8 +894,15 @@ class Controller(ControllerSecondary):
                 f"Arena region unavailable during {context}; cached arena_region={cached} age={age:.1f}s not reused."
             )
 
-    def _click_abs(self, x: int, y: int, tag: str) -> None:
-        bot_logger.log_click(int(x), int(y), tag)
+    def _region_age(self) -> float:
+        """Seconds since the arena window was last successfully located."""
+        return max(0.0, time.time() - float(self._last_good_arena_region_ts or 0.0))
+
+    def _click_abs(self, x: int, y: int, tag: str, *, source: str | None = None) -> None:
+        bot_logger.log_click(
+            int(x), int(y), tag,
+            source=source, region_age=self._region_age(), arena=self._arena_region,
+        )
         runtime_status.touch_input(tag, (int(x), int(y)))
         self.input.move_abs(int(x), int(y))
         time.sleep(0.1)
@@ -1006,7 +1013,7 @@ class Controller(ControllerSecondary):
                 arena_img = self._vision.capture(self._arena_region)
                 self._vision.save_image(arena_img, str(debug_dir / "arena_region.png"))
             full = self._vision.capture(None)
-            self._vision.save_image(full, str(debug_dir / "full_screen.png"))
+            self._vision.save_image(full, str(debug_dir / "full_screen.jpg"))
         except Exception:
             pass
         bot_logger.log_error(f"Navigation debug bundle saved: {debug_dir}")
@@ -1044,7 +1051,7 @@ class Controller(ControllerSecondary):
         try:
             self._vision.begin_tick()
             full = self._vision.capture(None)
-            self._vision.save_image(full, str(debug_dir / "full_screen_after_click.png"))
+            self._vision.save_image(full, str(debug_dir / "full_screen_after_click.jpg"))
             if self._arena_region:
                 arena_img = self._vision.capture(self._arena_region)
                 self._vision.save_image(arena_img, str(debug_dir / "arena_region_after_click.png"))
@@ -1167,7 +1174,7 @@ class Controller(ControllerSecondary):
         try:
             self._vision.begin_tick()
             full = self._vision.capture(None)
-            self._vision.save_image(full, str(debug_dir / "full_screen_after_click.png"))
+            self._vision.save_image(full, str(debug_dir / "full_screen_after_click.jpg"))
             if self._arena_region:
                 arena_img = self._vision.capture(self._arena_region)
                 self._vision.save_image(arena_img, str(debug_dir / "arena_region_after_click.png"))
@@ -1231,7 +1238,7 @@ class Controller(ControllerSecondary):
         try:
             self._vision.begin_tick()
             full = self._vision.capture(None)
-            self._vision.save_image(full, str(debug_dir / "full_screen.png"))
+            self._vision.save_image(full, str(debug_dir / "full_screen.jpg"))
             if self._arena_region:
                 arena_img = self._vision.capture(self._arena_region)
                 self._vision.save_image(arena_img, str(debug_dir / "arena_region.png"))
@@ -1281,7 +1288,7 @@ class Controller(ControllerSecondary):
         try:
             self._vision.begin_tick()
             full = self._vision.capture(None)
-            self._vision.save_image(full, str(debug_dir / "full_screen.png"))
+            self._vision.save_image(full, str(debug_dir / "full_screen.jpg"))
             if self._arena_region:
                 arena_img = self._vision.capture(self._arena_region)
                 self._vision.save_image(arena_img, str(debug_dir / "arena_region.png"))
@@ -4331,7 +4338,10 @@ class Controller(ControllerSecondary):
                     f"SUBMIT_SELECTION aborted: arena_region unavailable, refusing absolute desktop click. reason={reason}"
                 )
                 return False
-            bot_logger.log_click(target[0], target[1], "SUBMIT_SELECTION")
+            bot_logger.log_click(
+                target[0], target[1], "SUBMIT_SELECTION",
+                source=source, region_age=self._region_age(), arena=self._arena_region,
+            )
             self.input.move_abs(target[0], target[1])
             time.sleep(0.1)
             self.input.left_click(1)
@@ -4357,6 +4367,16 @@ class Controller(ControllerSecondary):
             force_reacquire=True,
             apply_correction=False,
         )
+        # Never blind-click the raw desktop coordinate when the arena window
+        # could not be located -- that lands somewhere unrelated (mirrors the
+        # SUBMIT_SELECTION / ATTACK_ALL / NO_BLOCKS guards). Better to wait for a
+        # later prompt than to misclick.
+        if source == "absolute_no_arena":
+            bot_logger.log_error(
+                "RESOLVE aborted: arena_region unavailable, refusing absolute desktop click."
+            )
+            return
+
         positions = [base_target]
         if turn_info.get('step') == 'Step_DeclareAttack' and turn_info.get('activePlayer') != my_seat:
             fallback_y = base_target[1] - 50
@@ -4370,8 +4390,12 @@ class Controller(ControllerSecondary):
             f"RESOLVE target: source={source} arena={self._arena_region} raw={self.main_br_button_coordinates} positions={positions}"
         )
 
+        region_age = self._region_age()
         for pos in positions:
-            bot_logger.log_click(pos[0], pos[1], "RESOLVE")
+            bot_logger.log_click(
+                pos[0], pos[1], "RESOLVE",
+                source=source, region_age=region_age, arena=self._arena_region,
+            )
             runtime_status.touch_input("RESOLVE", pos)
             self.input.move_abs(pos[0], pos[1])
             self.input.left_click(1)
@@ -4701,7 +4725,7 @@ class Controller(ControllerSecondary):
 
             if self._vision is not None:
                 full = self._vision.capture(None)
-                self._vision.save_image(full, str(debug_dir / "full_screen.png"))
+                self._vision.save_image(full, str(debug_dir / "full_screen.jpg"))
                 if self._arena_region is not None:
                     arena_img = self._vision.capture(self._arena_region)
                     self._vision.save_image(arena_img, str(debug_dir / "arena_region.png"))

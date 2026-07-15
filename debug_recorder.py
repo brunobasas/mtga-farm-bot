@@ -189,6 +189,12 @@ class DecisionRecorder:
             return
         self._enqueue(("match_end", result))
 
+    def current_seq(self) -> int:
+        """Last snapshot sequence number assigned. Used as a join key so a click
+        record can be correlated back to the decision that triggered it."""
+        with self._lock:
+            return self._seq
+
     # -- internals ---------------------------------------------------------
     def _enqueue(self, item) -> None:
         with self._lock:
@@ -516,3 +522,7 @@ def record(game_state, my_seat, match_id, decision_kind, move_name, move_data, e
 
 def end_match(result=None) -> None:
     _recorder.end_match(result)
+
+
+def current_seq() -> int:
+    return _recorder.current_seq()

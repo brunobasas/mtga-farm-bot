@@ -454,7 +454,7 @@ def write_incident_bundle(
     try:
         vision.begin_tick()
         full = vision.capture(None)
-        vision.save_image(full, str(incident_dir / "full_screen.png"))
+        vision.save_image(full, str(incident_dir / "full_screen.jpg"))
         if detection.region is not None:
             arena = vision.capture(detection.region)
             vision.save_image(arena, str(incident_dir / "arena_region.png"))
@@ -489,7 +489,7 @@ def capture_post_recovery_bundle(
     try:
         vision.begin_tick()
         full = vision.capture(None)
-        vision.save_image(full, str(Path(incident_dir) / "post_recovery_full_screen.png"))
+        vision.save_image(full, str(Path(incident_dir) / "post_recovery_full_screen.jpg"))
         arena = resolve_mtga_region(provider)
         if arena is not None:
             arena_img = vision.capture(arena)

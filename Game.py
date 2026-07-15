@@ -8,6 +8,7 @@ import traceback
 import threading
 import bot_logger
 import debug_recorder
+import click_recorder
 import runtime_status
 
 
@@ -37,6 +38,7 @@ class Game:
         self._stop_requested = False
         try:
             debug_recorder.start_session()
+            click_recorder.start_session()
         except Exception as e:
             self._debug(f"Decision recorder start failed: {e}")
         runtime_status.set_mode("starting")

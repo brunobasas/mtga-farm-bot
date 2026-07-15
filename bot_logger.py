@@ -11,6 +11,40 @@ _log_lock = threading.Lock()
 _fallback_warning_printed = False
 _hover_logging_enabled = False
 
+# Debug-bundle rotation. The per-failure bundle writers (keep-click, hand-select,
+# nav, assign-damage, arena-setup, ...) all funnel through ensure_debug_dir and
+# had no cap, so runtime/debug grew unbounded (1.2 GB observed). Prune oldest
+# sibling bundles opportunistically, throttled so we don't listdir on every call.
+_MAX_DEBUG_BUNDLES = 60
+_DEBUG_PRUNE_MIN_INTERVAL_SEC = 600
+_debug_prune_lock = threading.Lock()
+_last_debug_prune_ts = 0.0
+# Own their own retention / are not per-failure bundles -> never auto-pruned here.
+_DEBUG_PRUNE_EXCLUDE = {"matches", "clicks.jsonl", "clicks.jsonl.1", "clicks"}
+
+
+def _maybe_prune_debug_bundles(base: Path) -> None:
+    global _last_debug_prune_ts
+    import time as _time
+    now = _time.time()
+    with _debug_prune_lock:
+        if now - _last_debug_prune_ts < _DEBUG_PRUNE_MIN_INTERVAL_SEC:
+            return
+        _last_debug_prune_ts = now
+    try:
+        import shutil
+        entries = [
+            entry for entry in base.iterdir()
+            if entry.is_dir() and entry.name not in _DEBUG_PRUNE_EXCLUDE
+        ]
+        if len(entries) <= _MAX_DEBUG_BUNDLES:
+            return
+        entries.sort(key=lambda p: p.stat().st_mtime)
+        for old in entries[: len(entries) - _MAX_DEBUG_BUNDLES]:
+            shutil.rmtree(old, ignore_errors=True)
+    except Exception:
+        pass
+
 
 def _resolve_bot_log_path() -> str:
     """Resolve the repo-local runtime bot.log location."""
@@ -40,13 +74,16 @@ def get_app_log_dir() -> str:
 
 def ensure_debug_dir(subdir: str | None = None) -> str:
     """Create and return a debug output directory."""
-    base = ensure_runtime_subdir("debug")
+    debug_root = ensure_runtime_subdir("debug")
+    # Opportunistically cap the accumulated per-failure bundles (throttled).
+    _maybe_prune_debug_bundles(debug_root)
+    base = debug_root
     if subdir:
         base = base / str(subdir)
-    try:
-        base.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
     return str(base)
 
 
@@ -236,10 +273,34 @@ def log_error(message: str):
         _write_lines('a', [f"[{_timestamp()}] [ERROR] {message}\n"])
 
 
-def log_click(x: int, y: int, purpose: str):
-    """Log mouse click with absolute coordinates and purpose"""
+def log_click(x: int, y: int, purpose: str, *, source=None, region_age=None, arena=None):
+    """Log mouse click with absolute coordinates and purpose.
+
+    Optional visual-layer context (all keyword-only, backward compatible):
+      source      -- the arena-mapping source from _map_abs_point_to_arena, e.g.
+                     "arena_relative_1920_direct" or the risky "absolute_no_arena"
+                     (window lost -> blind desktop click).
+      region_age  -- seconds since the arena window was last located.
+      arena       -- the current arena_region tuple (or None if lost).
+    When provided, the context is appended to the [CLICK] line and the click is
+    also forwarded to click_recorder for the always-on clicks.jsonl."""
+    risky = bool(source and str(source).startswith("absolute")) or (
+        region_age is not None and region_age > 10.0
+    )
+    extra = ""
+    if source is not None or region_age is not None:
+        age_str = f"{region_age:.1f}s" if region_age is not None else "?"
+        extra = f" | source={source} arena={arena} age={age_str}{' RISKY' if risky else ''}"
     with _log_lock:
-        _write_lines('a', [f"[{_timestamp()}] [CLICK] ({x}, {y}) - {purpose}\n"])
+        _write_lines('a', [f"[{_timestamp()}] [CLICK] ({x}, {y}) - {purpose}{extra}\n"])
+    # Forward to the structured click log (best-effort, never disturb clicking).
+    try:
+        import click_recorder
+        click_recorder.record(
+            x, y, purpose, source=source, region_age=region_age, arena=arena, risky=risky
+        )
+    except Exception:
+        pass
 
 
 def log_move(x: int, y: int, purpose: str):

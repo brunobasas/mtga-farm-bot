@@ -201,6 +201,7 @@ Both `Controller` and `AI` follow an interface pattern (`ControllerInterface.py`
 |---|---|---|
 | `bot.log` | `runtime/logs/bot.log` | Main bot debug log |
 | `snapshots.jsonl` / `board.txt` | `runtime/debug/matches/<utc>_<matchId>/` | Per-decision game-state snapshots (see below) |
+| `clicks.jsonl` | `runtime/debug/clicks.jsonl` | Per-click verification log (see below) |
 | `Player.log` | Auto-detected per OS (see below) | MTGA game log — primary state source |
 
 `Player.log` default paths:
@@ -221,6 +222,12 @@ For post-mortem debugging of *play* decisions (why did the bot pass, attack, or 
 - `match.json` — per-match header/footer with the result and any card IDs that couldn't be resolved to names offline.
 
 Card names are resolved from the local card database only (no network calls on the decision path), so this never delays in-game actions. Recording is on by default and writes only per decision (a few dozen small records per match); disable it with `MTGA_DEBUG_SNAPSHOTS=0`, or add the full raw game-state dump to each record with `MTGA_DEBUG_FULL_STATE=1`. Old match directories are pruned automatically (newest 30 kept).
+
+### Click verification log
+
+For debugging the *visual* layer (bot clicked the wrong screen position, or the right position at the wrong time), every mouse click is logged as one line in `runtime/debug/clicks.jsonl`: the purpose, the coordinates, the arena-mapping `source`, how old the arena-window fix was (`region_age_sec`), a `risky` flag (set when the arena window was lost and the click fell back to a blind absolute desktop coordinate), and a `decision_seq` that ties the click back to the game-state snapshot that caused it. The same context is appended to the `[CLICK]` lines in `bot.log`. On by default; disable with `MTGA_DEBUG_CLICKS=0`. The file rotates at ~5 MB (one `.1` backup kept).
+
+The per-failure debug bundles under `runtime/debug/` (screenshots + state for mulligan/hand-select/navigation/etc.) are now capped automatically (oldest pruned, newest 60 kept) and their full-screen captures are saved as JPEG, so the debug folder no longer grows unbounded.
 
 ## See also on
 [elitepvpers](https://www.elitepvpers.com/)
