@@ -6,7 +6,7 @@ import glob
 import os
 import sys
 import time
-from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageStat, ImageTk
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageStat, ImageTk
 import json
 import threading
 import runtime_status
@@ -2361,6 +2361,104 @@ class MTGBotUI(tk.Tk):
             int(c1[2] + (c2[2] - c1[2]) * t),
         )
 
+    def _render_title_image(self, text: str):
+        """Render the main title as a single image with a warm 'molten gold'
+        vertical gradient, a warm emboss shadow and a soft ember glow
+        (design proposal #4). Returns an ImageTk.PhotoImage, or None on failure
+        (callers fall back to plain canvas text)."""
+        try:
+            font_px = max(28, self._scale_value(41))
+            font = None
+            # Prefer a native bold sans-serif on each supported platform. Bare
+            # font names are included as a final option for systems where
+            # FreeType/Pillow can resolve fonts through the OS font registry.
+            font_candidates = (
+                # Windows
+                r"C:\Windows\Fonts\segoeuib.ttf",
+                r"C:\Windows\Fonts\seguibl.ttf",
+                # macOS
+                "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                "/System/Library/Fonts/Helvetica.ttc",
+                "/System/Library/Fonts/SFNS.ttf",
+                # Linux
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+                "/usr/share/fonts/opentype/noto/NotoSans-Bold.ttf",
+                # Font-name fallbacks
+                "DejaVuSans-Bold.ttf",
+                "LiberationSans-Bold.ttf",
+                "Arial Bold.ttf",
+            )
+            for path in font_candidates:
+                try:
+                    font = ImageFont.truetype(path, font_px)
+                    break
+                except Exception:
+                    continue
+            if font is None:
+                return None
+
+            pad = max(6, int(font_px * 0.42))
+            probe = ImageDraw.Draw(Image.new("L", (1, 1)))
+            x0, y0, x1, y1 = probe.textbbox((0, 0), text, font=font)
+            tw, th = (x1 - x0), (y1 - y0)
+            size = (tw + pad * 2, th + pad * 2)
+            ox, oy = pad - x0, pad - y0
+
+            # Glyph mask.
+            mask = Image.new("L", size, 0)
+            ImageDraw.Draw(mask).text((ox, oy), text, font=font, fill=255)
+
+            # Vertical molten-gold gradient (light champagne -> copper), matching
+            # proposal #4: #fff4d3 -> #ffd889 -> #f4a83c -> #c9761d.
+            stops = [
+                (0.00, (255, 244, 211)),
+                (0.34, (255, 216, 137)),
+                (0.63, (244, 168, 60)),
+                (1.00, (201, 118, 31)),
+            ]
+
+            def grad_color(t: float) -> tuple[int, int, int]:
+                t = min(1.0, max(0.0, t))
+                for i in range(len(stops) - 1):
+                    t0, c0 = stops[i]
+                    t1, c1 = stops[i + 1]
+                    if t <= t1:
+                        f = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
+                        return tuple(int(c0[k] + (c1[k] - c0[k]) * f) for k in range(3))
+                return stops[-1][1]
+
+            col = Image.new("RGB", (1, size[1]))
+            for yy in range(size[1]):
+                col.putpixel((0, yy), grad_color((yy - pad) / max(1, th)))
+            grad = col.resize(size).convert("RGBA")
+            grad.putalpha(mask)
+
+            # Warm emboss shadow, offset slightly downward.
+            off = max(1, int(font_px * 0.05))
+            sh_mask = ImageChops.offset(mask, 0, off)
+            shadow = Image.new("RGBA", size, (0, 0, 0, 0))
+            shadow.paste((70, 30, 6, 255), (0, 0), sh_mask)
+            shadow = shadow.filter(ImageFilter.GaussianBlur(1))
+
+            # Soft ember glow behind the letters.
+            glow = Image.new("RGBA", size, (0, 0, 0, 0))
+            glow.paste((255, 150, 60, 255), (0, 0), mask)
+            glow = glow.filter(ImageFilter.GaussianBlur(max(2, int(font_px * 0.26))))
+            glow.putalpha(glow.getchannel("A").point(lambda v: int(v * 0.5)))
+
+            out = Image.new("RGBA", size, (0, 0, 0, 0))
+            out = Image.alpha_composite(out, glow)
+            out = Image.alpha_composite(out, shadow)
+            out = Image.alpha_composite(out, grad)
+            bbox = out.getbbox()
+            if bbox:
+                out = out.crop(bbox)
+            return ImageTk.PhotoImage(out)
+        except Exception:
+            return None
+
     def _render_button_skin(
         self,
         width: int,
@@ -2448,6 +2546,69 @@ class MTGBotUI(tk.Tk):
         base = Image.alpha_composite(base, inner_layer)
 
         return ImageTk.PhotoImage(base)
+
+    def _render_panel_skin(self, width: int, height: int, radius: int) -> ImageTk.PhotoImage:
+        """Same material as the menu buttons (dark #3D130E body + sheen + soft
+        drop shadow) but WITHOUT the colored rim/glow. Used as the container
+        field behind the status / queue / account-switch lines. Cached by size."""
+        width = max(1, int(width))
+        height = max(1, int(height))
+        radius = max(2, int(radius))
+        key = (width, height, radius)
+        cache = getattr(self, "_status_field_skin_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+
+        glow_pad = 6
+        img_w = width + glow_pad * 2
+        img_h = height + glow_pad * 2
+        base = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
+
+        # Soft drop shadow, matching the buttons.
+        shadow = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
+        ImageDraw.Draw(shadow).rounded_rectangle(
+            (glow_pad, glow_pad + 1, glow_pad + width - 1, glow_pad + height),
+            radius=radius, fill=(0, 0, 0, 115),
+        )
+        base = Image.alpha_composite(base, shadow.filter(ImageFilter.GaussianBlur(4)))
+
+        # Rounded shape + the exact button body fill (#3D130E, alpha 210).
+        shape_mask = Image.new("L", (width, height), 0)
+        ImageDraw.Draw(shape_mask).rounded_rectangle(
+            (0, 0, width - 1, height - 1), radius=radius, fill=255,
+        )
+        body_fill = Image.new("RGBA", (width, height), (61, 19, 14, 210))
+        base.paste(body_fill, (glow_pad, glow_pad), shape_mask)
+
+        # Same top->bottom sheen the buttons use, clipped to the rounded shape
+        # (there is no rim here to hide the square corners of the gradient).
+        sheen = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        sheen_draw = ImageDraw.Draw(sheen)
+        half = max(1, height // 2)
+        for yy in range(half):
+            alpha = int(96 * (1.0 - (yy / half)))
+            sheen_draw.line((2, yy + 2, width - 3, yy + 2), fill=(255, 255, 255, alpha))
+        for yy in range(half, height):
+            t = (yy - half) / max(1, (height - half))
+            sheen_draw.line((2, yy, width - 3, yy), fill=(0, 0, 0, int(78 * t)))
+        sheen.putalpha(ImageChops.multiply(sheen.getchannel("A"), shape_mask))
+        sheen_layer = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
+        sheen_layer.paste(sheen, (glow_pad, glow_pad), sheen)
+        base = Image.alpha_composite(base, sheen_layer)
+
+        # Subtle inner dark hairline for depth (no color), like the buttons.
+        inner = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        ImageDraw.Draw(inner).rounded_rectangle(
+            (1, 1, width - 2, height - 2), radius=max(2, radius - 1),
+            outline=(0, 0, 0, 45), width=1,
+        )
+        inner_layer = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
+        inner_layer.paste(inner, (glow_pad, glow_pad), inner)
+        base = Image.alpha_composite(base, inner_layer)
+
+        photo = ImageTk.PhotoImage(base)
+        self._status_field_skin_cache = (key, photo)
+        return photo
 
     def _install_button_skin_style(self, style_name: str, element_name: str, skins: dict[str, ImageTk.PhotoImage]):
         try:
@@ -2796,14 +2957,24 @@ class MTGBotUI(tk.Tk):
                 anchor="n",
             )
 
-        self._title_item = self._card_canvas.create_text(
-            0,
-            0,
-            text="Burning Lotus",
-            fill=c["text"],
-            font=self.ui_theme["font"]["title"],
-            anchor="n",
-        )
+        # Title as a molten-gold image (design proposal #4). Falls back to plain
+        # canvas text if the font/image can't be rendered.
+        self._title_photo = self._render_title_image("Burning Lotus")
+        if self._title_photo is not None:
+            self._title_is_image = True
+            self._title_item = self._card_canvas.create_image(
+                0, 0, image=self._title_photo, anchor="n",
+            )
+        else:
+            self._title_is_image = False
+            self._title_item = self._card_canvas.create_text(
+                0,
+                0,
+                text="Burning Lotus",
+                fill=c["text"],
+                font=self.ui_theme["font"]["title"],
+                anchor="n",
+            )
 
         self._menu_buttons: dict[str, dict] = {}
         self._menu_button_order: list[str] = []
@@ -2827,6 +2998,15 @@ class MTGBotUI(tk.Tk):
         )
         self._loading_bar_window = self._card_canvas.create_window(0, 0, anchor="n", window=self.loading_bar)
         self._loading_visible = False
+
+        # Container field behind the three gold lines (status / queue / account
+        # switch). Uses the same body material as the menu buttons but without a
+        # colored rim, so the warm text reads clearly on the fiery background.
+        # Sized/placed in _refresh_card_layout via _render_panel_skin.
+        self._status_field_item = self._card_canvas.create_image(
+            0, 0, anchor="nw", state="hidden",
+        )
+        self._status_field_skin_cache = None
 
         self._status_text_item = self._card_canvas.create_text(
             0,
@@ -2961,7 +3141,10 @@ class MTGBotUI(tk.Tk):
 
         title_font = tkfont.Font(font=self.ui_theme["font"]["title"])
         body_font = tkfont.Font(font=self.ui_theme["font"]["body"])
-        title_h = title_font.metrics("linespace")
+        if getattr(self, "_title_is_image", False) and getattr(self, "_title_photo", None) is not None:
+            title_h = self._title_photo.height()
+        else:
+            title_h = title_font.metrics("linespace")
         body_h = body_font.metrics("linespace")
         logo_h = size["logo"] if self._logo_item is not None else title_h
         loading_bar_h = self.loading_bar.winfo_reqheight()
@@ -3010,6 +3193,10 @@ class MTGBotUI(tk.Tk):
             is_last = idx == (len(self._menu_button_order) - 1)
             y += btn_h + (sp["lg"] if is_last else button_gap)
 
+        # Bottom edge of the button stack (used to vertically center the block
+        # below it between the Settings button and the footer).
+        menu_end_y = y
+
         if self._loading_visible:
             self._card_canvas.itemconfigure(self._loading_text_item, state="normal")
             self._card_canvas.itemconfigure(self._loading_bar_window, state="normal")
@@ -3021,6 +3208,8 @@ class MTGBotUI(tk.Tk):
             self._card_canvas.itemconfigure(self._loading_text_item, state="hidden")
             self._card_canvas.itemconfigure(self._loading_bar_window, state="hidden")
 
+        # Top of the container field that wraps the three gold lines.
+        status_field_top = y
         self._card_canvas.coords(self._status_text_item, center_x, y)
         y += body_h + sp["xs"]
         self._card_canvas.coords(self._queue_mode_item, center_x, y)
@@ -3042,6 +3231,27 @@ class MTGBotUI(tk.Tk):
             self._card_canvas.tag_raise(self._account_switch_tick_item)
             self._card_canvas.tag_raise(self._account_switch_label_item)
             y += as_box + sp["xs"]
+
+        # Draw the container field behind the three gold lines (status / queue /
+        # account switch). Same body as the buttons, no colored rim; aligned to
+        # the button width so it lines up with the stack above.
+        if getattr(self, "_status_field_item", None) is not None:
+            glow_pad = 6
+            pad_t = self._scale_value(9)
+            pad_b = self._scale_value(9)
+            body_w = self._scale_value(336)
+            radius = self._scale_value(14)
+            field_top_px = status_field_top - pad_t
+            field_bottom_px = (y - sp["xs"]) + pad_b  # y is past the last row
+            body_h = max(1, field_bottom_px - field_top_px)
+            photo = self._render_panel_skin(body_w, body_h, radius)
+            img_x = center_x - (body_w // 2) - glow_pad
+            img_y = field_top_px - glow_pad
+            self._card_canvas.coords(self._status_field_item, img_x, img_y)
+            self._card_canvas.itemconfigure(self._status_field_item, image=photo, state="normal")
+            # Above the background, below the gold text/controls it wraps.
+            self._card_canvas.tag_lower(self._status_field_item, self._status_text_item)
+
         if hasattr(self, "_quest_title_item"):
             self._card_canvas.coords(self._quest_title_item, center_x, y)
             self._card_canvas.tag_raise(self._quest_title_item)
@@ -3050,6 +3260,29 @@ class MTGBotUI(tk.Tk):
             self._card_canvas.coords(item, center_x, y)
             self._card_canvas.tag_raise(item)
             y += quest_h + sp["xs"]
+
+        # Vertically center the whole block below the Settings button (status
+        # field + quest rows) in the gap between the button stack and the footer.
+        block_top = status_field_top - self._scale_value(9)  # field's padded top
+        block_bottom = y - sp["xs"]                           # last quest row bottom
+        settings_bottom = menu_end_y - sp["lg"]
+        footer_top = canvas_h - footer_h
+        center_offset = ((footer_top + settings_bottom) - (block_bottom + block_top)) // 2
+        if center_offset > 0:
+            movers = [
+                self._loading_text_item, self._loading_bar_window,
+                self._status_field_item, self._status_text_item, self._queue_mode_item,
+            ]
+            for attr in (
+                "_account_switch_box_item", "_account_switch_tick_item",
+                "_account_switch_label_item", "_quest_title_item",
+            ):
+                movers.append(getattr(self, attr, None))
+            movers.extend(getattr(self, "_quest_items", []))
+            for it in movers:
+                if it is not None:
+                    self._card_canvas.move(it, 0, center_offset)
+
         footer_y1 = canvas_h - footer_h
         self._card_canvas.coords(self._main_topmost_panel_item, 0, footer_y1, canvas_w, canvas_h)
         box_size = self._scale_value(18)

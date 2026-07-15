@@ -12,6 +12,11 @@ set "VENV_PYTHON=%VENV_DIR%\Scripts\python.exe"
 set "REQ_FILE=%ROOT_DIR%\requirements.txt"
 set "MARKER=%VENV_DIR%\.requirements.installed"
 
+rem --- Minimized relaunch (Explorer double-click): the parent window already
+rem ran the setup below, so skip straight to starting the UI. This avoids
+rem running the whole dependency check twice. ---
+if /i "%~1"=="--minimized" goto start_ui
+
 rem --- Locate a Python interpreter (py -3 is preferred on Windows) ---
 set "PY_LAUNCHER="
 where py >nul 2>&1
@@ -68,10 +73,24 @@ if "%NEED_INSTALL%"=="1" (
     )
     copy /y "%REQ_FILE%" "%MARKER%" >nul
 ) else (
-    echo [INFO] Abhaengigkeiten unveraendert - starte direkt.
+    echo [INFO] Dependencies unchanged - starting directly.
+)
+
+rem --- Minimize Explorer-style cmd /c launches after setup succeeds. ---
+rem Setup ran visibly in this window; relaunch minimized (which skips setup via
+rem the guard above) so the console does not sit in the foreground. Direct cmd
+rem runs stay attached; pass --foreground to keep the visible window and the
+rem real process exit code (e.g. from PowerShell or automation).
+if /i not "%~1"=="--foreground" (
+    echo(!cmdcmdline! | findstr /i /c:"%~f0" >nul
+    if !ERRORLEVEL!==0 (
+        start "" /min "%ComSpec%" /d /c call "%~f0" --minimized
+        exit /b 0
+    )
 )
 
 rem --- Start the UI ---
+:start_ui
 cd /d "%ROOT_DIR%"
 "%VENV_PYTHON%" "%ROOT_DIR%\ui.py"
 set "RC=%ERRORLEVEL%"
