@@ -4455,9 +4455,13 @@ class Controller(ControllerSecondary):
 
     def __record_decision(self, decision_kind, move_name, move_data, extra=None) -> None:
         """Record a debug snapshot of the live game state for a prompt-handler
-        decision (target selection, blockers, pay-costs, ...). Runs on the
-        LogReader thread where updated_game_state is mutated, so the state read
-        is inherently consistent. Never raises into the caller."""
+        decision (target selection, blockers, pay-costs, ...). Most callsites run
+        on the LogReader thread where updated_game_state is mutated, so the read
+        is consistent; a few (e.g. a select_n prompt that re-schedules itself via
+        a timer) may run from a threading.Timer instead, which carries the same
+        benign snapshot race as the main decision path (capture() deep-copies a
+        pruned subset and drops the snapshot on any read error). Never raises into
+        the caller."""
         try:
             debug_recorder.record(
                 self.updated_game_state,
@@ -6454,10 +6458,6 @@ class Controller(ControllerSecondary):
                     )
                     continue
 
-                self.__record_decision(
-                    "select_n", "select_n",
-                    {"offered_ids": sorted(ids), "min_sel": min_sel},
-                )
                 context = req.get("context")
                 option_context = req.get("optionContext")
                 discard_context = False
@@ -6619,6 +6619,21 @@ class Controller(ControllerSecondary):
                         "stack"
                         if (use_stack_selection and not use_hand_selection)
                         else ("battlefield" if (use_battlefield_selection and not use_hand_selection) else "hand")
+                    )
+
+                # Record once per prompt token: the handler re-schedules itself
+                # via timers (stack-wait / discard retry), so guarding on the
+                # pending dict avoids a burst of duplicate snapshots. Placed here
+                # so the recorded ids/mode reflect the final resolved selection.
+                if self.__pending_select_n is not None and not self.__pending_select_n.get("recorded"):
+                    self.__pending_select_n["recorded"] = True
+                    self.__record_decision(
+                        "select_n", "select_n",
+                        {
+                            "ids": list(ids),
+                            "mode": self.__pending_select_n.get("mode"),
+                            "min_sel": min_sel,
+                        },
                     )
 
                 def _select_n_valid() -> bool:
