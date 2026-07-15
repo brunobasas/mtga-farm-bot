@@ -4511,14 +4511,26 @@ class SettingsWindow(tk.Toplevel):
 
         parent_ui = getattr(self, "master", None)
         title_font = getattr(parent_ui, "ui_theme", {}).get("font", {}).get("title") if parent_ui else None
-        self._title_item = self._settings_canvas.create_text(
-            0,
-            0,
-            text=f"v{APP_VERSION}",
-            fill=c["text_muted"],
-            font=title_font or ("Segoe UI", 14, "bold"),
-            anchor="n",
-        )
+        # Version label in the same molten-gold style as the main-UI title.
+        # Falls back to plain muted text if the image can't be built.
+        self._version_photo = None
+        self._version_is_image = False
+        if parent_ui is not None and hasattr(parent_ui, "_render_title_image"):
+            self._version_photo = parent_ui._render_title_image(f"v{APP_VERSION}")
+        if self._version_photo is not None:
+            self._version_is_image = True
+            self._title_item = self._settings_canvas.create_image(
+                0, 0, image=self._version_photo, anchor="n",
+            )
+        else:
+            self._title_item = self._settings_canvas.create_text(
+                0,
+                0,
+                text=f"v{APP_VERSION}",
+                fill=c["text_muted"],
+                font=title_font or ("Segoe UI", 14, "bold"),
+                anchor="n",
+            )
 
         self._settings_buttons = {}
         self._settings_button_order = []
@@ -4713,10 +4725,20 @@ class SettingsWindow(tk.Toplevel):
         if not getattr(self, "_settings_button_order", None):
             return
         x = cw // 2
-        y_start = s(62)
+        # Version label sits in a top band, vertically centered between the top
+        # edge and the first (Manage Accounts) button. When it is the molten-gold
+        # image, size the band to it so the button stack drops down accordingly.
+        if getattr(self, "_version_is_image", False) and getattr(self, "_version_photo", None) is not None:
+            vh = self._version_photo.height()
+            top_margin = s(16)
+            y_start = vh + top_margin * 2   # first button top
+            title_y = top_margin            # centered: equal margin above/below
+        else:
+            y_start = s(62)
+            title_y = s(14)
         y_step = s(76)
         if getattr(self, "_title_item", None):
-            self._settings_canvas.coords(self._title_item, x, s(14))
+            self._settings_canvas.coords(self._title_item, x, title_y)
         for idx, name in enumerate(self._settings_button_order):
             btn = self._settings_buttons.get(name)
             if not btn:
