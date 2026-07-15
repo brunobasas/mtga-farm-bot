@@ -222,6 +222,34 @@ def log_actions_available(actions: list):
         _write_lines('a', lines)
 
 
+def log_match_end(result: str, turns: int, duration_sec: float):
+    """Emit a single structured match-end marker.
+
+    Written to bot.log (and thus to the persistent history.log copied by
+    tools/session_watchdog.py) so the watchdog can build one match record per
+    game without any cross-process coupling into the gameplay thread. Format is
+    deliberately flat and grep-friendly:
+        [MATCH_END] result=won turns=8 duration_sec=142.53
+    """
+    with _log_lock:
+        safe_result = str(result or "unknown").strip() or "unknown"
+        try:
+            turns_val = int(turns)
+        except Exception:
+            turns_val = -1
+        try:
+            duration_val = float(duration_sec)
+        except Exception:
+            duration_val = 0.0
+        _write_lines(
+            'a',
+            [
+                f"[{_timestamp()}] [MATCH_END] result={safe_result} "
+                f"turns={turns_val} duration_sec={duration_val:.2f}\n"
+            ],
+        )
+
+
 def log_mulligan_decision(keep: bool, card_count: int):
     """Log mulligan decision"""
     with _log_lock:

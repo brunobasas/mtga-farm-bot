@@ -2024,6 +2024,7 @@ class MTGBotUI(tk.Tk):
         self.bot_running = False
         self.game = None
         self.bot_thread = None
+        self._watchdog_proc = None
         self.session_games = 0
         self.session_wins = 0
         self.settings_window = None
@@ -3329,6 +3330,7 @@ class MTGBotUI(tk.Tk):
         # Start bot in separate thread
         self.bot_thread = threading.Thread(target=self._run_bot, daemon=True)
         self.bot_thread.start()
+        self._start_session_watchdog()
         self._update_switch_eta()
 
     def _check_arena_setup(self):
@@ -3618,6 +3620,50 @@ class MTGBotUI(tk.Tk):
         self._stop_bot()
         messagebox.showerror("Bot Error", f"An error occurred:\n{error_msg}")
 
+    def _start_session_watchdog(self):
+        """Launch the read-only session watchdog as a detached child.
+
+        It observes bot.log / status.json and writes evidence under runtime/
+        (history.log, alerts.log, per-match records, stall black boxes). It never
+        touches input, so it is safe alongside the in-process bot. Failure to
+        start must never block the bot, hence the broad guard."""
+        try:
+            import subprocess
+
+            if self._watchdog_proc is not None and self._watchdog_proc.poll() is None:
+                return  # already running
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            self._watchdog_proc = subprocess.Popen(
+                [sys.executable, "-m", "tools.session_watchdog"],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                creationflags=creationflags,
+            )
+        except Exception as exc:
+            self._watchdog_proc = None
+            try:
+                import bot_logger
+
+                bot_logger.log_error(f"Session watchdog failed to start: {exc}")
+            except Exception:
+                pass
+
+    def _stop_session_watchdog(self):
+        proc = self._watchdog_proc
+        self._watchdog_proc = None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+        except Exception:
+            pass
+
     def _stop_bot(self):
         self.bot_running = False
 
@@ -3628,6 +3674,7 @@ class MTGBotUI(tk.Tk):
                 pass
             self.game = None
 
+        self._stop_session_watchdog()
         self._set_running_state(False)
         self._set_startup_loading(False)
         self._controller = None

@@ -1,0 +1,466 @@
+"""Read-only session watchdog: black-box recorder for farming sessions.
+
+This process observes the bot without ever touching the mouse or keyboard, so
+it is safe to run alongside the UI-launched bot (which owns input). It exists to
+turn an unattended farming session into debuggable evidence:
+
+  A. Persistent history  -> runtime/analysis/history.log
+     Accumulates a copy of bot.log that survives the many bot restarts between
+     matches (bot.log is truncated on every restart, so without this the earlier
+     matches of a session are lost).
+
+  A. Alert stream        -> runtime/analysis/alerts.log
+     The subset of log lines that indicate a problem (exceptions, combat forced
+     via recovery, image-match failures, skipped/unsupported casts, critical
+     timers), throttled per signature so it stays scannable.
+
+  D. Stall black boxes   -> runtime/debug/incident-<stamp>/
+     When runtime/status.json shows a genuine stall (reusing the supervisor's
+     detect_stuck_reason so the definition stays in one place), a text-only
+     incident bundle is written and registered in the shared signature registry
+     (tools/incident_tracking). No recovery is attempted here.
+
+  B. Per-match records   -> runtime/records/<session>/match-NNNN.json
+     One record per game (result / turns / duration from the [MATCH_END] marker
+     Game emits, plus the alert counts seen during that game and quest context).
+
+Nothing here is sent anywhere. Everything lands under runtime/ on this machine
+for a developer to inspect (or feed to tools/session_report.py) after a session.
+
+Usage:
+    python -m tools.session_watchdog                # run continuously
+    python -m tools.session_watchdog --once         # single pass then exit
+    python -m tools.session_watchdog --poll-sec 3   # custom poll interval
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from bot_logger import ensure_debug_dir
+from runtime_paths import ensure_runtime_subdir, runtime_file
+from runtime_status import read_status
+from state.state_machine import get_state_from_playerlog
+from tools.bot_supervisor import (
+    detect_stuck_reason,
+    read_tail,
+    resolve_bot_log_path,
+    resolve_playerlog_path,
+    write_text,
+)
+from tools.incident_tracking import (
+    build_related_incidents_payload,
+    build_signature_knowledge_payload,
+    ensure_tracking_file,
+)
+
+# --- Alert signatures ------------------------------------------------------
+# (label, needles, cooldown_sec). Checked in order; the first matching needle
+# wins so specific errors are classified before the generic buckets. The
+# cooldown throttles alerts.log writes only -- per-match counting still counts
+# every occurrence.
+ALERT_SIGNATURES: tuple[tuple[str, tuple[str, ...], float], ...] = (
+    ("combat_force", ("COMBAT_RECOVERY_ATTEMPT",), 20.0),
+    ("submit_img_fail", ("SUBMIT_SELECTION_IMG: image not found",), 20.0),
+    ("unsupported_cast", ("not implemented yet", "chooser not implemented"), 30.0),
+    ("no_scryfall_land", ("No Scryfall data for land",), 60.0),
+    ("no_card_info", ("No card info for grpId",), 60.0),
+    ("timer_critical", ("MY_TIMER_CRITICAL", "TimerType_Inactivity remaining=0"), 20.0),
+    ("exception", ("Traceback (most recent call last)", "Unhandled exception"), 5.0),
+    # NOTE: no generic "[ERROR]" bucket on purpose -- most [ERROR] lines are benign
+    # retries (image-not-found, arena reacquire) and would drown the alert stream.
+    # Genuine crashes are caught by "exception"; the raw lines stay in history.log.
+)
+
+MATCH_END_RE = re.compile(
+    r"\[MATCH_END\]\s+result=(?P<result>\S+)\s+turns=(?P<turns>-?\d+)\s+"
+    r"duration_sec=(?P<duration>[\d.]+)"
+)
+
+# Per-reason cooldown before a repeated stall writes another black box.
+INCIDENT_COOLDOWN_SEC = 120.0
+# Soft cap for history.log; rotated to history.log.1 when exceeded.
+HISTORY_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort cross-platform liveness check for the bot/UI process."""
+    if not pid:
+        return True  # unknown -> assume alive, don't self-terminate prematurely
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+            )
+            if not handle:
+                return False
+            exit_code = ctypes.c_ulong()
+            ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return exit_code.value == STILL_ACTIVE
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+class _Thresholds:
+    """Minimal stand-in for the supervisor argparse namespace that
+    detect_stuck_reason reads (kept in sync with the supervisor defaults)."""
+
+    my_timer_critical_threshold = 2
+    my_timer_stall_sec = 20.0
+
+
+def _analysis_dir() -> Path:
+    return ensure_runtime_subdir("analysis")
+
+
+def _state_path() -> Path:
+    return _analysis_dir() / "watchdog_state.json"
+
+
+def _history_path() -> Path:
+    return _analysis_dir() / "history.log"
+
+
+def _alerts_path() -> Path:
+    return _analysis_dir() / "alerts.log"
+
+
+def _timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _load_state() -> dict:
+    path = _state_path()
+    if not path.is_file():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    path = _state_path()
+    tmp = path.with_suffix(".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(state, handle, indent=2, sort_keys=True)
+        tmp.replace(path)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def _default_match_state() -> dict:
+    return {"count": 0, "alerts": {}, "stalled": False, "session_dir": ""}
+
+
+def _append_text(path: Path, text: str) -> None:
+    if not text:
+        return
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(text)
+    except Exception:
+        pass
+
+
+def _rotate_history_if_needed() -> None:
+    path = _history_path()
+    try:
+        if path.is_file() and path.stat().st_size > HISTORY_MAX_BYTES:
+            backup = path.with_suffix(".log.1")
+            if backup.exists():
+                backup.unlink()
+            path.replace(backup)
+    except Exception:
+        pass
+
+
+def _classify_line(line: str) -> str | None:
+    for label, needles, _cooldown in ALERT_SIGNATURES:
+        if any(needle in line for needle in needles):
+            return label
+    return None
+
+
+def _cooldown_for(label: str) -> float:
+    for candidate, _needles, cooldown in ALERT_SIGNATURES:
+        if candidate == label:
+            return cooldown
+    return 30.0
+
+
+def _records_session_dir(state: dict, session_id: str) -> Path:
+    match_state = state.setdefault("match", _default_match_state())
+    session_dir = str(match_state.get("session_dir") or "")
+    if not session_dir:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        sid = (session_id or "nosid")[:8]
+        session_dir = f"session-{stamp}-{sid}"
+        match_state["session_dir"] = session_dir
+    path = ensure_runtime_subdir("records", session_dir)
+    return path
+
+
+def _write_match_record(state: dict, session_id: str, match: dict, status: dict) -> None:
+    match_state = state.setdefault("match", _default_match_state())
+    index = int(match_state.get("count") or 0) + 1
+    match_state["count"] = index
+
+    quest = {
+        "id": str(status.get("active_quest_id") or ""),
+        "colors": str(status.get("active_quest_colors") or ""),
+    }
+    record = {
+        "schema_version": 1,
+        "session_id": session_id,
+        "match_index": index,
+        "ended_at": _timestamp(),
+        "ended_at_epoch": time.time(),
+        "result": str(match.get("result") or "unknown"),
+        "turns": int(match.get("turns", -1)),
+        "duration_sec": float(match.get("duration", 0.0)),
+        "stalled": bool(match_state.get("stalled")),
+        "quest": quest,
+        "game_mode": str(status.get("mode") or ""),
+        "alerts": dict(match_state.get("alerts") or {}),
+    }
+    session_dir = _records_session_dir(state, session_id)
+    out = session_dir / f"match-{index:04d}.json"
+    try:
+        with out.open("w", encoding="utf-8") as handle:
+            json.dump(record, handle, indent=2, sort_keys=True)
+    except Exception:
+        pass
+
+    # Also drop a compact one-liner into alerts.log so a human scanning the alert
+    # stream sees the match boundary and its problem tally in context.
+    alert_summary = ", ".join(f"{k}={v}" for k, v in sorted(record["alerts"].items())) or "clean"
+    _append_text(
+        _alerts_path(),
+        f"[{_timestamp()}] [MATCH_SUMMARY] #{index} result={record['result']} "
+        f"turns={record['turns']} duration={record['duration_sec']:.0f}s "
+        f"stalled={record['stalled']} ({alert_summary})\n",
+    )
+
+    # Reset per-match accumulators for the next game.
+    match_state["alerts"] = {}
+    match_state["stalled"] = False
+
+
+def _process_new_lines(state: dict, session_id: str, text: str, status: dict) -> None:
+    match_state = state.setdefault("match", _default_match_state())
+    last_alert = state.setdefault("last_alert", {})
+    now = time.time()
+    for line in text.splitlines():
+        label = _classify_line(line)
+        if label:
+            # Count every occurrence for the per-match tally.
+            alerts = match_state.setdefault("alerts", {})
+            alerts[label] = int(alerts.get(label, 0)) + 1
+            # Throttle the alerts.log write per signature.
+            if (now - float(last_alert.get(label, 0.0))) >= _cooldown_for(label):
+                last_alert[label] = now
+                _append_text(_alerts_path(), f"[{_timestamp()}] [{label.upper()}] {line.strip()}\n")
+        match = MATCH_END_RE.search(line)
+        if match:
+            parsed = {
+                "result": match.group("result"),
+                "turns": int(match.group("turns")),
+                "duration": float(match.group("duration")),
+            }
+            _write_match_record(state, session_id, parsed, status)
+
+
+def _consume_bot_log(state: dict, session_id: str, status: dict) -> None:
+    bot_log = resolve_bot_log_path()
+    if not os.path.isfile(bot_log):
+        return
+    offset = int(state.get("offset") or 0)
+    try:
+        size = os.path.getsize(bot_log)
+    except Exception:
+        return
+    if size < offset:
+        # bot.log was truncated (bot restarted): start over and mark the seam.
+        offset = 0
+        _append_text(
+            _history_path(),
+            f"\n[{_timestamp()}] === session_watchdog: bot.log restart detected ===\n",
+        )
+    if size <= offset:
+        return
+    try:
+        with open(bot_log, "rb") as handle:
+            handle.seek(offset)
+            raw = handle.read(size - offset)
+    except Exception:
+        return
+    # Only process up to the last complete line; keep the remainder for next poll
+    # so a line being written right now is never split.
+    last_nl = raw.rfind(b"\n")
+    if last_nl == -1:
+        return
+    chunk = raw[: last_nl + 1]
+    text = chunk.decode("utf-8", errors="replace")
+    _rotate_history_if_needed()
+    _append_text(_history_path(), text)
+    _process_new_lines(state, session_id, text, status)
+    state["offset"] = offset + len(chunk)
+
+
+def _write_incident_bundle(state: dict, status: dict, reason: str) -> None:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    incident_dir = Path(ensure_debug_dir(f"incident-{stamp}"))
+    playerlog = resolve_playerlog_path(status)
+    player_tail = read_tail(playerlog, max_bytes=160000)
+    derived_state = get_state_from_playerlog(player_tail)
+    payload = {
+        "reason": reason,
+        "created_at": stamp,
+        "source": "session_watchdog",
+        "derived_playerlog_state": str(derived_state),
+        "status": status,
+    }
+    try:
+        with (incident_dir / "incident.json").open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+    except Exception:
+        pass
+    # Prefer the persistent history (survives restarts) for the bot-side tail.
+    history = _history_path()
+    bot_tail = read_tail(str(history), max_bytes=160000) or read_tail(
+        resolve_bot_log_path(), max_bytes=160000
+    )
+    write_text(incident_dir / "bot_tail.txt", bot_tail)
+    write_text(incident_dir / "player_tail.txt", player_tail)
+    # Register in the shared signature machinery so recurring stalls dedupe and
+    # accumulate known guidance across sessions (same registry the supervisor uses).
+    try:
+        ensure_tracking_file(incident_dir, created_at=stamp, trigger=reason)
+        with (incident_dir / "related_incidents.json").open("w", encoding="utf-8") as handle:
+            json.dump(
+                build_related_incidents_payload(
+                    incident_dir=incident_dir, created_at=stamp, trigger=reason
+                ),
+                handle,
+                indent=2,
+            )
+        with (incident_dir / "signature_knowledge.json").open("w", encoding="utf-8") as handle:
+            json.dump(
+                build_signature_knowledge_payload(
+                    incident_dir=incident_dir, created_at=stamp, trigger=reason
+                ),
+                handle,
+                indent=2,
+            )
+    except Exception:
+        pass
+
+    _append_text(
+        _alerts_path(),
+        f"[{_timestamp()}] [STALL] reason={reason} -> {incident_dir.name}\n",
+    )
+    # Flag the current match so its record notes it stalled.
+    state.setdefault("match", _default_match_state())["stalled"] = True
+    print(f"[session_watchdog] stall captured: reason={reason} dir={incident_dir}")
+
+
+def _check_stall(state: dict, status: dict, thresholds: _Thresholds) -> None:
+    try:
+        reason = detect_stuck_reason(status, thresholds)
+    except Exception:
+        reason = None
+    if not reason:
+        return
+    last_incident = state.setdefault("last_incident", {})
+    now = time.time()
+    if (now - float(last_incident.get(reason, 0.0))) < INCIDENT_COOLDOWN_SEC:
+        return
+    last_incident[reason] = now
+    _write_incident_bundle(state, status, reason)
+
+
+def run_once(state: dict, thresholds: _Thresholds) -> bool:
+    """Process one poll. Returns False when the watchdog should exit (the bot
+    process it was observing has gone away)."""
+    status = read_status()
+    session_id = str(status.get("session_id") or "")
+    stored_session = str(state.get("session_id") or "")
+    if session_id and session_id != stored_session:
+        # New bot process: fresh per-match accumulators and a new records folder,
+        # but keep the history/alert offsets so we don't reprocess.
+        state["session_id"] = session_id
+        state["match"] = _default_match_state()
+    _consume_bot_log(state, session_id, status)
+    _check_stall(state, status, thresholds)
+
+    # Self-terminate safety net: if we ever saw the bot process and it has since
+    # died (e.g. the UI was closed with the window X instead of Stop), exit so we
+    # don't linger. Only trips once a pid has actually been observed.
+    pid = int(status.get("pid") or 0)
+    if pid:
+        state["seen_pid"] = pid
+    seen_pid = int(state.get("seen_pid") or 0)
+    if seen_pid and not _pid_alive(seen_pid):
+        print(f"[session_watchdog] bot process {seen_pid} gone; exiting.")
+        return False
+    return True
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Read-only MTGA bot session watchdog.")
+    parser.add_argument("--poll-sec", type=float, default=2.0, help="Polling interval in seconds.")
+    parser.add_argument("--once", action="store_true", help="Run a single pass then exit.")
+    args = parser.parse_args()
+
+    thresholds = _Thresholds()
+    state = _load_state()
+    # Ensure the analysis dir and files exist so first-run reads never fail.
+    _analysis_dir()
+    print(f"[session_watchdog] observing bot.log; artifacts under {runtime_file('analysis')}")
+
+    if args.once:
+        run_once(state, thresholds)
+        _save_state(state)
+        return 0
+
+    poll = max(0.5, float(args.poll_sec))
+    try:
+        while True:
+            keep_going = run_once(state, thresholds)
+            _save_state(state)
+            if not keep_going:
+                break
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        _save_state(state)
+        print("[session_watchdog] stopped.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
