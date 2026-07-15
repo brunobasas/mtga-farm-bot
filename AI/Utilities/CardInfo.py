@@ -595,6 +595,31 @@ def get_card_info(mtga_id: int):
     return None # Return None if card not found
 
 
+def get_card_info_local(mtga_id: int):
+    """Offline-only variant of get_card_info.
+
+    Looks the card up in the two local layers (curated starter DB, then the
+    on-disk cards.json index) and returns None on a miss. Unlike
+    get_card_info() it NEVER falls back to a blocking Scryfall request and
+    NEVER rewrites cards.json/missing_cards. Use this on latency-sensitive
+    paths (e.g. the debug snapshot recorder) where a network round-trip could
+    burn the in-game priority timer. In Starter Deck Duel the starter layer is
+    warmed by warm_up_starter_data() at startup, so the hit rate is ~100%.
+    """
+    if mtga_id is None:
+        return None
+    try:
+        starter = _starter_cards.get(str(mtga_id))
+    except Exception:
+        starter = None
+    if starter:
+        return starter
+    try:
+        return _get_card_data_index().get(mtga_id)
+    except Exception:
+        return None
+
+
 def get_oracle_text(mtga_id: int) -> str:
     card_info = get_card_info(mtga_id)
     if card_info and card_info.get("oracleText"):

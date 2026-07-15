@@ -200,6 +200,7 @@ Both `Controller` and `AI` follow an interface pattern (`ControllerInterface.py`
 | File | Location | Purpose |
 |---|---|---|
 | `bot.log` | `runtime/logs/bot.log` | Main bot debug log |
+| `snapshots.jsonl` / `board.txt` | `runtime/debug/matches/<utc>_<matchId>/` | Per-decision game-state snapshots (see below) |
 | `Player.log` | Auto-detected per OS (see below) | MTGA game log — primary state source |
 
 `Player.log` default paths:
@@ -210,6 +211,16 @@ Both `Controller` and `AI` follow an interface pattern (`ControllerInterface.py`
 If auto-detection fails, the UI prompts for a manual file selection on startup.
 
 When something goes wrong the bot saves debug bundles under `runtime/debug/<timestamp>/` containing screenshots, the log tail, and a state dump. The entire `runtime/` tree is gitignored.
+
+### Decision snapshots
+
+For post-mortem debugging of *play* decisions (why did the bot pass, attack, or pick that target?), the bot records one structured snapshot per decision under `runtime/debug/matches/<utc>_<matchId>/`:
+
+- `snapshots.jsonl` — one JSON record per decision: turn/phase, both life totals, your and the opponent's permanents (name + power/toughness + tapped/attacking), your hand, the stack, the available actions, and the move the bot chose (`"exception"` if the decision crashed).
+- `board.txt` — the same records rendered human-readable, one block per decision.
+- `match.json` — per-match header/footer with the result and any card IDs that couldn't be resolved to names offline.
+
+Card names are resolved from the local card database only (no network calls on the decision path), so this never delays in-game actions. Recording is on by default and writes only per decision (a few dozen small records per match); disable it with `MTGA_DEBUG_SNAPSHOTS=0`, or add the full raw game-state dump to each record with `MTGA_DEBUG_FULL_STATE=1`. Old match directories are pruned automatically (newest 30 kept).
 
 ## See also on
 [elitepvpers](https://www.elitepvpers.com/)

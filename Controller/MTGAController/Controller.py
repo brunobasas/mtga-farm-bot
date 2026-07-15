@@ -4443,6 +4443,15 @@ class Controller(ControllerSecondary):
     def get_game_state(self) -> 'GameStateSecondary':
         return self.updated_game_state
 
+    def get_system_seat_id(self):
+        """Local player's systemSeatId (None until derived from the log)."""
+        return self.__system_seat_id
+
+    def get_current_match_id(self):
+        """Last seen matchId (None until a match is joined). Used by the debug
+        snapshot recorder to rotate per-match output directories."""
+        return self.__last_seen_match_id
+
     def keep(self, keep: bool):
         if keep:
             used_raw = self.mulligan_keep_coors

@@ -7,6 +7,7 @@ import os
 import traceback
 import threading
 import bot_logger
+import debug_recorder
 import runtime_status
 
 
@@ -34,6 +35,10 @@ class Game:
     def start(self):
         self._debug("Game.start() called")
         self._stop_requested = False
+        try:
+            debug_recorder.start_session()
+        except Exception as e:
+            self._debug(f"Decision recorder start failed: {e}")
         runtime_status.set_mode("starting")
         self._refresh_card_data()
         # Eagerly load the curated Starter Deck Duel card DB (oracle text, types,
@@ -72,6 +77,11 @@ class Game:
             self._debug("Match ended but stop requested - not restarting")
             return
         runtime_status.set_mode("match_end")
+        try:
+            result = None if won is None else ("win" if won else "loss")
+            debug_recorder.end_match(result)
+        except Exception as e:
+            self._debug(f"Decision recorder end_match failed: {e}")
         self._debug("Match ended - scheduling restart in 10 seconds")
         # Stop inactivity timer since match ended
         if hasattr(self.controller, 'stop_inactivity_timer'):
@@ -147,11 +157,38 @@ class Game:
         self.game_started = True  # Mark game as started after mulligan
         keep = self.ai.generate_keep(card_list)
         bot_logger.log_mulligan_decision(keep, len(card_list))
+        try:
+            debug_recorder.record(
+                self.controller.get_game_state(),
+                self._recorder_seat(),
+                self._recorder_match_id(),
+                "mulligan",
+                "keep" if keep else "mulligan",
+                {"card_count": len(card_list)},
+            )
+        except Exception as e:
+            self._debug(f"Decision recorder (mulligan) failed: {e}")
         self.controller.keep(keep)
 
     def _debug(self, message):
         """Debug log - detailed technical information"""
         bot_logger.log_info(message)
+
+    def _recorder_seat(self):
+        try:
+            if hasattr(self.controller, "get_system_seat_id"):
+                return self.controller.get_system_seat_id()
+        except Exception:
+            pass
+        return None
+
+    def _recorder_match_id(self):
+        try:
+            if hasattr(self.controller, "get_current_match_id"):
+                return self.controller.get_current_match_id()
+        except Exception:
+            pass
+        return None
 
     def _refresh_card_data(self):
         """Refresh cards.json from local MTGA data (Linux/macOS/Windows Steam paths)."""
@@ -296,6 +333,9 @@ class Game:
         if hasattr(self.controller, 'reset_inactivity_timer'):
             self.controller.reset_inactivity_timer()
 
+        # Initialized before the try so the except handler can still record the
+        # snapshot when generate_move() itself throws (the most valuable case).
+        snapshot_handle = None
         try:
             self._debug("=" * 50)
             self._debug("decision_method called")
@@ -374,6 +414,16 @@ class Game:
                 self._debug(f"ERROR getting actions: {e}")
                 action_list = []
 
+            # Snapshot the exact state the AI is about to reason over, so the
+            # recorded board matches the move decided below (capture only deep-
+            # copies a pruned subset; no I/O on this thread).
+            try:
+                snapshot_handle = debug_recorder.capture(
+                    current_game_state, self._recorder_seat(), self._recorder_match_id(), "main"
+                )
+            except Exception as e:
+                self._debug(f"Decision recorder capture failed: {e}")
+
             # Generate move
             self._debug("Calling AI.generate_move()")
             move = self.ai.generate_move(current_game_state, self.controller.get_inst_id_grp_id_dict())
@@ -381,6 +431,10 @@ class Game:
 
             if not move:
                 self._debug("ERROR: AI returned empty move!")
+                try:
+                    debug_recorder.attach_move(snapshot_handle, None, None)
+                except Exception:
+                    pass
                 return
 
             move_name = list(move.keys())[0]
@@ -396,6 +450,11 @@ class Game:
                 },
             )
             bot_logger.log_decision(move_name, move.get(move_name))
+            try:
+                debug_recorder.attach_move(snapshot_handle, move_name, move.get(move_name))
+                snapshot_handle = None  # attached; don't let the except re-record it
+            except Exception:
+                pass
             self._debug(f"Executing move: {move_name}")
 
             # Execute move
@@ -449,6 +508,12 @@ class Game:
         except Exception as e:
             self._debug(f"CRITICAL ERROR in decision_method: {e}")
             self._debug(traceback.format_exc())
+            # Preserve the snapshot that led to the crash (only if not yet
+            # attached above) -- the crash case is the most useful to debug.
+            try:
+                debug_recorder.attach_move(snapshot_handle, "exception", str(e))
+            except Exception:
+                pass
         finally:
             if delay_wait_active:
                 runtime_status.clear_intentional_wait()
