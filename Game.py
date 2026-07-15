@@ -23,6 +23,10 @@ class Game:
         self._stop_requested = False
         self._timers: list[threading.Timer] = []
         self._last_action_delay_turn = -1
+        # Epoch when the current match actually started (first mulligan / inferred
+        # live state). Used only to report match duration in the [MATCH_END]
+        # marker; None until a game is under way.
+        self._match_started_ts: float | None = None
         # Optional callback (no args -> path string or "") the UI can supply to
         # ask the user to locate their MTGA install when auto-detection in
         # _refresh_card_data() fails. Without card data the bot has no removal/
@@ -90,6 +94,23 @@ class Game:
             self._debug("Match ended but stop requested - not restarting")
             return
         runtime_status.set_mode("match_end")
+        # Emit one structured match-end marker (result/turns/duration) for the
+        # session watchdog to turn into a per-match record. Never let recording
+        # failures touch the restart path.
+        try:
+            if won is True:
+                result = "won"
+            elif won is False:
+                result = "lost"
+            else:
+                result = "unknown"
+            if self._match_started_ts:
+                duration_sec = max(0.0, time.time() - self._match_started_ts)
+            else:
+                duration_sec = 0.0
+            bot_logger.log_match_end(result, self.last_logged_turn, duration_sec)
+        except Exception as e:
+            self._debug(f"Match-end marker failed: {e}")
         self._debug("Match ended - scheduling restart in 10 seconds")
         # Stop inactivity timer since match ended
         if hasattr(self.controller, 'stop_inactivity_timer'):
@@ -111,6 +132,7 @@ class Game:
         self.game_started = False
         self.starting_hand_logged = False
         self._last_action_delay_turn = -1
+        self._match_started_ts = None
 
         # Reset AI state
         if hasattr(self.ai, 'reset'):
@@ -169,6 +191,8 @@ class Game:
             return
         self._debug(f"Mulligan decision called with {len(card_list)} cards")
         runtime_status.set_mode("in_game")
+        if not self.game_started:
+            self._match_started_ts = time.time()
         self.game_started = True  # Mark game as started after mulligan
         keep = self.ai.generate_keep(card_list)
         bot_logger.log_mulligan_decision(keep, len(card_list))
@@ -319,6 +343,8 @@ class Game:
             if not (has_live_priority and has_playable_state):
                 return False
 
+            if not self.game_started:
+                self._match_started_ts = time.time()
             self.game_started = True
             if turn_num > 1:
                 self.starting_hand_logged = True
