@@ -120,10 +120,12 @@ def _pid_alive(pid: int) -> bool:
 
 class _Thresholds:
     """Minimal stand-in for the supervisor argparse namespace that
-    detect_stuck_reason reads (kept in sync with the supervisor defaults)."""
+    detect_stuck_reason reads. Values mirror tools/bot_supervisor.py argparse
+    defaults (--my-timer-critical-threshold, --my-timer-stall-sec) so "stalled"
+    means exactly the same thing here as in the supervisor."""
 
-    my_timer_critical_threshold = 2
-    my_timer_stall_sec = 20.0
+    my_timer_critical_threshold = 1
+    my_timer_stall_sec = 45.0
 
 
 def _analysis_dir() -> Path:
@@ -132,6 +134,11 @@ def _analysis_dir() -> Path:
 
 def _state_path() -> Path:
     return _analysis_dir() / "watchdog_state.json"
+
+
+def _stop_request_path() -> Path:
+    # The UI drops this file on Stop Bot to ask for a graceful final flush + exit.
+    return _analysis_dir() / "watchdog.stop"
 
 
 def _history_path() -> Path:
@@ -306,7 +313,10 @@ def _consume_bot_log(state: dict, session_id: str, status: dict) -> None:
         return
     if size < offset:
         # bot.log was truncated (bot restarted): start over and mark the seam.
+        # Persist the reset immediately so an early return below (no complete line
+        # yet) does not re-detect the truncation and re-append the seam each poll.
         offset = 0
+        state["offset"] = 0
         _append_text(
             _history_path(),
             f"\n[{_timestamp()}] === session_watchdog: bot.log restart detected ===\n",
@@ -337,7 +347,10 @@ def _write_incident_bundle(state: dict, status: dict, reason: str) -> None:
     incident_dir = Path(ensure_debug_dir(f"incident-{stamp}"))
     playerlog = resolve_playerlog_path(status)
     player_tail = read_tail(playerlog, max_bytes=160000)
-    derived_state = get_state_from_playerlog(player_tail)
+    try:
+        derived_state = get_state_from_playerlog(player_tail)
+    except Exception:
+        derived_state = None
     payload = {
         "reason": reason,
         "created_at": stamp,
@@ -404,29 +417,37 @@ def _check_stall(state: dict, status: dict, thresholds: _Thresholds) -> None:
     _write_incident_bundle(state, status, reason)
 
 
-def run_once(state: dict, thresholds: _Thresholds) -> bool:
-    """Process one poll. Returns False when the watchdog should exit (the bot
-    process it was observing has gone away)."""
+def run_once(state: dict, thresholds: _Thresholds, parent_pid: int = 0) -> bool:
+    """Process one poll. Returns False when the watchdog should exit (the process
+    it was observing has gone away)."""
     status = read_status()
     session_id = str(status.get("session_id") or "")
     stored_session = str(state.get("session_id") or "")
     if session_id and session_id != stored_session:
-        # New bot process: fresh per-match accumulators and a new records folder,
-        # but keep the history/alert offsets so we don't reprocess.
+        # New bot process: fresh per-match accumulators and a new records folder.
+        # bot.log is truncated on restart, so re-read it from the start too --
+        # a stale offset from the previous session would skip into a new file.
         state["session_id"] = session_id
         state["match"] = _default_match_state()
+        state["offset"] = 0
     _consume_bot_log(state, session_id, status)
     _check_stall(state, status, thresholds)
 
-    # Self-terminate safety net: if we ever saw the bot process and it has since
-    # died (e.g. the UI was closed with the window X instead of Stop), exit so we
-    # don't linger. Only trips once a pid has actually been observed.
-    pid = int(status.get("pid") or 0)
-    if pid:
-        state["seen_pid"] = pid
-    seen_pid = int(state.get("seen_pid") or 0)
-    if seen_pid and not _pid_alive(seen_pid):
-        print(f"[session_watchdog] bot process {seen_pid} gone; exiting.")
+    # Self-terminate safety net. Prefer the launching UI pid passed on the command
+    # line: it is stable and immune to a stale status.json left by a previous
+    # session (which could otherwise make us adopt a dead pid and exit at once).
+    # Only fall back to the bot pid in status.json when we weren't told a parent.
+    watch_pid = int(parent_pid or 0)
+    if not watch_pid:
+        try:
+            pid = int(status.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid:
+            state["seen_pid"] = pid
+        watch_pid = int(state.get("seen_pid") or 0)
+    if watch_pid and not _pid_alive(watch_pid):
+        print(f"[session_watchdog] watched process {watch_pid} gone; exiting.")
         return False
     return True
 
@@ -435,25 +456,54 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Read-only MTGA bot session watchdog.")
     parser.add_argument("--poll-sec", type=float, default=2.0, help="Polling interval in seconds.")
     parser.add_argument("--once", action="store_true", help="Run a single pass then exit.")
+    parser.add_argument(
+        "--parent-pid", type=int, default=0,
+        help="PID of the launching UI; the watchdog exits when that process dies.",
+    )
     args = parser.parse_args()
 
     thresholds = _Thresholds()
     state = _load_state()
+    parent_pid = int(args.parent_pid or 0)
     # Ensure the analysis dir and files exist so first-run reads never fail.
     _analysis_dir()
+    # Drop any stale stop request from a previous session so we don't exit at once.
+    try:
+        _stop_request_path().unlink()
+    except OSError:
+        pass
     print(f"[session_watchdog] observing bot.log; artifacts under {runtime_file('analysis')}")
 
     if args.once:
-        run_once(state, thresholds)
+        run_once(state, thresholds, parent_pid)
         _save_state(state)
         return 0
 
     poll = max(0.5, float(args.poll_sec))
     try:
         while True:
-            keep_going = run_once(state, thresholds)
+            # One bad poll must never end an unattended session's monitoring.
+            try:
+                keep_going = run_once(state, thresholds, parent_pid)
+            except Exception as exc:
+                print(f"[session_watchdog] poll error: {exc}")
+                keep_going = True
             _save_state(state)
             if not keep_going:
+                break
+            # Graceful stop: the UI drops a sentinel on Stop Bot. Do one final pass
+            # to flush the last match's log lines, then exit cleanly.
+            if _stop_request_path().is_file():
+                try:
+                    run_once(state, thresholds, parent_pid)
+                except Exception:
+                    pass
+                _save_state(state)
+                try:
+                    _stop_request_path().unlink()
+                except OSError:
+                    pass
+                print("[session_watchdog] stop requested; final flush done.")
                 break
             time.sleep(poll)
     except KeyboardInterrupt:

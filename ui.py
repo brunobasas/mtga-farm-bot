@@ -3863,15 +3863,24 @@ class MTGBotUI(tk.Tk):
         try:
             import subprocess
 
+            if getattr(sys, "frozen", False):
+                # In a packaged .exe `python -m tools.session_watchdog` is not
+                # available and sys.executable is the app itself -- launching it
+                # would spawn a second UI instance, not the watchdog. No-op here.
+                return
             if self._watchdog_proc is not None and self._watchdog_proc.poll() is None:
                 return  # already running
             creationflags = 0
             if os.name == "nt":
                 creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             self._watchdog_proc = subprocess.Popen(
-                [sys.executable, "-m", "tools.session_watchdog"],
+                [sys.executable, "-m", "tools.session_watchdog",
+                 "--parent-pid", str(os.getpid())],
                 cwd=os.path.dirname(os.path.abspath(__file__)),
                 creationflags=creationflags,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
         except Exception as exc:
             self._watchdog_proc = None
@@ -3889,11 +3898,22 @@ class MTGBotUI(tk.Tk):
             return
         try:
             if proc.poll() is None:
-                proc.terminate()
+                # Ask for a graceful final flush first (so the last match's log
+                # lines are consumed and recorded); only hard-kill if it does not
+                # exit promptly. The UI stays alive on Stop, so the watchdog's
+                # parent-pid exit path does not apply here -- hence the sentinel.
                 try:
-                    proc.wait(timeout=5)
+                    runtime_file("analysis", "watchdog.stop").write_text("stop", encoding="utf-8")
                 except Exception:
-                    proc.kill()
+                    pass
+                try:
+                    proc.wait(timeout=4)
+                except Exception:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except Exception:
+                        proc.kill()
         except Exception:
             pass
 

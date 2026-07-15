@@ -90,13 +90,10 @@ class Game:
             debug_recorder.end_match(result)
         except Exception as e:
             self._debug(f"Decision recorder end_match failed: {e}")
-        if self._stop_requested:
-            self._debug("Match ended but stop requested - not restarting")
-            return
-        runtime_status.set_mode("match_end")
         # Emit one structured match-end marker (result/turns/duration) for the
-        # session watchdog to turn into a per-match record. Never let recording
-        # failures touch the restart path.
+        # session watchdog to turn into a per-match record. Done before the
+        # stop-requested check so the final match of a session is still recorded.
+        # Never let recording failures touch the restart path.
         try:
             if won is True:
                 result = "won"
@@ -111,6 +108,10 @@ class Game:
             bot_logger.log_match_end(result, self.last_logged_turn, duration_sec)
         except Exception as e:
             self._debug(f"Match-end marker failed: {e}")
+        if self._stop_requested:
+            self._debug("Match ended but stop requested - not restarting")
+            return
+        runtime_status.set_mode("match_end")
         self._debug("Match ended - scheduling restart in 10 seconds")
         # Stop inactivity timer since match ended
         if hasattr(self.controller, 'stop_inactivity_timer'):
