@@ -22,6 +22,7 @@ from state.state_machine import BotState, PlayerLogStateTracker, get_state_from_
 from vision.vision import VisionEngine
 from vision.window_locator import ArenaRegionProvider, focus_mtga_window
 import bot_logger
+import debug_recorder
 import runtime_status
 from runtime_paths import runtime_file
 
@@ -4452,6 +4453,27 @@ class Controller(ControllerSecondary):
         snapshot recorder to rotate per-match output directories."""
         return self.__last_seen_match_id
 
+    def __record_decision(self, decision_kind, move_name, move_data, extra=None) -> None:
+        """Record a debug snapshot of the live game state for a prompt-handler
+        decision (target selection, blockers, pay-costs, ...). Runs on the
+        LogReader thread where updated_game_state is mutated, so the state read
+        is inherently consistent. Never raises into the caller."""
+        try:
+            debug_recorder.record(
+                self.updated_game_state,
+                self.__system_seat_id,
+                self.__last_seen_match_id,
+                decision_kind,
+                move_name,
+                move_data,
+                extra=extra,
+            )
+        except Exception as e:
+            try:
+                bot_logger.log_error(f"__record_decision({decision_kind}) failed: {e}")
+            except Exception:
+                pass
+
     def keep(self, keep: bool):
         if keep:
             used_raw = self.mulligan_keep_coors
@@ -6226,6 +6248,9 @@ class Controller(ControllerSecondary):
                 f"MODAL_CHOICE: {n} option(s) (source={source_id}) -> clicking bottom "
                 f"(lose life) at base={base_point}"
             )
+            self.__record_decision(
+                "modal", "choose_last", {"n_options": n, "source": source_id}
+            )
 
             def _modal_still_open() -> bool:
                 # Resolved if the turn state moved on from the modal's step.
@@ -6301,6 +6326,7 @@ class Controller(ControllerSecondary):
                 # decisions until the scry resolves.
                 self.__group_req_active_until = now + 6.0
                 bot_logger.log_info(f"GROUP_REQ ({context}): clicking Done (no reordering).")
+                self.__record_decision("group", "done", {"context": context})
 
                 def _click_done() -> None:
                     try:
@@ -6428,6 +6454,10 @@ class Controller(ControllerSecondary):
                     )
                     continue
 
+                self.__record_decision(
+                    "select_n", "select_n",
+                    {"offered_ids": sorted(ids), "min_sel": min_sel},
+                )
                 context = req.get("context")
                 option_context = req.get("optionContext")
                 discard_context = False
@@ -6967,6 +6997,10 @@ class Controller(ControllerSecondary):
                 bot_logger.log_info(
                     f"PayCostsReq paying via {click_kind}: {chosen_ids} (need {need} of {ids})"
                 )
+                self.__record_decision(
+                    "pay_costs", "pay",
+                    {"chosen": list(chosen_ids), "kind": click_kind, "need": need, "offered": list(ids)},
+                )
 
                 def _do_cost_selection(card_ids: list[int], kind: str) -> None:
                     try:
@@ -7102,6 +7136,10 @@ class Controller(ControllerSecondary):
                 "CASTING_TIME_OPTIONS detected: options=[{}] — choosing {}.".format(
                     "; ".join(option_summaries) or "unparsed", choice_desc
                 )
+            )
+            self.__record_decision(
+                "casting_option", label,
+                {"choice": choice_desc, "options": list(option_summaries)},
             )
 
             # Snapshot the turn state so retries stop once the dialog resolves --
@@ -7872,6 +7910,10 @@ class Controller(ControllerSecondary):
         selection_token = (self.__pending_target_select or {}).get("token")
         side = "friendly" if friendly else "enemy"
         bot_logger.log_info(f"{reason}: targeting {side} creature instanceId={creature_id}")
+        self.__record_decision(
+            "select_target", "target_creature",
+            {"target": creature_id, "side": side, "source": source_id, "reason": reason},
+        )
 
         def _valid() -> bool:
             if self._suppress_selections or self._stop_requested:
@@ -7994,6 +8036,10 @@ class Controller(ControllerSecondary):
         bot_logger.log_info(
             f"FIGHT target flow: our creature {our_id} then enemy creature {enemy_id}."
         )
+        self.__record_decision(
+            "select_target", "fight",
+            {"our": our_id, "enemy": enemy_id, "source": source_id},
+        )
 
         def _flow() -> None:
             if self._suppress_selections or self._stop_requested:
@@ -8106,6 +8152,10 @@ class Controller(ControllerSecondary):
         self.__last_target_select_ts = now
         where = "stack" if is_stack_target else "overlay"
         bot_logger.log_info(f"{reason}: choosing card instanceId={target_id} from {where}")
+        self.__record_decision(
+            "select_target", "target_chooser",
+            {"target": target_id, "where": where, "source": source_id, "reason": reason},
+        )
 
         def _do(attempt: int = 0) -> None:
             if self._suppress_selections or self._stop_requested:
@@ -8232,6 +8282,10 @@ class Controller(ControllerSecondary):
         self.__update_pending_target_select(source_id)
         selection_token = (self.__pending_target_select or {}).get("token")
         bot_logger.log_info(f"{reason}: targeting opponent avatar")
+        self.__record_decision(
+            "select_target", "target_face",
+            {"source": source_id, "reason": reason},
+        )
 
         def _target_selection_still_valid() -> bool:
             if self._suppress_selections or self._stop_requested:
@@ -8690,6 +8744,7 @@ class Controller(ControllerSecondary):
                 return
             self.__last_declare_blockers_ts = now
             bot_logger.log_info("DeclareBlockersReq: declaring NO blocks (no blocking logic yet).")
+            self.__record_decision("blockers", "no_blocks", None)
 
             def _click_no_blocks() -> None:
                 try:
@@ -8799,6 +8854,13 @@ class Controller(ControllerSecondary):
                 )
                 self.__preempt_stack_select_n_for_combat(
                     "DeclareAttackersReq: preempted stale stack SelectN prompt."
+                )
+                self.__record_decision(
+                    "attackers", "declare_attackers_recovery",
+                    {
+                        "attacker_ids": list(self.__attack_target_attacker_ids),
+                        "target_required": self.__attack_target_required,
+                    },
                 )
                 self.__arm_combat_recovery(recovery_key, delay=1.0)
                 return
