@@ -11,7 +11,11 @@ Fed from ``bot_logger.log_click`` (the one call that runs immediately before
 every physical click on both click paths), so there is a single hook point and
 no new chokepoint. I/O runs on a daemon writer thread; the click path never
 waits on disk. Correlate a click back to the decision that caused it via the
-``decision_seq`` field (the DecisionRecorder's last sequence number).
+``decision_seq`` field (the DecisionRecorder's last sequence number). This is a
+best-effort join key: on the main decision path it is exact (the seq is assigned
+before the move executes), but clicks fired later from threading.Timer callbacks
+(inactivity-resolve, combat recovery) or the select_n path may carry a
+neighbouring seq -- use it together with the timestamps, not as a hard link.
 
 Env: ``MTGA_DEBUG_CLICKS=0`` disables it (default: on).
 """
@@ -76,9 +80,7 @@ class ClickRecorder:
                 except Exception:
                     decision_seq = None
             if risky is None:
-                risky = bool(source and str(source).startswith("absolute")) or (
-                    region_age is not None and region_age > 10.0
-                )
+                risky = bot_logger.click_is_risky(source, region_age)
             record = {
                 "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                 "purpose": purpose,

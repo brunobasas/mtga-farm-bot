@@ -38,9 +38,12 @@ class Game:
         self._stop_requested = False
         try:
             debug_recorder.start_session()
-            click_recorder.start_session()
         except Exception as e:
             self._debug(f"Decision recorder start failed: {e}")
+        try:
+            click_recorder.start_session()
+        except Exception as e:
+            self._debug(f"Click recorder start failed: {e}")
         runtime_status.set_mode("starting")
         self._refresh_card_data()
         # Eagerly load the curated Starter Deck Duel card DB (oracle text, types,

@@ -273,6 +273,15 @@ def log_error(message: str):
         _write_lines('a', [f"[{_timestamp()}] [ERROR] {message}\n"])
 
 
+def click_is_risky(source=None, region_age=None) -> bool:
+    """A click is 'risky' when the arena window was lost (absolute desktop
+    fallback) or the window fix is stale. Shared by log_click and click_recorder
+    so the flag stays consistent."""
+    return bool(source and str(source).startswith("absolute")) or (
+        region_age is not None and region_age > 10.0
+    )
+
+
 def log_click(x: int, y: int, purpose: str, *, source=None, region_age=None, arena=None):
     """Log mouse click with absolute coordinates and purpose.
 
@@ -284,9 +293,7 @@ def log_click(x: int, y: int, purpose: str, *, source=None, region_age=None, are
       arena       -- the current arena_region tuple (or None if lost).
     When provided, the context is appended to the [CLICK] line and the click is
     also forwarded to click_recorder for the always-on clicks.jsonl."""
-    risky = bool(source and str(source).startswith("absolute")) or (
-        region_age is not None and region_age > 10.0
-    )
+    risky = click_is_risky(source, region_age)
     extra = ""
     if source is not None or region_age is not None:
         age_str = f"{region_age:.1f}s" if region_age is not None else "?"

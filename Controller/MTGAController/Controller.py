@@ -894,9 +894,14 @@ class Controller(ControllerSecondary):
                 f"Arena region unavailable during {context}; cached arena_region={cached} age={age:.1f}s not reused."
             )
 
-    def _region_age(self) -> float:
-        """Seconds since the arena window was last successfully located."""
-        return max(0.0, time.time() - float(self._last_good_arena_region_ts or 0.0))
+    def _region_age(self) -> float | None:
+        """Seconds since the arena window was last successfully located, or None
+        if it has never been located yet (avoids flagging early menu/login
+        clicks as RISKY with an absurd age from the epoch-0 default)."""
+        ts = float(self._last_good_arena_region_ts or 0.0)
+        if ts <= 0.0:
+            return None
+        return max(0.0, time.time() - ts)
 
     def _click_abs(self, x: int, y: int, tag: str, *, source: str | None = None) -> None:
         bot_logger.log_click(
