@@ -91,7 +91,14 @@ class Controller(ControllerSecondary):
         self.__inactivity_timeout = 180  # 3 minutes in seconds
         self.__has_mulled_keep = False
         self.__intro_delay = 15
-        self.__decision_delay = 4
+        # Per-decision "settle" delay on OUR turn. Was 4s since the initial commit,
+        # which stacks across a multi-play turn (~20-30s) and repeatedly drives the
+        # inactivity rope critical -> the bot looks stuck "burning ropes" even though
+        # it is progressing. The opponent turn was already cut to 0.8s for the same
+        # reason (see __get_effective_decision_delay); 2s keeps our turn deliberate
+        # while staying comfortably ahead of the rope. The low-rope clamp there still
+        # accelerates further on heavy turns.
+        self.__decision_delay = 2
         self.screen_bounds = screen_bounds
         self.patterns = {
             'game_state': '"type": "GREMessageType_GameStateMessage"',
@@ -7703,6 +7710,15 @@ class Controller(ControllerSecondary):
                 f"Decision delay bypassed: inactivity rope remaining={lowest_remaining:.1f}s"
             )
             return 0.0
+        if lowest_remaining <= 20.0:
+            # Rope getting low: race to clear the turn (mirror the opponent-turn
+            # cap) instead of only accelerating in the final seconds. Prevents the
+            # sawtooth where a heavy turn burns the rope down every time before the
+            # <=6s bypass kicks in.
+            bot_logger.log_info(
+                f"Decision delay reduced: inactivity rope low (remaining={lowest_remaining:.1f}s)"
+            )
+            return min(delay, 0.8)
         safe_delay = max(0.0, lowest_remaining - 2.5)
         if safe_delay < delay:
             bot_logger.log_info(
