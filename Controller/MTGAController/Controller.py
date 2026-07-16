@@ -340,12 +340,6 @@ class Controller(ControllerSecondary):
         self.__select_n_stack_wait_timeout_sec = 8.0
         self.__target_submit_cooldown_sec = 1.0
         self.__pending_pay_costs_ts = 0.0
-        # Safety net for a pay-costs prompt the bot cannot satisfy (e.g. it tried
-        # to cast a spell without the mana): if the game state has not advanced a
-        # few seconds after such a prompt, ESC-cancel the pending cast so the bot
-        # keeps playing instead of idling on the payment screen until the rope.
-        self.__pay_costs_cancel_timer = None
-        self.__last_pay_costs_cancel_ts = 0.0
         self.__last_casting_time_options_ts = 0.0
         self.__last_modal_choice_ts = 0.0
         self.__last_group_req_ts = 0.0
@@ -5147,9 +5141,6 @@ class Controller(ControllerSecondary):
         if self.__group_resume_timer is not None:
             self.__group_resume_timer.cancel()
             self.__group_resume_timer = None
-        if self.__pay_costs_cancel_timer is not None:
-            self.__pay_costs_cancel_timer.cancel()
-            self.__pay_costs_cancel_timer = None
         if self.__mulligan_execution_thread is not None:
             self.__mulligan_execution_thread.cancel()
             self.__mulligan_execution_thread = None
@@ -5189,9 +5180,6 @@ class Controller(ControllerSecondary):
         if self.__group_resume_timer is not None:
             self.__group_resume_timer.cancel()
             self.__group_resume_timer = None
-        if self.__pay_costs_cancel_timer is not None:
-            self.__pay_costs_cancel_timer.cancel()
-            self.__pay_costs_cancel_timer = None
         if self.__mulligan_execution_thread is not None:
             self.__mulligan_execution_thread.cancel()
             self.__mulligan_execution_thread = None
@@ -7179,15 +7167,14 @@ class Controller(ControllerSecondary):
                 break
 
             if not handled_selection:
-                # No card/permanent to choose. Two cases reach here: (a) legit --
-                # MTGA already has the mana and just needs a confirm (auto-submit
-                # resolves it in <1s and the game state advances), or (b) stuck --
-                # the bot tried to cast something it cannot pay for, so no click
-                # can satisfy the cost and it would idle on the payment screen
-                # until the rope. Try the confirm first; if the game state has NOT
-                # progressed a few seconds later, ESC-cancel the cast.
+                # No card/permanent to choose -- just confirm. NOTE: do NOT try to
+                # ESC out of a stuck pay-costs prompt here: in MTGA, Escape opens
+                # the OPTIONS menu (that is exactly how the account-switch logout
+                # reaches it), it does not cancel the pending cast. Doing so left
+                # the options overlay covering the board and the bot clicking
+                # blindly behind it. A real cancel needs the on-screen Cancel
+                # button (no template for it yet).
                 threading.Timer(0.6, lambda: self.submit_selection(reason="pay_costs_auto_submit", force=True)).start()
-                self.__arm_pay_costs_cancel()
         except Exception as e:
             bot_logger.log_error(f"Failed to handle PayCostsReq: {e}")
             threading.Timer(0.6, lambda: self.submit_selection(reason="pay_costs_error_fallback", force=True)).start()
@@ -7211,51 +7198,6 @@ class Controller(ControllerSecondary):
             return True
         finally:
             self.__decision_exec_lock.release()
-
-    def __current_game_state_id(self) -> int:
-        try:
-            return int((self.updated_game_state.get_full_state() or {}).get("gameStateId") or 0)
-        except Exception:
-            return 0
-
-    def __arm_pay_costs_cancel(self) -> None:
-        """Arm the ESC-cancel safety net for an unsatisfiable pay-costs prompt."""
-        gsid = self.__current_game_state_id()
-        try:
-            if self.__pay_costs_cancel_timer is not None:
-                self.__pay_costs_cancel_timer.cancel()
-        except Exception:
-            pass
-        self.__pay_costs_cancel_timer = threading.Timer(
-            5.0, lambda: self.__cancel_stuck_pay_costs(gsid)
-        )
-        self.__pay_costs_cancel_timer.daemon = True
-        self.__pay_costs_cancel_timer.start()
-
-    def __cancel_stuck_pay_costs(self, gsid_at_arm: int) -> None:
-        self.__pay_costs_cancel_timer = None
-        if self._stop_requested or self._suppress_selections:
-            return
-        # Only cancel if the game barely moved since the prompt (still stuck). A
-        # resolved cast advances the gameStateId by several diffs; a fresh game
-        # resets it lower (negative delta) -- neither should trigger a cancel.
-        delta = self.__current_game_state_id() - int(gsid_at_arm or 0)
-        if not (0 <= delta <= 3):
-            return
-        if time.time() - self.__last_pay_costs_cancel_ts < 5.0:
-            return  # debounce ESC
-        self.__last_pay_costs_cancel_ts = time.time()
-        try:
-            if focus_mtga_window():
-                time.sleep(0.2)
-            bot_logger.log_info(
-                "PAY_COSTS_CANCEL: pay-costs prompt stuck (game state did not advance); "
-                "sending ESC to cancel the cast."
-            )
-            self.input.tap_escape()
-            self.__pending_pay_costs_ts = 0.0
-        except Exception as e:
-            bot_logger.log_error(f"PAY_COSTS_CANCEL failed: {e}")
 
     # Modal "Choose one" spells whose SECOND (right) plate is the mode we want.
     # Valorous Stance (all printings): always take "Destroy target creature with
