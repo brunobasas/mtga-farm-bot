@@ -340,6 +340,22 @@ class Controller(ControllerSecondary):
         self.__select_n_stack_wait_timeout_sec = 8.0
         self.__target_submit_cooldown_sec = 1.0
         self.__pending_pay_costs_ts = 0.0
+        # Stack-deferral watchdog. The "Deferring decision: stack has N object(s)"
+        # gate had no escape hatch: it re-deferred on every message, so a stack that
+        # never resolved idled the bot into the rope (observed: 34s frozen on turn 16
+        # before the operator stopped it). Same family as the scry/modal gates.
+        self.__stack_defer_since = 0.0
+        self.__stack_defer_warned = False
+        self.__stack_defer_timeout_sec = 15.0
+        # Global decision heartbeat -- the catch-all for "the bot idled into the
+        # rope". Every gate that pauses a decision (scry/group, modal, stack,
+        # pay-costs, a failed cast) cancels the armed decision and returns; the loop
+        # is edge-triggered on GameStateMessages, so if MTGA sends none for the
+        # unchanged priority window nothing re-arms it. Each of those was patched
+        # individually -- this is the net for the ones we have not found yet.
+        self.__decision_heartbeat_timer = None
+        self.__decision_heartbeat_idle_sec = 8.0
+        self.__last_decision_ts = 0.0
         self.__last_casting_time_options_ts = 0.0
         self.__last_modal_choice_ts = 0.0
         self.__last_group_req_ts = 0.0
@@ -1320,6 +1336,47 @@ class Controller(ControllerSecondary):
         except Exception:
             pass
         bot_logger.log_error(f"Hand overlay debug bundle saved: {debug_dir}")
+
+    # "Are You Sure?" confirm plates, measured from runtime/debug/are_you_sure.png
+    # (1922x1112 capture -> game frame = px - (1, 31)). The dialog is centred, so
+    # both plates sit symmetrically around x=960 at the same height.
+    _ARE_YOU_SURE_YES_BASE = (786, 629)
+    _ARE_YOU_SURE_NO_BASE = (1136, 629)
+
+    def _dismiss_are_you_sure_if_present(self, *, context: str) -> bool:
+        """Answer MTGA's client-side "Are You Sure?" confirm, returning True if one
+        was dismissed.
+
+        This dialog emits NO GRE message, so it is invisible in Player.log -- the
+        bot could only sit in front of it until the rope (the self-buff comments in
+        RemovalLogic already noted the bot "cannot answer" it). It pops when we are
+        about to do something questionable, e.g. "Do you want to target Arahbo, the
+        First Fang with Bulk Up?" -- doubling the OPPONENT's power.
+
+        We answer NO: it cancels the questionable action and lets the decision loop
+        pick again, so we can never confirm a bad play we did not understand. The
+        real cure is never raising it (see SELF_BUFF_GRPIDS); this is the net.
+        NOTE: a ward confirm ("pay the ward?") would also get a No here, which just
+        declines the removal -- revisit if that case ever shows up in a log.
+        """
+        tpl = os.path.join(self._buttons_dir(), "are_you_sure.png")
+        if not os.path.exists(tpl):
+            return False
+        # Title band only: the question text underneath changes per card.
+        if self._locate_image_center_in_scaled_arena_region(
+            tpl, f"ARE_YOU_SURE_PROBE({context})", rel_region=(700, 360, 560, 110),
+            confidence=0.80, timeout=0.6,
+        ) is None:
+            return False
+        target, src = self._map_abs_point_to_arena(
+            self._ARE_YOU_SURE_NO_BASE, label="ARE_YOU_SURE_NO"
+        )
+        bot_logger.log_info(
+            f"{context}: 'Are You Sure?' dialog detected; answering No at {target} ({src})."
+        )
+        self._click_abs(int(target[0]), int(target[1]), "ARE_YOU_SURE_NO")
+        time.sleep(0.6)
+        return True
 
     def _ensure_options_overlay_closed(self, *, context: str, max_attempts: int = 2) -> bool:
         if focus_mtga_window():
@@ -3364,6 +3421,7 @@ class Controller(ControllerSecondary):
 
     def start_game(self) -> None:
         self._stop_requested = False
+        self.__start_decision_heartbeat()
         runtime_status.set_mode(
             "starting",
             bot_state=str(self._get_state_from_log()),
@@ -3515,6 +3573,10 @@ class Controller(ControllerSecondary):
             # sat 36s burning the rope with Valorous Stance stuck in hand at 3
             # life. Focus MTGA first, exactly like the logout ESC path does.
             focus_mtga_window()
+            # An "Are You Sure?" confirm covers the board and swallows every click,
+            # so clear it before sweeping the hand (it emits no log line, so this
+            # visual probe is the only way we can see it at all).
+            self._dismiss_are_you_sure_if_present(context=f"CAST_CARD id={card_id}")
             hand_p1, hand_p2 = self._get_hand_scan_points_mapped(force_reacquire=True)
             # Clear any stale hover events from previous scans
             self.log_reader.clear_new_line_flag(self.patterns['hover_id'])
@@ -7204,6 +7266,132 @@ class Controller(ControllerSecondary):
             bot_logger.log_error(f"Failed to handle PayCostsReq: {e}")
             threading.Timer(0.6, lambda: self.submit_selection(reason="pay_costs_error_fallback", force=True)).start()
 
+    def __start_decision_heartbeat(self) -> None:
+        try:
+            if self.__decision_heartbeat_timer is not None:
+                self.__decision_heartbeat_timer.cancel()
+        except Exception:
+            pass
+        self.__last_decision_ts = time.time()
+        self.__decision_heartbeat_timer = threading.Timer(2.0, self.__decision_heartbeat_tick)
+        self.__decision_heartbeat_timer.daemon = True
+        self.__decision_heartbeat_timer.start()
+
+    def __decision_heartbeat_tick(self) -> None:
+        try:
+            if self._stop_requested:
+                return
+            self.__maybe_wake_stalled_decision()
+        except Exception as e:
+            bot_logger.log_error(f"Decision heartbeat failed: {e}")
+        finally:
+            # Reschedule no matter what, so one bad tick can never kill the net.
+            if not self._stop_requested:
+                self.__decision_heartbeat_timer = threading.Timer(2.0, self.__decision_heartbeat_tick)
+                self.__decision_heartbeat_timer.daemon = True
+                self.__decision_heartbeat_timer.start()
+
+    def __maybe_wake_stalled_decision(self) -> None:
+        """Re-drive a decision that is ours, overdue, and blocked by nothing.
+
+        Deliberately conservative: it acts ONLY when the game says the decision is
+        ours, nothing is armed or executing, and no legitimate wait is in progress.
+        Every one of those conditions clears on its own in normal play, so the only
+        time this fires is when a gate dropped the decision and no fresh
+        GameStateMessage came to re-arm it -- exactly the shape of every stall we
+        have chased (scry, modal, stack, failed cast).
+        """
+        if self._suppress_selections or not self.__has_mulled_keep:
+            return
+        if not self.__last_decision_ts:
+            return  # nothing has happened yet this game
+        my_seat = self.__system_seat_id
+        if my_seat is None:
+            return
+        ti = self.updated_game_state.get_turn_info() or {}
+        if ti.get("decisionPlayer") != my_seat:
+            return  # not ours -> never act on the opponent's turn
+        if not self.updated_game_state.is_complete():
+            return
+        # Already armed or running? Leave it alone.
+        if self.__decision_execution_thread is not None and getattr(
+            self.__decision_execution_thread, "is_alive", lambda: False
+        )():
+            return
+        if self.__decision_exec_lock.locked():
+            return
+        # Legitimate waits -- all of these clear by themselves.
+        if time.time() < self.__group_req_active_until:
+            return
+        if (
+            self.__should_pause_for_targets()
+            or self.__should_pause_for_assign_damage()
+            or self.__should_pause_for_pay_costs()
+        ):
+            return
+        if self.__select_n_in_progress or self.__pending_select_n is not None:
+            return
+        idle_for = time.time() - self.__last_decision_ts
+        if idle_for < self.__decision_heartbeat_idle_sec:
+            return
+        rope = self.__get_running_inactivity_timer_remaining()
+        bot_logger.log_error(
+            f"DECISION_HEARTBEAT: decision is ours and idle {idle_for:.1f}s "
+            f"(turn={ti.get('turnNumber')} {ti.get('phase')}/{ti.get('step')}, rope={rope}); "
+            "re-driving the decision instead of idling into the rope."
+        )
+        self.reset_inactivity_timer()
+        self.__invoke_decision_callback("decision heartbeat")
+
+    def __clear_stack_defer(self, reason: str) -> None:
+        if self.__stack_defer_since:
+            bot_logger.log_info(f"Stack deferral cleared: {reason}.")
+        self.__stack_defer_since = 0.0
+        self.__stack_defer_warned = False
+
+    def __stack_defer_expired(
+        self,
+        *,
+        stack_count: int,
+        pending_count: int,
+        decision_is_ours: bool,
+        turn_info_dict: dict,
+    ) -> bool:
+        """Track how long we have been stuck behind a stack, and say whether we
+        should stop waiting.
+
+        Returns True ONLY when the game says the decision is ours and just a pending
+        message is blocking it: that is the case where waiting forever is pointless
+        and the rope is the only outcome. When the decision belongs to the opponent
+        we must keep waiting -- acting there would click during their turn (and the
+        delayed-decision path would skip it anyway) -- so we only log diagnostics,
+        once, to make the stall reproducible next time.
+        """
+        now = time.time()
+        if not self.__stack_defer_since:
+            self.__stack_defer_since = now
+            return False
+        deferred_for = now - self.__stack_defer_since
+        if deferred_for < self.__stack_defer_timeout_sec:
+            return False
+        if decision_is_ours:
+            bot_logger.log_error(
+                f"STACK_DEFER_TIMEOUT: waited {deferred_for:.1f}s with the decision ours and "
+                f"pendingMessageCount={pending_count}; proceeding instead of idling into the rope."
+            )
+            self.__clear_stack_defer("timed out; proceeding")
+            return True
+        if not self.__stack_defer_warned:
+            self.__stack_defer_warned = True
+            bot_logger.log_error(
+                f"STACK_DEFER_STUCK: {deferred_for:.1f}s deferring on stack={stack_count} "
+                f"pending={pending_count} but decisionPlayer={turn_info_dict.get('decisionPlayer')} "
+                f"!= my_seat={self.__system_seat_id} (turn={turn_info_dict.get('turnNumber')} "
+                f"{turn_info_dict.get('phase')}/{turn_info_dict.get('step')}). Not ours to act on: "
+                "still waiting. If the client is actually prompting US here, this log is the evidence."
+            )
+        return False
+
     def __invoke_decision_callback(self, reason: str) -> bool:
         """Run the AI decision (and its mouse work) under __decision_exec_lock.
 
@@ -7222,6 +7410,9 @@ class Controller(ControllerSecondary):
             self.__decision_callback(self.updated_game_state)
             return True
         finally:
+            # Stamp on completion, so the heartbeat measures idle time since the
+            # decision actually finished (a cast's hand scan runs for seconds).
+            self.__last_decision_ts = time.time()
             self.__decision_exec_lock.release()
 
     # Modal "Choose one" spells whose SECOND (right) plate is the mode we want.
@@ -8452,6 +8643,25 @@ class Controller(ControllerSecondary):
                     )
                     removal_target = replacement
 
+        # The reconciliation above only runs when the prompt offers creatures. When it
+        # offers NONE, a creature target from the profile is stale -- the board changed
+        # between our cast decision and this prompt. Observed: Burst Lightning aimed at
+        # 332 while legalTargets=[1:player, 2:player] and opp_creatures=[]; the bot then
+        # hunted a card that was not there (CREATURE_TARGET click: found=False) and hung
+        # on the prompt. Drop the stale target and let the face path below take it (the
+        # spell still deals its damage) whenever the face is actually legal.
+        if (
+            removal_target is not None
+            and removal_target != RemovalLogic.FACE_TARGET
+            and not legal_creature_ids
+            and face_legal
+        ):
+            bot_logger.log_info(
+                f"{reason}: profile target {removal_target} is not offered and no enemy "
+                f"creature is legal; taking the face instead."
+            )
+            removal_target = None
+
         if removal_target is not None and removal_target != RemovalLogic.FACE_TARGET:
             self.__schedule_creature_target_selection(source_id, removal_target, reason)
             return
@@ -9402,7 +9612,11 @@ class Controller(ControllerSecondary):
 
         if stack_count > 0 and turn_info_dict and turn_info_dict.get("phase") in ("Phase_Main1", "Phase_Main2"):
             my_seat = self.__system_seat_id or turn_info_dict.get("decisionPlayer")
-            if my_seat is not None and turn_info_dict.get("decisionPlayer") == my_seat and pending_count == 0:
+            decision_is_ours = (
+                my_seat is not None and turn_info_dict.get("decisionPlayer") == my_seat
+            )
+            if decision_is_ours and pending_count == 0:
+                self.__clear_stack_defer("stack decision is ours and nothing is pending")
                 has_pass = self.__has_available_action_type("ActionType_Pass")
                 if has_pass:
                     bot_logger.log_info(
@@ -9424,6 +9638,15 @@ class Controller(ControllerSecondary):
                         runtime_status.set_intentional_wait(2.0, "stack_resolution_wait")
                         bot_logger.log_info(f"Deferring decision: stack has {stack_count} object(s)")
                         return
+            elif self.__stack_defer_expired(
+                stack_count=stack_count,
+                pending_count=pending_count,
+                decision_is_ours=decision_is_ours,
+                turn_info_dict=turn_info_dict,
+            ):
+                # Our decision, only a pending message was blocking it, and it never
+                # cleared: proceed rather than idle into the rope.
+                pass
             else:
                 if self.__decision_execution_thread is not None:
                     self.__decision_execution_thread.cancel()
@@ -9433,6 +9656,8 @@ class Controller(ControllerSecondary):
                 runtime_status.set_intentional_wait(2.0, "stack_resolution_wait")
                 bot_logger.log_info(f"Deferring decision: stack has {stack_count} object(s)")
                 return
+        else:
+            self.__clear_stack_defer("no stack to wait on")
 
         if pending_count > 0:
             if self.__decision_execution_thread is not None:

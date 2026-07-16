@@ -117,6 +117,13 @@ def _timestamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
+# A GameStateMessage runs several KB, so the old 500-char cap cut every one of
+# them off inside the first zone -- which made stack/trigger stalls undiagnosable
+# (we could see "stack has 1 object(s)" but never WHICH object). 4000 keeps
+# turnInfo + zones + the first game objects while still bounding the log.
+_RAW_LINE_MAX_CHARS = 4000
+
+
 def log_raw_line(pattern: str, line: str):
     """Log raw line matched from player.log"""
     with _log_lock:
@@ -124,8 +131,10 @@ def log_raw_line(pattern: str, line: str):
         # Truncate very long lines for readability
         if "SelectTargetsReq" in pattern:
             lines.append(f"[{_timestamp()}] [RAW] Line: {line.strip()}\n")
-        elif len(line) > 500:
-            lines.append(f"[{_timestamp()}] [RAW] Line (truncated): {line[:500]}...\n")
+        elif len(line) > _RAW_LINE_MAX_CHARS:
+            lines.append(
+                f"[{_timestamp()}] [RAW] Line (truncated): {line[:_RAW_LINE_MAX_CHARS]}...\n"
+            )
         else:
             lines.append(f"[{_timestamp()}] [RAW] Line: {line.strip()}\n")
         _write_lines('a', lines)
@@ -156,24 +165,51 @@ def log_game_state_update(game_state_dict: dict):
                 lines.append(f"[{ts}] [PLAYER] seat={seat}, life={life}\n")
 
         # Log zones summary
+        stack_ids: list = []
         if 'zones' in game_state_dict:
             for zone in game_state_dict['zones']:
                 zone_type = zone.get('type', '?')
                 owner = zone.get('ownerSeatId', '?')
-                obj_count = len(zone.get('objectInstanceIds', []))
-                lines.append(f"[{ts}] [ZONE] type={zone_type}, owner={owner}, objects={obj_count}\n")
+                zone_obj_ids = zone.get('objectInstanceIds', []) or []
+                obj_count = len(zone_obj_ids)
+                # Spell out the stack's contents: "Deferring decision: stack has 1
+                # object(s)" was undiagnosable without knowing WHICH object it was.
+                if zone_type == 'ZoneType_Stack' and zone_obj_ids:
+                    stack_ids = list(zone_obj_ids)
+                    lines.append(
+                        f"[{ts}] [ZONE] type={zone_type}, owner={owner}, "
+                        f"objects={obj_count}, ids={stack_ids}\n"
+                    )
+                else:
+                    lines.append(f"[{ts}] [ZONE] type={zone_type}, owner={owner}, objects={obj_count}\n")
 
         # Log game objects summary
         if 'gameObjects' in game_state_dict:
             objects = game_state_dict['gameObjects']
             lines.append(f"[{ts}] [OBJECTS] count={len(objects)}\n")
+            logged_ids = set()
             for obj in objects[:10]:  # Log first 10 objects to avoid spam
                 inst_id = obj.get('instanceId', '?')
                 grp_id = obj.get('grpId', '?')
                 obj_type = obj.get('type', '?')
                 zone_id = obj.get('zoneId', '?')
+                logged_ids.add(inst_id)
                 lines.append(
                     f"[{ts}] [OBJECT] instId={inst_id}, grpId={grp_id}, type={obj_type}, zone={zone_id}\n"
+                )
+            # Whatever sits on the stack is exactly what we need when a decision is
+            # deferred on it, and it is routinely past the first 10 (observed: the
+            # trigger that froze turn 16 was object 381). Always log those.
+            for obj in objects:
+                inst_id = obj.get('instanceId', '?')
+                if inst_id in logged_ids or inst_id not in stack_ids:
+                    continue
+                logged_ids.add(inst_id)
+                lines.append(
+                    f"[{ts}] [OBJECT|STACK] instId={inst_id}, grpId={obj.get('grpId', '?')}, "
+                    f"type={obj.get('type', '?')}, zone={obj.get('zoneId', '?')}, "
+                    f"controller={obj.get('controllerSeatId', '?')}, "
+                    f"source={obj.get('objectSourceGrpId', '?')}\n"
                 )
             if len(objects) > 10:
                 lines.append(f"[{ts}] [OBJECTS] ... and {len(objects) - 10} more objects\n")

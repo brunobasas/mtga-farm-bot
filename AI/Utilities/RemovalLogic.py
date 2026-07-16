@@ -105,6 +105,11 @@ SELF_BUFF_GRPIDS: set[int] = {
                    # Aura. Pin it so it is always cast on OUR strongest creature
                    # (never an enemy's, never with no creature), regardless of
                    # whether its oracle text is available offline.
+    93793, 102792,  # Bulk Up (both printings) -- "Double target creature's power".
+                    # Phrased with no "+N/M", so the _RE_SELF_BUFF pattern missed it
+                    # and the generic path handed it to an ENEMY creature: MTGA then
+                    # asked "Do you want to target Arahbo, the First Fang with Bulk
+                    # Up?" -- i.e. we were about to double the OPPONENT's power.
 }
 
 _RE_SELF_BUFF = re.compile(r"target creature gets \+\d+/", re.I)
@@ -114,6 +119,10 @@ _RE_SELF_BUFF = re.compile(r"target creature gets \+\d+/", re.I)
 # answer and the match stalls. Detrimental auras (Pacifism "-X/-X", "can't attack")
 # are excluded by the removal-profile guard in _is_self_buff_lookup below.
 _RE_BUFF_AURA = re.compile(r"enchanted creature gets \+\d+/\+?\d+", re.I)
+# Buffs phrased without a "+N/M" at all, which the two patterns above miss --
+# e.g. Bulk Up's "Double target creature's power until end of turn". Handing one
+# of these to an enemy creature is strictly helping the opponent.
+_RE_POWER_BUFF = re.compile(r"double target creature's power", re.I)
 
 
 _self_buff_memo: dict[int, bool] = {}
@@ -132,7 +141,11 @@ def _is_self_buff_lookup(grp_id: int) -> bool:
     if text and get_removal_profile(grp_id):
         result = False
     else:
-        result = bool(_RE_SELF_BUFF.search(text) or _RE_BUFF_AURA.search(text))
+        result = bool(
+            _RE_SELF_BUFF.search(text)
+            or _RE_BUFF_AURA.search(text)
+            or _RE_POWER_BUFF.search(text)
+        )
     if text:
         # Same rationale as _removal_profile_lookup: only memoize once real
         # oracle text was available, so a transient fetch failure doesn't
