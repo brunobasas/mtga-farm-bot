@@ -99,7 +99,13 @@ def get_removal_profile(grp_id: int | None) -> dict | None:
 # creatures as legal, so without this the generic path would hand the buff to the
 # opponent or stall on the illegal avatar. Fake Your Own Death across all its
 # printings, plus an oracle heuristic for other "+N/+M" pump tricks.
-SELF_BUFF_GRPIDS: set[int] = {80230, 90433, 92991, 93887}
+SELF_BUFF_GRPIDS: set[int] = {
+    80230, 90433, 92991, 93887,
+    94150, 94489,  # Unflinching Courage (both printings) -- +2/+2 trample/lifelink
+                   # Aura. Pin it so it is always cast on OUR strongest creature
+                   # (never an enemy's, never with no creature), regardless of
+                   # whether its oracle text is available offline.
+}
 
 _RE_SELF_BUFF = re.compile(r"target creature gets \+\d+/", re.I)
 # Beneficial Auras (e.g. Angelic Destiny, Ethereal Armor) read "Enchant creature"
