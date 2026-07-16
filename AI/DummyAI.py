@@ -306,6 +306,47 @@ class DummyAI(AIKernel):
             return instance_id, ability_grp_id
         return None
 
+    def _find_reassembling_skeleton_activation(self, action_list, inst_id_grp_id_dict, available_colors, total_mana, sources):
+        """Find a payable Reassembling Skeleton return-from-graveyard activation.
+
+        Reassembling Skeleton has '1B: Return this card from your graveyard to
+        the battlefield tapped.' MTGA offers this as an ActionType_Activate for
+        the graveyard instance whenever we have priority and can pay. It returns
+        itself with no target and no in-resolution chooser, so it is safe to
+        activate directly (unlike a cast with an unclickable chooser). This is
+        the key line for the sacrifice deck: the skeleton is sac fodder we bring
+        back every time it is sacrificed (e.g. to Vampire Gourmand)."""
+        for action_wrapper in action_list:
+            action = action_wrapper.get('action', {})
+            action_type = action.get('actionType', '')
+            if not action_type or not action_type.startswith('ActionType_Activate'):
+                continue
+            if action_type == 'ActionType_Activate_Mana':
+                continue
+
+            instance_id = action.get('instanceId')
+            if instance_id is None:
+                continue
+            grp_id = action.get('grpId') or inst_id_grp_id_dict.get(instance_id)
+            card_info = CardInfo.get_card_info(grp_id) if grp_id else None
+            if not card_info or card_info.get('name') != 'Reassembling Skeleton':
+                continue
+
+            action_mana_cost = action.get('manaCost', [])
+            if not action_mana_cost:
+                # Fallback to the printed activation cost 1B when MTGA omits it.
+                action_mana_cost = [
+                    {'color': ['ManaColor_Black'], 'count': 1},
+                    {'color': ['ManaColor_Generic'], 'count': 1},
+                ]
+            if not self._can_cast_with_mana_cost(action_mana_cost, available_colors, total_mana, sources):
+                self._debug("Reassembling Skeleton return available but mana cost not payable")
+                continue
+
+            ability_grp_id = action.get('abilityGrpId', 0)
+            return instance_id, ability_grp_id
+        return None
+
     def _get_convoke_sources(self, game_state: GameState, my_seat: int):
         """Return convoke sources from untapped creatures we control."""
         color_map = {
@@ -829,6 +870,20 @@ class DummyAI(AIKernel):
                                 )
                             move = {'cast': [instance_id]}
                             return move
+
+                    # Nothing better to cast this window: bring Reassembling
+                    # Skeleton back from the graveyard with the leftover mana so
+                    # it is available as sacrifice fodder again. Checked after
+                    # casts so a real spell always takes mana priority.
+                    skeleton_activation = self._find_reassembling_skeleton_activation(
+                        action_list, inst_id_grp_id_dict, available_colors, total_mana, sources
+                    )
+                    if skeleton_activation:
+                        inst_id, ability_grp_id = skeleton_activation
+                        self._debug(
+                            f"Reassembling Skeleton return-from-graveyard: instanceId={inst_id}, abilityGrpId={ability_grp_id}"
+                        )
+                        return {'activate_ability': [inst_id, ability_grp_id]}
 
                     if sorcery_found:
                         self._debug(
