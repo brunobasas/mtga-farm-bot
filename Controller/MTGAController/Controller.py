@@ -79,6 +79,10 @@ class Controller(ControllerSecondary):
         self.__decision_execution_thread = None
         self.__decision_delay_key = None
         self.__decision_delay_scheduled_at = 0.0
+        # One-shot timer that re-drives the decision after a scry/group prompt
+        # clears, in case MTGA sends no fresh GameStateMessage for the unchanged
+        # priority window (prevents the post-scry own_inactivity_timer_stalled).
+        self.__group_resume_timer = None
         self.__assign_damage_execution_thread = None
         self.__assign_damage_in_progress = False
         self.__mulligan_execution_thread = None
@@ -5118,6 +5122,9 @@ class Controller(ControllerSecondary):
             self.__decision_execution_thread = None
         self.__decision_delay_key = None
         self.__decision_delay_scheduled_at = 0.0
+        if self.__group_resume_timer is not None:
+            self.__group_resume_timer.cancel()
+            self.__group_resume_timer = None
         if self.__mulligan_execution_thread is not None:
             self.__mulligan_execution_thread.cancel()
             self.__mulligan_execution_thread = None
@@ -5154,6 +5161,9 @@ class Controller(ControllerSecondary):
             self.__decision_execution_thread = None
         self.__decision_delay_key = None
         self.__decision_delay_scheduled_at = 0.0
+        if self.__group_resume_timer is not None:
+            self.__group_resume_timer.cancel()
+            self.__group_resume_timer = None
         if self.__mulligan_execution_thread is not None:
             self.__mulligan_execution_thread.cancel()
             self.__mulligan_execution_thread = None
@@ -6400,9 +6410,72 @@ class Controller(ControllerSecondary):
 
                 # Let the scry overlay finish animating in before clicking.
                 threading.Timer(0.8, _click_done).start()
+                # Re-drive the decision once the prompt window clears. MTGA often
+                # does not emit a fresh GameStateMessage after the scry resolves
+                # (the priority window is unchanged), so the decision that
+                # __update_game_state cancelled while the gate was up would never
+                # be re-armed and the bot would idle until the inactivity rope.
+                self.__schedule_group_resume((self.__group_req_active_until - now) + 0.6)
                 return
         except Exception as e:
             bot_logger.log_error(f"Failed to handle GroupReq: {e}")
+
+    def __schedule_group_resume(self, delay: float, attempts: int = 0) -> None:
+        """(Re)arm the post-scry decision-resume timer."""
+        try:
+            if self.__group_resume_timer is not None:
+                self.__group_resume_timer.cancel()
+        except Exception:
+            pass
+        self.__group_resume_timer = threading.Timer(
+            max(0.2, float(delay)),
+            self.__resume_decision_after_group_req,
+            kwargs={"attempts": attempts},
+        )
+        self.__group_resume_timer.start()
+
+    def __resume_decision_after_group_req(self, attempts: int = 0) -> None:
+        """After a scry/group prompt is dismissed, re-drive the decision from the
+        cached game state if nothing else has (fixes the observed
+        own_inactivity_timer_stalled after a scry). Heavily guarded so the worst
+        case is a no-op: it only acts when it is unambiguously our clean priority
+        with no decision already in flight."""
+        try:
+            self.__group_resume_timer = None
+            if self._stop_requested or self._suppress_selections:
+                return
+            # Still inside the scry/group window (or a new one arrived): wait it out.
+            if time.time() < self.__group_req_active_until:
+                self.__schedule_group_resume(0.6, attempts)
+                return
+            # A normal GameStateMessage already re-armed a decision: nothing to do.
+            if self.__decision_execution_thread is not None and getattr(
+                self.__decision_execution_thread, "is_alive", lambda: False
+            )():
+                return
+            ti = self.updated_game_state.get_turn_info() or {}
+            my_seat = self.__system_seat_id
+            if (
+                my_seat is None
+                or not self.__has_mulled_keep
+                or ti.get("decisionPlayer") != my_seat
+                or not self.updated_game_state.is_complete()
+            ):
+                return
+            # Respect the same pauses the main handler enforces before deciding.
+            if self.__should_pause_for_targets() or self.__should_pause_for_assign_damage():
+                if attempts < 8:
+                    self.__schedule_group_resume(0.8, attempts + 1)
+                return
+            runtime_status.clear_intentional_wait()
+            bot_logger.log_info(
+                "Resuming decision after scry/group prompt (no fresh GameStateMessage arrived)."
+            )
+            self.reset_inactivity_timer()
+            if self.__decision_callback:
+                self.__decision_callback(self.updated_game_state)
+        except Exception as e:
+            bot_logger.log_error(f"Resume-after-group decision failed: {e}")
 
     def __handle_select_n_req(self, line: str) -> None:
         try:
