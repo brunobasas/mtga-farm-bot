@@ -306,6 +306,39 @@ class DummyAI(AIKernel):
             return instance_id, ability_grp_id
         return None
 
+    @staticmethod
+    def _is_priority_removal_target(target_id, game_objects) -> bool:
+        """True if this removal target is worth answering NOW rather than
+        developing the board.
+
+        The generic picker maximises mana spent and breaks ties by card type
+        (Creature 5 > Instant 4), so a 1-mana Burst Lightning always lost to a
+        1-mana creature: the bot logged 'Removal Burst Lightning target=305'
+        every turn and never fired it, while that very target (Perforating
+        Artist) drained us with its repeatable ability. Treat a target as worth
+        it when it is a known repeatable engine, or simply a real beater.
+        """
+        if target_id is None:
+            return False
+        try:
+            target_id = int(target_id)
+        except Exception:
+            return False
+        if target_id < 0:
+            return False  # face/player damage is not a "threat answer"
+        obj = None
+        for candidate in game_objects or []:
+            if isinstance(candidate, dict) and candidate.get("instanceId") == target_id:
+                obj = candidate
+                break
+        if not obj:
+            return False
+        # Repeatable engines the bot already flags as too valuable to sacrifice
+        # (e.g. Perforating Artist) are exactly what removal is for.
+        if RemovalLogic.is_protected_from_sacrifice(obj.get("grpId")):
+            return True
+        return RemovalLogic._stat(obj.get("power")) >= 3
+
     def _find_reassembling_skeleton_activation(self, action_list, inst_id_grp_id_dict, available_colors, total_mana, sources):
         """Find a payable Reassembling Skeleton return-from-graveyard activation.
 
@@ -425,7 +458,7 @@ class DummyAI(AIKernel):
             if idx >= len(actions):
                 return
 
-            paid_cost, _instance_id, _card_name, _mana_cost_str, action_mana_cost, _uses_convoke, _type_priority, _nominal_cmc, _is_discounted = actions[idx]
+            paid_cost, _instance_id, _card_name, _mana_cost_str, action_mana_cost, _uses_convoke, _type_priority, _nominal_cmc, _is_discounted, _priority_removal = actions[idx]
             safe_action_mana_cost = list(action_mana_cost) if isinstance(action_mana_cost, list) else []
             _dfs(
                 idx + 1,
@@ -751,6 +784,7 @@ class DummyAI(AIKernel):
                                 continue
                             # Targeted removal: only cast it if it has a valid
                             # target (kills a creature, or is lethal to the face).
+                            priority_removal = False
                             removal_profile = RemovalLogic.get_removal_profile(grp_id)
                             if removal_profile is not None:
                                 _rm_target = RemovalLogic.choose_removal_target(
@@ -780,8 +814,12 @@ class DummyAI(AIKernel):
                                         f"Removal {card_name} has no target; casting as creature/permanent for board presence."
                                     )
                                 else:
+                                    priority_removal = self._is_priority_removal_target(
+                                        _rm_target, removal_game_objects
+                                    )
                                     self._debug(
-                                        f"Removal {card_name} target={_rm_target} (profile={removal_profile})."
+                                        f"Removal {card_name} target={_rm_target} (profile={removal_profile}, "
+                                        f"priority={priority_removal})."
                                     )
                             # Pump-fight (e.g. Felling Blow): only cast it if we
                             # have a creature to buff AND an enemy it can then
@@ -814,6 +852,7 @@ class DummyAI(AIKernel):
                                     type_priority,
                                     nominal_cmc,
                                     is_discounted,
+                                    priority_removal,
                                 )
                             )
                             self._debug(
@@ -832,6 +871,21 @@ class DummyAI(AIKernel):
                                 sorcery_blocked_mana += 1
 
                     if cast_actions:
+                        # Answer a real threat before developing the board. The
+                        # max-mana plan below breaks ties by card type (Creature 5 >
+                        # Instant 4), so a 1-mana Burst Lightning always lost to a
+                        # 1-mana creature and the bot never removed the Perforating
+                        # Artist that was draining it. Take the cheapest removal that
+                        # answers the threat, so the rest of the mana still develops.
+                        priority_removals = [a for a in cast_actions if a[9]]
+                        if priority_removals:
+                            chosen = min(priority_removals, key=lambda a: (a[0], a[7]))
+                            self._debug(
+                                f"Priority removal: casting {chosen[2]} (instanceId={chosen[1]}, "
+                                f"cost={chosen[3]}) to answer a threat before developing."
+                            )
+                            return {'cast': [chosen[1]]}
+
                         # If a high-mana-value spell is heavily discounted by effects, prioritize it.
                         discounted_bombs = [a for a in cast_actions if a[8] and a[7] >= 6]
                         if discounted_bombs:
@@ -859,7 +913,7 @@ class DummyAI(AIKernel):
                                 chosen_score = convoke_score
 
                         if chosen:
-                            paid_cost, instance_id, card_name, mana_cost, _action_mana_cost, _uses_convoke, _type_priority, nominal_cmc, _is_discounted = chosen
+                            paid_cost, instance_id, card_name, mana_cost, _action_mana_cost, _uses_convoke, _type_priority, nominal_cmc, _is_discounted, _priority_removal = chosen
                             self._debug(
                                 f"CASTING: {card_name} (instanceId={instance_id}, cost={mana_cost}, paid={paid_cost}, cmc={nominal_cmc})"
                             )
