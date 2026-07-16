@@ -74,6 +74,15 @@ class Controller(ControllerSecondary):
         account_switch_enabled: bool = True,
     ):
         self.__decision_callback = None
+        # Serialises decision EXECUTION. A decision runs for seconds (hand scans
+        # move the mouse), and _decision_if_still_my_priority clears
+        # __decision_execution_thread BEFORE running it, so the "already armed"
+        # guard cannot see an in-flight decision -- a fresh GameStateMessage
+        # could arm a second one that then executed concurrently. Two hand scans
+        # fighting over the mouse mis-click (observed: a cast retry interleaved
+        # with a land play, which kicked off an unpayable cast and stalled the
+        # bot on the pay-costs screen).
+        self.__decision_exec_lock = threading.Lock()
         self.__mulligan_decision_callback = None
         self.__action_success_callback = None
         self.__decision_execution_thread = None
@@ -6491,8 +6500,7 @@ class Controller(ControllerSecondary):
                 "Resuming decision after scry/group prompt (no fresh GameStateMessage arrived)."
             )
             self.reset_inactivity_timer()
-            if self.__decision_callback:
-                self.__decision_callback(self.updated_game_state)
+            self.__invoke_decision_callback("group/scry resume")
         except Exception as e:
             bot_logger.log_error(f"Resume-after-group decision failed: {e}")
 
@@ -7183,6 +7191,26 @@ class Controller(ControllerSecondary):
         except Exception as e:
             bot_logger.log_error(f"Failed to handle PayCostsReq: {e}")
             threading.Timer(0.6, lambda: self.submit_selection(reason="pay_costs_error_fallback", force=True)).start()
+
+    def __invoke_decision_callback(self, reason: str) -> bool:
+        """Run the AI decision (and its mouse work) under __decision_exec_lock.
+
+        Skips rather than queues when a decision is already executing: the game
+        state a blocked decision was computed from is stale by the time the lock
+        frees, and the next GameStateMessage re-evaluates anyway. This is what
+        stops two hand scans from racing the mouse."""
+        if not self.__decision_callback:
+            return False
+        if not self.__decision_exec_lock.acquire(blocking=False):
+            bot_logger.log_info(
+                f"Decision skipped: another decision is already executing ({reason})."
+            )
+            return False
+        try:
+            self.__decision_callback(self.updated_game_state)
+            return True
+        finally:
+            self.__decision_exec_lock.release()
 
     def __current_game_state_id(self) -> int:
         try:
@@ -9481,7 +9509,7 @@ class Controller(ControllerSecondary):
                             and ti.get("decisionPlayer") == my_seat
                         ):
                             bot_logger.log_info("Retrying decision after pay costs pause")
-                            self.__decision_callback(self.updated_game_state)
+                            self.__invoke_decision_callback("pay-costs pause retry")
                     except Exception as e:
                         bot_logger.log_error(f"Error in pay-costs pause retry: {e}")
 
@@ -9576,7 +9604,7 @@ class Controller(ControllerSecondary):
                             )
                         )
                         if still_my_priority and self.__decision_callback and self.__has_mulled_keep:
-                            self.__decision_callback(self.updated_game_state)
+                            self.__invoke_decision_callback("decision delay fired")
                         else:
                             bot_logger.log_info(
                                 f"Skipping delayed decision (decisionPlayer={ti.get('decisionPlayer')}, my_seat={my_seat})"
