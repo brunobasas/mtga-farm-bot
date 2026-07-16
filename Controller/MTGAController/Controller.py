@@ -3490,12 +3490,31 @@ class Controller(ControllerSecondary):
                     f"CAST_RETRY: card {card_id} not hovered on attempt {attempt}; rescanning after pause."
                 )
                 time.sleep(0.8)
+        if self._stop_requested or self._suppress_selections:
+            return
+        # All retries failed. Do NOT return silently: nothing we did changed the
+        # game, so no fresh GameStateMessage arrives to re-trigger a decision and
+        # the bot just idles until the rope (observed: 36s frozen while holding
+        # Valorous Stance at 3 life). Surface it and let the decision loop have
+        # another go from the current state.
+        bot_logger.log_error(
+            f"CAST_FAILED: card {card_id} could not be hovered after 3 attempts; "
+            "re-driving the decision instead of idling."
+        )
+        self.__schedule_group_resume(1.0)
 
     def _cast_once(self, card_id: int) -> bool:
         bot_logger.set_hover_logging(True)
         try:
             if not self._ensure_options_overlay_closed(context=f"CAST_CARD id={card_id}"):
                 return False
+            # The hand scan identifies cards purely from MTGA's hover events, and
+            # Unity only emits those while the window has focus. If anything else
+            # took focus (observed: the user browsing Explorer), the scan sweeps
+            # the whole hand, hovers NOTHING, and the cast fails -- the bot then
+            # sat 36s burning the rope with Valorous Stance stuck in hand at 3
+            # life. Focus MTGA first, exactly like the logout ESC path does.
+            focus_mtga_window()
             hand_p1, hand_p2 = self._get_hand_scan_points_mapped(force_reacquire=True)
             # Clear any stale hover events from previous scans
             self.log_reader.clear_new_line_flag(self.patterns['hover_id'])
