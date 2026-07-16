@@ -6311,6 +6311,12 @@ class Controller(ControllerSecondary):
             # (mirrors the scry/GroupReq handler). Without this the click could
             # land off the "Lose 3 life" plate and the choice would not register.
             self.__group_req_active_until = now + 6.0
+            # This gate reuses the scry/GroupReq pause, so it needs the same
+            # wake-up: MTGA often sends no fresh GameStateMessage once the modal
+            # resolves (the priority window is unchanged), leaving the decision
+            # that __update_game_state cancelled un-rearmed. Observed: modal
+            # resolved at 14:31:04, then 34.5s frozen burning the rope.
+            self.__schedule_group_resume((self.__group_req_active_until - now) + 0.6)
             # Snapshot the turn state so retries stop once the modal resolves (the
             # game advances past this step) -- avoids clicking the board after.
             snap_ti = {}
