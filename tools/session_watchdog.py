@@ -89,6 +89,12 @@ MATCH_END_RE = re.compile(
 
 # Per-reason cooldown before a repeated stall writes another black box.
 INCIDENT_COOLDOWN_SEC = 120.0
+# No-progress window (any activity timestamp) before we treat the bot as hung
+# OUTSIDE a game -- e.g. frozen at home / post-account-switch, which the in-game
+# detect_stuck_reason never sees. Set well above a normal account switch or queue
+# search (both keep emitting input/playerlog events), so only a genuine hang trips
+# it. The overnight milo freeze idled ~3.5h, so there is enormous margin.
+HOME_IDLE_THRESHOLD_SEC = 360.0
 # Soft cap for history.log; rotated to history.log.1 when exceeded.
 HISTORY_MAX_BYTES = 50 * 1024 * 1024
 
@@ -389,19 +395,58 @@ def _write_incident_bundle(state: dict, status: dict, reason: str) -> None:
     print(f"[session_watchdog] stall captured: reason={reason} dir={incident_dir}")
 
 
-def _check_stall(state: dict, status: dict, thresholds: _Thresholds) -> None:
+def _check_stall(state: dict, status: dict, thresholds: _Thresholds) -> str | None:
+    """Detect and record an in-game stall. Returns the detected reason (even if a
+    cooldown suppressed the bundle write) so the caller can skip the home-idle
+    check when an in-game stall already explains the freeze."""
     try:
         reason = detect_stuck_reason(status, thresholds)
     except Exception:
         reason = None
     if not reason:
-        return
+        return None
     last_incident = state.setdefault("last_incident", {})
     now = time.time()
-    if (now - float(last_incident.get(reason, 0.0))) < INCIDENT_COOLDOWN_SEC:
+    if (now - float(last_incident.get(reason, 0.0))) >= INCIDENT_COOLDOWN_SEC:
+        last_incident[reason] = now
+        _write_incident_bundle(state, status, reason)
+    return reason
+
+
+def _check_home_idle(state: dict, status: dict) -> None:
+    """Catch a hang OUTSIDE a game: no activity of any kind for too long.
+
+    The in-game detector (detect_stuck_reason) only fires while IN_GAME, so a
+    freeze at home / post-account-switch (like the overnight milo hang that idled
+    3.5h until disconnection) left no trace. Here we track the newest of the
+    bot's activity timestamps; if none advances for HOME_IDLE_THRESHOLD_SEC we
+    write one black box for the episode (reset once progress resumes)."""
+    now = time.time()
+    progress = max(
+        float(status.get("last_input_at_epoch") or 0.0),
+        float(status.get("last_decision_at_epoch") or 0.0),
+        float(status.get("last_playerlog_event_at_epoch") or 0.0),
+    )
+    tracker = state.setdefault("progress", {})
+    if progress <= 0.0:
+        return  # no activity observed yet (bot still booting); nothing to compare
+    if progress > float(tracker.get("value") or 0.0):
+        tracker["value"] = progress
+        tracker["seen_at"] = now
+        tracker["alerted"] = False
         return
-    last_incident[reason] = now
-    _write_incident_bundle(state, status, reason)
+    seen_at = float(tracker.get("seen_at") or 0.0)
+    if seen_at <= 0.0:
+        tracker["seen_at"] = now
+        return
+    if tracker.get("alerted"):
+        return  # already flagged this idle episode
+    if (now - seen_at) < HOME_IDLE_THRESHOLD_SEC:
+        return
+    tracker["alerted"] = True
+    idle_min = (now - seen_at) / 60.0
+    _write_incident_bundle(state, status, "home_idle_no_progress")
+    print(f"[session_watchdog] home-idle hang: no progress for {idle_min:.1f} min.")
 
 
 def run_once(state: dict, thresholds: _Thresholds) -> bool:
@@ -416,7 +461,10 @@ def run_once(state: dict, thresholds: _Thresholds) -> bool:
         state["session_id"] = session_id
         state["match"] = _default_match_state()
     _consume_bot_log(state, session_id, status)
-    _check_stall(state, status, thresholds)
+    # In-game stall first; only look for a home/post-switch idle hang when no
+    # in-game stall already explains the freeze.
+    if not _check_stall(state, status, thresholds):
+        _check_home_idle(state, status)
 
     # Self-terminate safety net: if we ever saw the bot process and it has since
     # died (e.g. the UI was closed with the window X instead of Stop), exit so we
