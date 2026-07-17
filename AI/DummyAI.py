@@ -271,8 +271,27 @@ class DummyAI(AIKernel):
                 return True
         return False
 
-    def _find_phoenix_chick_activation(self, action_list, inst_id_grp_id_dict, available_colors, total_mana, sources):
-        """Find a Phoenix Chick activation action we can pay for."""
+    def _find_named_activation(
+        self,
+        action_list,
+        inst_id_grp_id_dict,
+        available_colors,
+        total_mana,
+        sources,
+        *,
+        card_name,
+        fallback_mana_cost,
+        explicit_cost_fail_msg,
+        fallback_cost_fail_msg,
+    ):
+        """Find a payable activation action for `card_name`.
+
+        Shared by _find_phoenix_chick_activation and
+        _find_reassembling_skeleton_activation, which differ only in which card
+        they look for and what mana cost to assume when MTGA's action omits
+        manaCost. Both are direct self-activations with no target and no
+        in-resolution chooser, so they are safe to fire once payable.
+        """
         for action_wrapper in action_list:
             action = action_wrapper.get('action', {})
             action_type = action.get('actionType', '')
@@ -288,23 +307,32 @@ class DummyAI(AIKernel):
                 continue
             grp_id = action.get('grpId') or inst_id_grp_id_dict.get(instance_id)
             card_info = CardInfo.get_card_info(grp_id) if grp_id else None
-            if not card_info or card_info.get('name') != 'Phoenix Chick':
+            if not card_info or card_info.get('name') != card_name:
                 continue
 
             action_mana_cost = action.get('manaCost', [])
             if action_mana_cost:
                 if not self._can_cast_with_mana_cost(action_mana_cost, available_colors, total_mana, sources):
-                    self._debug("Phoenix Chick activation available but mana cost not payable")
+                    self._debug(explicit_cost_fail_msg)
                     continue
             else:
-                rr_cost = [{'color': ['ManaColor_Red'], 'count': 2}]
-                if not self._can_cast_with_mana_cost(rr_cost, available_colors, total_mana, sources):
-                    self._debug("Phoenix Chick activation available but RR not payable")
+                if not self._can_cast_with_mana_cost(fallback_mana_cost, available_colors, total_mana, sources):
+                    self._debug(fallback_cost_fail_msg)
                     continue
 
             ability_grp_id = action.get('abilityGrpId', 0)
             return instance_id, ability_grp_id
         return None
+
+    def _find_phoenix_chick_activation(self, action_list, inst_id_grp_id_dict, available_colors, total_mana, sources):
+        """Find a Phoenix Chick activation action we can pay for."""
+        return self._find_named_activation(
+            action_list, inst_id_grp_id_dict, available_colors, total_mana, sources,
+            card_name='Phoenix Chick',
+            fallback_mana_cost=[{'color': ['ManaColor_Red'], 'count': 2}],
+            explicit_cost_fail_msg="Phoenix Chick activation available but mana cost not payable",
+            fallback_cost_fail_msg="Phoenix Chick activation available but RR not payable",
+        )
 
     @staticmethod
     def _is_priority_removal_target(target_id, game_objects) -> bool:
@@ -349,36 +377,18 @@ class DummyAI(AIKernel):
         activate directly (unlike a cast with an unclickable chooser). This is
         the key line for the sacrifice deck: the skeleton is sac fodder we bring
         back every time it is sacrificed (e.g. to Vampire Gourmand)."""
-        for action_wrapper in action_list:
-            action = action_wrapper.get('action', {})
-            action_type = action.get('actionType', '')
-            if not action_type or not action_type.startswith('ActionType_Activate'):
-                continue
-            if action_type == 'ActionType_Activate_Mana':
-                continue
-
-            instance_id = action.get('instanceId')
-            if instance_id is None:
-                continue
-            grp_id = action.get('grpId') or inst_id_grp_id_dict.get(instance_id)
-            card_info = CardInfo.get_card_info(grp_id) if grp_id else None
-            if not card_info or card_info.get('name') != 'Reassembling Skeleton':
-                continue
-
-            action_mana_cost = action.get('manaCost', [])
-            if not action_mana_cost:
-                # Fallback to the printed activation cost 1B when MTGA omits it.
-                action_mana_cost = [
-                    {'color': ['ManaColor_Black'], 'count': 1},
-                    {'color': ['ManaColor_Generic'], 'count': 1},
-                ]
-            if not self._can_cast_with_mana_cost(action_mana_cost, available_colors, total_mana, sources):
-                self._debug("Reassembling Skeleton return available but mana cost not payable")
-                continue
-
-            ability_grp_id = action.get('abilityGrpId', 0)
-            return instance_id, ability_grp_id
-        return None
+        fallback_cost_fail_msg = "Reassembling Skeleton return available but mana cost not payable"
+        return self._find_named_activation(
+            action_list, inst_id_grp_id_dict, available_colors, total_mana, sources,
+            card_name='Reassembling Skeleton',
+            # Fallback to the printed activation cost 1B when MTGA omits manaCost.
+            fallback_mana_cost=[
+                {'color': ['ManaColor_Black'], 'count': 1},
+                {'color': ['ManaColor_Generic'], 'count': 1},
+            ],
+            explicit_cost_fail_msg=fallback_cost_fail_msg,
+            fallback_cost_fail_msg=fallback_cost_fail_msg,
+        )
 
     def _get_convoke_sources(self, game_state: GameState, my_seat: int):
         """Return convoke sources from untapped creatures we control."""
