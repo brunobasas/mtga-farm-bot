@@ -722,15 +722,44 @@ class DummyAI(AIKernel):
                         removal_opp_life = None
                     removal_bf_ids = RemovalLogic.battlefield_zone_ids(game_state.get_full_state()) or None
                     # Do we control a creature on the battlefield? Self-buff tricks
-                    # (e.g. Fake Your Own Death) must not be cast with nothing of
-                    # ours to buff -- otherwise the only legal target is an enemy,
-                    # which we must never buff.
-                    _own_bf = removal_bf_ids if removal_bf_ids else set()
-                    have_own_creature = any(
+                    # (e.g. Fake Your Own Death) must not be cast with nothing of ours
+                    # to buff -- otherwise the only legal target is an enemy, which we
+                    # must never buff.
+                    # A buff aura / pump trick needs a creature ON OUR BATTLEFIELD to
+                    # enchant; a creature card sitting in our hand or graveyard is not a
+                    # legal target. The zone filter must therefore be REQUIRED, never
+                    # bypassed: an earlier version fell back to "any zone" whenever the
+                    # battlefield zones could not be determined (`not _own_bf or ...`),
+                    # which counted a creature in HAND as a board creature -- so a 4-mana
+                    # aura (e.g. Angelic Destiny) got cast with an empty board, MTGA then
+                    # offered only enemy creatures as targets, the self-buff handler
+                    # refused (correctly, never buff an enemy), and the decision loop
+                    # re-cast the same aura every rope, bleeding the whole game.
+                    #
+                    # battlefield_zone_ids() only finds a zone once MTGA re-declares its
+                    # ZoneType (observed: a match can go many turns with the battlefield
+                    # type declared only once, so removal_bf_ids is empty most of the
+                    # game). Rather than either bypass the filter (the old bug) or refuse
+                    # every self-buff for lack of a known battlefield zone, INFER our
+                    # battlefield zone from a permanent that can only ever live there --
+                    # our lands. Any land we control shares the battlefield zoneId, so a
+                    # creature in that same zone is genuinely on our board, while a
+                    # creature in hand/graveyard is not.
+                    _own_bf = set(removal_bf_ids or set())
+                    if not _own_bf:
+                        _own_bf = {
+                            o.get('zoneId')
+                            for o in removal_game_objects
+                            if isinstance(o, dict)
+                            and o.get('controllerSeatId') == my_seat
+                            and 'CardType_Land' in (o.get('cardTypes') or [])
+                            and o.get('zoneId') is not None
+                        }
+                    have_own_creature = bool(_own_bf) and any(
                         isinstance(o, dict)
                         and o.get('controllerSeatId') == my_seat
                         and 'CardType_Creature' in (o.get('cardTypes') or [])
-                        and (not _own_bf or o.get('zoneId') in _own_bf)
+                        and o.get('zoneId') in _own_bf
                         for o in removal_game_objects
                     )
                     allow_sorcery = phase in ['Phase_Main1', 'Phase_Main2']
