@@ -3550,6 +3550,15 @@ class Controller(ControllerSecondary):
                 bot_logger.log_info(
                     f"CAST_RETRY: card {card_id} not hovered on attempt {attempt}; rescanning after pause."
                 )
+                # Only probe for the "Are You Sure?" dialog once a cast attempt has
+                # actually failed to hover the card -- that is the evidence something
+                # is wrong (the dialog covers the board and swallows every click). The
+                # probe costs up to ~1.6s (template scan + rescaled fallback) even when
+                # the dialog is ABSENT, which is the common case; running it up front on
+                # every one of up to 3 attempts burned up to ~5s under the decision-exec
+                # lock, against the rope, for nothing. It emits no log line of its own,
+                # so this visual probe is still the only way we can see it at all.
+                self._dismiss_are_you_sure_if_present(context=f"CAST_CARD id={card_id}")
                 time.sleep(0.8)
         if self._stop_requested or self._suppress_selections:
             return
@@ -3576,10 +3585,10 @@ class Controller(ControllerSecondary):
             # sat 36s burning the rope with Valorous Stance stuck in hand at 3
             # life. Focus MTGA first, exactly like the logout ESC path does.
             focus_mtga_window()
-            # An "Are You Sure?" confirm covers the board and swallows every click,
-            # so clear it before sweeping the hand (it emits no log line, so this
-            # visual probe is the only way we can see it at all).
-            self._dismiss_are_you_sure_if_present(context=f"CAST_CARD id={card_id}")
+            # NOTE: an "Are You Sure?" confirm dialog, if present, is probed for
+            # reactively in cast() after a failed attempt -- not here. See the
+            # comment in cast() for why running that scan up front on every
+            # attempt was too expensive to do speculatively.
             hand_p1, hand_p2 = self._get_hand_scan_points_mapped(force_reacquire=True)
             # Clear any stale hover events from previous scans
             self.log_reader.clear_new_line_flag(self.patterns['hover_id'])
