@@ -306,6 +306,80 @@ class DummyAI(AIKernel):
             return instance_id, ability_grp_id
         return None
 
+    @staticmethod
+    def _is_priority_removal_target(target_id, game_objects) -> bool:
+        """True if this removal target is worth answering NOW rather than
+        developing the board.
+
+        The generic picker maximises mana spent and breaks ties by card type
+        (Creature 5 > Instant 4), so a 1-mana Burst Lightning always lost to a
+        1-mana creature: the bot logged 'Removal Burst Lightning target=305'
+        every turn and never fired it, while that very target (Perforating
+        Artist) drained us with its repeatable ability. Treat a target as worth
+        it when it is a known repeatable engine, or simply a real beater.
+        """
+        if target_id is None:
+            return False
+        try:
+            target_id = int(target_id)
+        except Exception:
+            return False
+        if target_id < 0:
+            return False  # face/player damage is not a "threat answer"
+        obj = None
+        for candidate in game_objects or []:
+            if isinstance(candidate, dict) and candidate.get("instanceId") == target_id:
+                obj = candidate
+                break
+        if not obj:
+            return False
+        # Repeatable engines the bot already flags as too valuable to sacrifice
+        # (e.g. Perforating Artist) are exactly what removal is for.
+        if RemovalLogic.is_protected_from_sacrifice(obj.get("grpId")):
+            return True
+        return RemovalLogic._stat(obj.get("power")) >= 3
+
+    def _find_reassembling_skeleton_activation(self, action_list, inst_id_grp_id_dict, available_colors, total_mana, sources):
+        """Find a payable Reassembling Skeleton return-from-graveyard activation.
+
+        Reassembling Skeleton has '1B: Return this card from your graveyard to
+        the battlefield tapped.' MTGA offers this as an ActionType_Activate for
+        the graveyard instance whenever we have priority and can pay. It returns
+        itself with no target and no in-resolution chooser, so it is safe to
+        activate directly (unlike a cast with an unclickable chooser). This is
+        the key line for the sacrifice deck: the skeleton is sac fodder we bring
+        back every time it is sacrificed (e.g. to Vampire Gourmand)."""
+        for action_wrapper in action_list:
+            action = action_wrapper.get('action', {})
+            action_type = action.get('actionType', '')
+            if not action_type or not action_type.startswith('ActionType_Activate'):
+                continue
+            if action_type == 'ActionType_Activate_Mana':
+                continue
+
+            instance_id = action.get('instanceId')
+            if instance_id is None:
+                continue
+            grp_id = action.get('grpId') or inst_id_grp_id_dict.get(instance_id)
+            card_info = CardInfo.get_card_info(grp_id) if grp_id else None
+            if not card_info or card_info.get('name') != 'Reassembling Skeleton':
+                continue
+
+            action_mana_cost = action.get('manaCost', [])
+            if not action_mana_cost:
+                # Fallback to the printed activation cost 1B when MTGA omits it.
+                action_mana_cost = [
+                    {'color': ['ManaColor_Black'], 'count': 1},
+                    {'color': ['ManaColor_Generic'], 'count': 1},
+                ]
+            if not self._can_cast_with_mana_cost(action_mana_cost, available_colors, total_mana, sources):
+                self._debug("Reassembling Skeleton return available but mana cost not payable")
+                continue
+
+            ability_grp_id = action.get('abilityGrpId', 0)
+            return instance_id, ability_grp_id
+        return None
+
     def _get_convoke_sources(self, game_state: GameState, my_seat: int):
         """Return convoke sources from untapped creatures we control."""
         color_map = {
@@ -384,7 +458,7 @@ class DummyAI(AIKernel):
             if idx >= len(actions):
                 return
 
-            paid_cost, _instance_id, _card_name, _mana_cost_str, action_mana_cost, _uses_convoke, _type_priority, _nominal_cmc, _is_discounted = actions[idx]
+            paid_cost, _instance_id, _card_name, _mana_cost_str, action_mana_cost, _uses_convoke, _type_priority, _nominal_cmc, _is_discounted, _priority_removal = actions[idx]
             safe_action_mana_cost = list(action_mana_cost) if isinstance(action_mana_cost, list) else []
             _dfs(
                 idx + 1,
@@ -710,6 +784,7 @@ class DummyAI(AIKernel):
                                 continue
                             # Targeted removal: only cast it if it has a valid
                             # target (kills a creature, or is lethal to the face).
+                            priority_removal = False
                             removal_profile = RemovalLogic.get_removal_profile(grp_id)
                             if removal_profile is not None:
                                 _rm_target = RemovalLogic.choose_removal_target(
@@ -739,8 +814,12 @@ class DummyAI(AIKernel):
                                         f"Removal {card_name} has no target; casting as creature/permanent for board presence."
                                     )
                                 else:
+                                    priority_removal = self._is_priority_removal_target(
+                                        _rm_target, removal_game_objects
+                                    )
                                     self._debug(
-                                        f"Removal {card_name} target={_rm_target} (profile={removal_profile})."
+                                        f"Removal {card_name} target={_rm_target} (profile={removal_profile}, "
+                                        f"priority={priority_removal})."
                                     )
                             # Pump-fight (e.g. Felling Blow): only cast it if we
                             # have a creature to buff AND an enemy it can then
@@ -773,6 +852,7 @@ class DummyAI(AIKernel):
                                     type_priority,
                                     nominal_cmc,
                                     is_discounted,
+                                    priority_removal,
                                 )
                             )
                             self._debug(
@@ -791,6 +871,21 @@ class DummyAI(AIKernel):
                                 sorcery_blocked_mana += 1
 
                     if cast_actions:
+                        # Answer a real threat before developing the board. The
+                        # max-mana plan below breaks ties by card type (Creature 5 >
+                        # Instant 4), so a 1-mana Burst Lightning always lost to a
+                        # 1-mana creature and the bot never removed the Perforating
+                        # Artist that was draining it. Take the cheapest removal that
+                        # answers the threat, so the rest of the mana still develops.
+                        priority_removals = [a for a in cast_actions if a[9]]
+                        if priority_removals:
+                            chosen = min(priority_removals, key=lambda a: (a[0], a[7]))
+                            self._debug(
+                                f"Priority removal: casting {chosen[2]} (instanceId={chosen[1]}, "
+                                f"cost={chosen[3]}) to answer a threat before developing."
+                            )
+                            return {'cast': [chosen[1]]}
+
                         # If a high-mana-value spell is heavily discounted by effects, prioritize it.
                         discounted_bombs = [a for a in cast_actions if a[8] and a[7] >= 6]
                         if discounted_bombs:
@@ -818,7 +913,7 @@ class DummyAI(AIKernel):
                                 chosen_score = convoke_score
 
                         if chosen:
-                            paid_cost, instance_id, card_name, mana_cost, _action_mana_cost, _uses_convoke, _type_priority, nominal_cmc, _is_discounted = chosen
+                            paid_cost, instance_id, card_name, mana_cost, _action_mana_cost, _uses_convoke, _type_priority, nominal_cmc, _is_discounted, _priority_removal = chosen
                             self._debug(
                                 f"CASTING: {card_name} (instanceId={instance_id}, cost={mana_cost}, paid={paid_cost}, cmc={nominal_cmc})"
                             )
@@ -829,6 +924,20 @@ class DummyAI(AIKernel):
                                 )
                             move = {'cast': [instance_id]}
                             return move
+
+                    # Nothing better to cast this window: bring Reassembling
+                    # Skeleton back from the graveyard with the leftover mana so
+                    # it is available as sacrifice fodder again. Checked after
+                    # casts so a real spell always takes mana priority.
+                    skeleton_activation = self._find_reassembling_skeleton_activation(
+                        action_list, inst_id_grp_id_dict, available_colors, total_mana, sources
+                    )
+                    if skeleton_activation:
+                        inst_id, ability_grp_id = skeleton_activation
+                        self._debug(
+                            f"Reassembling Skeleton return-from-graveyard: instanceId={inst_id}, abilityGrpId={ability_grp_id}"
+                        )
+                        return {'activate_ability': [inst_id, ability_grp_id]}
 
                     if sorcery_found:
                         self._debug(
