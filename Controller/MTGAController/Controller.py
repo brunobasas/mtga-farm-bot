@@ -6568,19 +6568,19 @@ class Controller(ControllerSecondary):
                 self.__decision_execution_thread, "is_alive", lambda: False
             )():
                 return
-            ti = self.updated_game_state.get_turn_info() or {}
-            my_seat = self.__system_seat_id
-            if (
-                my_seat is None
-                or not self.__has_mulled_keep
-                or ti.get("decisionPlayer") != my_seat
-                or not self.updated_game_state.is_complete()
-            ):
+            # Targets/assign-damage pauses clear on their own; give them a bounded
+            # number of retries before giving up, same as before this predicate was
+            # unified with the heartbeat's (see __safe_to_redrive_decision).
+            if (self.__should_pause_for_targets() or self.__should_pause_for_assign_damage()) and attempts < 8:
+                self.__schedule_group_resume(0.8, attempts + 1)
                 return
-            # Respect the same pauses the main handler enforces before deciding.
-            if self.__should_pause_for_targets() or self.__should_pause_for_assign_damage():
-                if attempts < 8:
-                    self.__schedule_group_resume(0.8, attempts + 1)
+            # Shared guard (also used by the heartbeat): seat known, mulligan kept,
+            # decision genuinely ours, state complete, nothing already armed/running,
+            # exec lock free, outside the group-req window, and no targets/assign
+            # damage/pay-costs/select-N prompt still open. This is what FIXES the
+            # gap where a PayCostsReq or SelectNReq shortly after the scry window
+            # used to let this timer fire a decision into an open selection prompt.
+            if not self.__safe_to_redrive_decision():
                 return
             runtime_status.clear_intentional_wait()
             bot_logger.log_info(
@@ -7303,6 +7303,51 @@ class Controller(ControllerSecondary):
                 self.__decision_heartbeat_timer.daemon = True
                 self.__decision_heartbeat_timer.start()
 
+    def __safe_to_redrive_decision(self) -> bool:
+        """Shared guard: is it safe to re-drive our decision right now?
+
+        Used by both the idle-decision heartbeat (__maybe_wake_stalled_decision)
+        and the scry/group-prompt resume timer (__resume_decision_after_group_req).
+        Those two guards used to be maintained separately and drifted apart --
+        the resume path was missing the pay-costs and select-N checks the
+        heartbeat had, so it could fire a decision into an open PayCostsReq or
+        SelectNReq prompt shortly after a scry window closed. Keeping one
+        predicate means both callers fail safe the same way.
+
+        Deliberately conservative: every check below clears on its own in normal
+        play, so returning False here just means "wait for the next legitimate
+        trigger", never "give up permanently".
+        """
+        if not self.__has_mulled_keep:
+            return False
+        my_seat = self.__system_seat_id
+        if my_seat is None:
+            return False
+        ti = self.updated_game_state.get_turn_info() or {}
+        if ti.get("decisionPlayer") != my_seat:
+            return False  # not ours -> never act on the opponent's turn
+        if not self.updated_game_state.is_complete():
+            return False
+        # Already armed or running? Leave it alone.
+        if self.__decision_execution_thread is not None and getattr(
+            self.__decision_execution_thread, "is_alive", lambda: False
+        )():
+            return False
+        if self.__decision_exec_lock.locked():
+            return False
+        # Legitimate waits -- all of these clear by themselves.
+        if time.time() < self.__group_req_active_until:
+            return False
+        if (
+            self.__should_pause_for_targets()
+            or self.__should_pause_for_assign_damage()
+            or self.__should_pause_for_pay_costs()
+        ):
+            return False
+        if self.__select_n_in_progress or self.__pending_select_n is not None:
+            return False
+        return True
+
     def __maybe_wake_stalled_decision(self) -> None:
         """Re-drive a decision that is ours, overdue, and blocked by nothing.
 
@@ -7313,39 +7358,23 @@ class Controller(ControllerSecondary):
         GameStateMessage came to re-arm it -- exactly the shape of every stall we
         have chased (scry, modal, stack, failed cast).
         """
-        if self._suppress_selections or not self.__has_mulled_keep:
+        if self._suppress_selections:
             return
         if not self.__last_decision_ts:
             return  # nothing has happened yet this game
-        my_seat = self.__system_seat_id
-        if my_seat is None:
-            return
-        ti = self.updated_game_state.get_turn_info() or {}
-        if ti.get("decisionPlayer") != my_seat:
-            return  # not ours -> never act on the opponent's turn
-        if not self.updated_game_state.is_complete():
-            return
-        # Already armed or running? Leave it alone.
-        if self.__decision_execution_thread is not None and getattr(
-            self.__decision_execution_thread, "is_alive", lambda: False
-        )():
-            return
-        if self.__decision_exec_lock.locked():
-            return
-        # Legitimate waits -- all of these clear by themselves.
-        if time.time() < self.__group_req_active_until:
-            return
-        if (
-            self.__should_pause_for_targets()
-            or self.__should_pause_for_assign_damage()
-            or self.__should_pause_for_pay_costs()
+        # The stack-defer timeout (see __stack_defer_expired) owns a deliberate
+        # 15s wait when the decision is ours but blocked behind a stack; do not
+        # let the 8s heartbeat preempt that wait before it has had its say.
+        if self.__stack_defer_since and (
+            (time.time() - self.__stack_defer_since) < self.__stack_defer_timeout_sec
         ):
             return
-        if self.__select_n_in_progress or self.__pending_select_n is not None:
+        if not self.__safe_to_redrive_decision():
             return
         idle_for = time.time() - self.__last_decision_ts
         if idle_for < self.__decision_heartbeat_idle_sec:
             return
+        ti = self.updated_game_state.get_turn_info() or {}
         rope = self.__get_running_inactivity_timer_remaining()
         bot_logger.log_error(
             f"DECISION_HEARTBEAT: decision is ours and idle {idle_for:.1f}s "
@@ -9622,6 +9651,7 @@ class Controller(ControllerSecondary):
             bot_logger.log_info("Pausing decision while assign damage handler is pending")
             return
 
+        stack_defer_forced = False
         if stack_count > 0 and turn_info_dict and turn_info_dict.get("phase") in ("Phase_Main1", "Phase_Main2"):
             my_seat = self.__system_seat_id or turn_info_dict.get("decisionPlayer")
             decision_is_ours = (
@@ -9657,8 +9687,14 @@ class Controller(ControllerSecondary):
                 turn_info_dict=turn_info_dict,
             ):
                 # Our decision, only a pending message was blocking it, and it never
-                # cleared: proceed rather than idle into the rope.
-                pass
+                # cleared: proceed rather than idle into the rope. This ONLY reaches
+                # here when pending_count > 0 (decision_is_ours and pending_count==0
+                # is handled above), so without stack_defer_forced the pending_count>0
+                # gate right below would immediately re-defer and __stack_defer_expired
+                # would restart its own 15s clock -- logging STACK_DEFER_TIMEOUT every
+                # ~15s forever without ever actually proceeding. The flag lets this
+                # decision skip that one gate exactly once.
+                stack_defer_forced = True
             else:
                 if self.__decision_execution_thread is not None:
                     self.__decision_execution_thread.cancel()
@@ -9671,7 +9707,7 @@ class Controller(ControllerSecondary):
         else:
             self.__clear_stack_defer("no stack to wait on")
 
-        if pending_count > 0:
+        if pending_count > 0 and not stack_defer_forced:
             if self.__decision_execution_thread is not None:
                 self.__decision_execution_thread.cancel()
                 self.__decision_execution_thread = None
@@ -9680,6 +9716,11 @@ class Controller(ControllerSecondary):
             runtime_status.set_intentional_wait(1.2, "pending_message_wait")
             bot_logger.log_info(f"Deferring decision: pendingMessageCount={pending_count}")
             return
+        if stack_defer_forced and pending_count > 0:
+            bot_logger.log_info(
+                f"STACK_DEFER_TIMEOUT: proceeding past pendingMessageCount={pending_count} "
+                "gate after the 15s stack-defer wait expired."
+            )
 
         if self.__should_pause_for_pay_costs():
             if self.__decision_execution_thread is not None:
@@ -9739,6 +9780,17 @@ class Controller(ControllerSecondary):
             if my_seat is None:
                 bot_logger.log_info("Skipping decision (local systemSeatId unknown)")
             elif turn_info_dict['decisionPlayer'] == my_seat and self.__has_mulled_keep:
+                # A fresh priority window just opened for us. Stamp the heartbeat's
+                # idle clock here (not just in __start_decision_heartbeat / after a
+                # decision actually fires): updated_game_state.update(game_state)
+                # above makes decisionPlayer==us visible before the 2s settle delay
+                # below is even armed, and after a long opponent turn
+                # __last_decision_ts can already be >8s stale. Without this, a
+                # heartbeat tick landing in that gap fires the decision immediately,
+                # skipping the settle delay. Restarting the clock here gives every
+                # new priority window -- and any gates that pause it -- a fresh 8s
+                # budget, which is the heartbeat's intended semantics.
+                self.__last_decision_ts = time.time()
                 delay_key = (
                     int(turn_info_dict.get("turnNumber", -1) or -1),
                     str(turn_info_dict.get("phase") or ""),
