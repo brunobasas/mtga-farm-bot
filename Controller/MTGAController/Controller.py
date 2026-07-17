@@ -1340,7 +1340,10 @@ class Controller(ControllerSecondary):
     # "Are You Sure?" confirm plates, measured from runtime/debug/are_you_sure.png
     # (1922x1112 capture -> game frame = px - (1, 31)). The dialog is centred, so
     # both plates sit symmetrically around x=960 at the same height.
-    _ARE_YOU_SURE_YES_BASE = (786, 629)
+    # Fixed point for the "No" plate of MTGA's "Are You Sure?" dialog. There is no
+    # template image for the No button in Buttons/ to locate it dynamically, so
+    # this relies on MTGA's dialog always being centred at the same place in the
+    # (scaled) arena region. Revisit if a No-button template is ever added.
     _ARE_YOU_SURE_NO_BASE = (1136, 629)
 
     def _dismiss_are_you_sure_if_present(self, *, context: str) -> bool:
