@@ -161,6 +161,8 @@ The bot maximizes mana usage each turn:
 - Type priority when CMC is tied: creature → instant → sorcery → enchantment
 - Supports Convoke (untapped creatures as mana sources)
 - Kicker: the "Cast with Kicker?" chooser is answered automatically (always the plain, non-kicked version for now) so the bot never stalls on it
+- Client-side "Are You Sure?" confirmations are handled reactively after a failed cast attempt, avoiding speculative screen probes during normal casts
+- Decision recovery is guarded against open payment/selection prompts and resumes safely after modal, stack, or scry interruptions
 
 ### Stopping the bot
 
