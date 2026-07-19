@@ -9893,6 +9893,33 @@ class Controller(ControllerSecondary):
                             self.__decision_delay_scheduled_at = time.time()
                             self.__decision_execution_thread.start()
                             return
+                        # Same gap as above, for the other two prompt types
+                        # __safe_to_redrive_decision() already guards against
+                        # (heartbeat/group-resume paths): a pending sacrifice/
+                        # convoke/etc. cost payment (PayCostsReq) or an active
+                        # damage-assignment click sequence also move the mouse
+                        # on their own timers. Observed: an Arbiter of Woe cast
+                        # ("sacrifice a creature" additional cost) had its
+                        # PayCostsReq battlefield-click still resolving when
+                        # this timer fired a second, unrelated cast on top of it.
+                        if self.__should_pause_for_pay_costs():
+                            bot_logger.log_info("Deferring decision; pay-costs prompt still pending")
+                            runtime_status.set_intentional_wait(3.0, "pay_costs_wait")
+                            runtime_status.touch_decision()
+                            self.__decision_execution_thread = threading.Timer(0.5, _decision_if_still_my_priority)
+                            self.__decision_delay_key = delay_key
+                            self.__decision_delay_scheduled_at = time.time()
+                            self.__decision_execution_thread.start()
+                            return
+                        if self.__should_pause_for_assign_damage():
+                            bot_logger.log_info("Deferring decision; assign damage handler is pending")
+                            runtime_status.set_intentional_wait(3.0, "assign_damage_wait")
+                            runtime_status.touch_decision()
+                            self.__decision_execution_thread = threading.Timer(0.5, _decision_if_still_my_priority)
+                            self.__decision_delay_key = delay_key
+                            self.__decision_delay_scheduled_at = time.time()
+                            self.__decision_execution_thread.start()
+                            return
                         ti = self.updated_game_state.get_turn_info() or {}
                         if self.__should_pause_for_targets():
                             bot_logger.log_info("Deferring decision; target selection still pending")
