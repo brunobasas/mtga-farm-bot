@@ -144,12 +144,6 @@ class Controller(ControllerSecondary):
             )
         self.log_reader = LogReader(self.patterns.values(), log_path=log_path, callback=self.__log_callback)
         self._log_path = log_path
-        self._supervisor_active = str(os.environ.get("MTGA_SUPERVISOR_ACTIVE", "")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
         runtime_status.reset_status(log_path=log_path)
         try:
             self.input = create_input_controller(input_backend)
@@ -4860,12 +4854,6 @@ class Controller(ControllerSecondary):
 
     def __handle_inactivity_timeout(self):
         """Handle timeout when no activity for 3 minutes - click next button repeatedly"""
-        if self._supervisor_active:
-            bot_logger.log_error("TIMEOUT: legacy inactivity resolve disabled while supervisor mode is active.")
-            runtime_status.set_recovery_reason("controller_inactivity_timeout")
-            runtime_status.set_mode("stuck_suspected", bot_state=str(self._get_state_from_log()))
-            self.__inactivity_timer = None
-            return
         bot_logger.log_info("TIMEOUT: No activity for 3 minutes - clicking next button")
         self.resolve()  # Click the "next" button
         # Reschedule timer to keep clicking until turn ends
@@ -4877,9 +4865,6 @@ class Controller(ControllerSecondary):
 
     def reset_inactivity_timer(self):
         """Reset the inactivity timer - called when a decision is made"""
-        if self._supervisor_active:
-            runtime_status.touch_decision()
-            return
         if self.__inactivity_timer is not None:
             self.__inactivity_timer.cancel()
             self.__inactivity_timer = None

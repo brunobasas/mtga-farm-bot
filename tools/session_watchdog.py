@@ -15,9 +15,8 @@ turn an unattended farming session into debuggable evidence:
      timers), throttled per signature so it stays scannable.
 
   D. Stall black boxes   -> runtime/debug/incident-<stamp>/
-     When runtime/status.json shows a genuine stall (reusing the supervisor's
-     detect_stuck_reason so the definition stays in one place), a text-only
-     incident bundle is written and registered in the shared signature registry
+     When runtime/status.json shows a genuine stall, a text-only incident bundle
+     is written and registered in the shared signature registry
      (tools/incident_tracking). No recovery is attempted here.
 
   B. Per-match records   -> runtime/records/<session>/match-NNNN.json
@@ -50,14 +49,7 @@ if str(ROOT_DIR) not in sys.path:
 from bot_logger import ensure_debug_dir
 from runtime_paths import ensure_runtime_subdir, runtime_file
 from runtime_status import read_status
-from state.state_machine import get_state_from_playerlog
-from tools.bot_supervisor import (
-    detect_stuck_reason,
-    read_tail,
-    resolve_bot_log_path,
-    resolve_playerlog_path,
-    write_text,
-)
+from state.state_machine import BotState, get_state_from_playerlog
 from tools.incident_tracking import (
     build_related_incidents_payload,
     build_signature_knowledge_payload,
@@ -77,7 +69,7 @@ ALERT_SIGNATURES: tuple[tuple[str, tuple[str, ...], float], ...] = (
     # move (cast/attack/select_target/...) was returned unchanged 3x in a row
     # with no game-state progress and got force-replaced with resolve(). The
     # bot's own DECISION_HEARTBEAT resets the inactivity timer on every retry,
-    # so detect_stuck_reason (timer-based) never sees this as a stall -- this
+    # so the timer-based stall detector never sees this as a stall -- this
     # is the only signal that surfaces it.
     ("stuck_action", ("STUCK_ACTION_RETRY_LIMIT",), 15.0),
     ("no_scryfall_land", ("No Scryfall data for land",), 60.0),
@@ -98,12 +90,119 @@ MATCH_END_RE = re.compile(
 INCIDENT_COOLDOWN_SEC = 120.0
 # No-progress window (any activity timestamp) before we treat the bot as hung
 # OUTSIDE a game -- e.g. frozen at home / post-account-switch, which the in-game
-# detect_stuck_reason never sees. Set well above a normal account switch or queue
+# stall detector never sees. Set well above a normal account switch or queue
 # search (both keep emitting input/playerlog events), so only a genuine hang trips
 # it. The overnight milo freeze idled ~3.5h, so there is enormous margin.
 HOME_IDLE_THRESHOLD_SEC = 360.0
 # Soft cap for history.log; rotated to history.log.1 when exceeded.
 HISTORY_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _has_local_priority(status: dict) -> bool:
+    turn_info = status.get("turn_info")
+    if not isinstance(turn_info, dict) or not turn_info:
+        return False
+    try:
+        local_seat = int(status.get("local_system_seat_id") or 0)
+    except Exception:
+        local_seat = 0
+    if local_seat <= 0:
+        return False
+    try:
+        decision_player = int(turn_info.get("decisionPlayer") or 0)
+    except Exception:
+        decision_player = 0
+    try:
+        priority_player = int(turn_info.get("priorityPlayer") or 0)
+    except Exception:
+        priority_player = 0
+    return decision_player == local_seat or priority_player == local_seat
+
+
+def _detect_stuck_reason(status: dict, thresholds: "_Thresholds") -> str | None:
+    bot_state = str(status.get("bot_state") or "")
+    timer_type = str(status.get("my_timer_type") or "")
+    try:
+        critical_count = int(status.get("my_timer_critical_count") or 0)
+    except Exception:
+        critical_count = 0
+    if (
+        bot_state != str(BotState.HOME)
+        and timer_type == "TimerType_Inactivity"
+        and critical_count >= max(1, int(thresholds.my_timer_critical_threshold))
+    ):
+        return "repeated_own_timer_critical"
+    if bot_state != str(BotState.HOME) and bool(status.get("my_timer_timeout_seen")):
+        return "own_timeout_observed"
+    wait_active = float(status.get("intentional_wait_until_epoch") or 0.0) > time.time()
+    if (
+        bot_state == str(BotState.IN_GAME)
+        and str(status.get("mode") or "") == "in_game"
+        and bool(status.get("my_timer_running"))
+        and timer_type == "TimerType_Inactivity"
+    ):
+        try:
+            stall_threshold = max(5.0, float(thresholds.my_timer_stall_sec))
+        except Exception:
+            stall_threshold = 20.0
+        try:
+            timer_elapsed = float(status.get("my_timer_elapsed_sec") or 0.0)
+        except Exception:
+            timer_elapsed = 0.0
+        try:
+            timer_remaining = float(status.get("my_timer_remaining_sec") or 0.0)
+        except Exception:
+            timer_remaining = 0.0
+        activity = []
+        for key in ("last_input_at_epoch", "last_decision_at_epoch", "last_playerlog_event_at_epoch"):
+            try:
+                activity.append(float(status.get(key) or 0.0))
+            except Exception:
+                activity.append(0.0)
+        latest = max(activity)
+        idle = max(0.0, time.time() - latest) if latest > 0.0 else 0.0
+        if wait_active and timer_remaining > 8.0:
+            return None
+        if not _has_local_priority(status):
+            return None
+        if timer_elapsed >= stall_threshold and idle >= stall_threshold:
+            return "own_inactivity_timer_stalled"
+    return None
+
+
+def _resolve_playerlog_path(status: dict) -> str:
+    candidate = str(status.get("log_path") or "").strip()
+    if candidate and os.path.isfile(candidate):
+        return candidate
+    env_path = str(os.environ.get("MTGA_BOT_LOG_PATH", "")).strip()
+    if env_path and os.path.isfile(env_path):
+        return env_path
+    return str(Path.home() / "AppData" / "LocalLow" / "Wizards Of The Coast" / "MTGA" / "Player.log")
+
+
+def _resolve_bot_log_path() -> str:
+    return str(runtime_file("logs", "bot.log"))
+
+
+def _read_tail(path: str, *, max_bytes: int) -> str:
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes), os.SEEK_SET)
+            return handle.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _write_text(path: Path, content: str) -> None:
+    try:
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write(content or "")
+    except Exception:
+        pass
 
 
 def _pid_alive(pid: int) -> bool:
@@ -132,10 +231,7 @@ def _pid_alive(pid: int) -> bool:
 
 
 class _Thresholds:
-    """Minimal stand-in for the supervisor argparse namespace that
-    detect_stuck_reason reads. Values mirror tools/bot_supervisor.py argparse
-    defaults (--my-timer-critical-threshold, --my-timer-stall-sec) so "stalled"
-    means exactly the same thing here as in the supervisor."""
+    """Thresholds used by the read-only stall detector."""
 
     my_timer_critical_threshold = 1
     my_timer_stall_sec = 45.0
@@ -316,7 +412,7 @@ def _process_new_lines(state: dict, session_id: str, text: str, status: dict) ->
 
 
 def _consume_bot_log(state: dict, session_id: str, status: dict) -> None:
-    bot_log = resolve_bot_log_path()
+    bot_log = _resolve_bot_log_path()
     if not os.path.isfile(bot_log):
         return
     offset = int(state.get("offset") or 0)
@@ -358,8 +454,8 @@ def _consume_bot_log(state: dict, session_id: str, status: dict) -> None:
 def _write_incident_bundle(state: dict, status: dict, reason: str) -> None:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     incident_dir = Path(ensure_debug_dir(f"incident-{stamp}"))
-    playerlog = resolve_playerlog_path(status)
-    player_tail = read_tail(playerlog, max_bytes=160000)
+    playerlog = _resolve_playerlog_path(status)
+    player_tail = _read_tail(playerlog, max_bytes=160000)
     try:
         derived_state = get_state_from_playerlog(player_tail)
     except Exception:
@@ -378,13 +474,13 @@ def _write_incident_bundle(state: dict, status: dict, reason: str) -> None:
         pass
     # Prefer the persistent history (survives restarts) for the bot-side tail.
     history = _history_path()
-    bot_tail = read_tail(str(history), max_bytes=160000) or read_tail(
-        resolve_bot_log_path(), max_bytes=160000
+    bot_tail = _read_tail(str(history), max_bytes=160000) or _read_tail(
+        _resolve_bot_log_path(), max_bytes=160000
     )
-    write_text(incident_dir / "bot_tail.txt", bot_tail)
-    write_text(incident_dir / "player_tail.txt", player_tail)
+    _write_text(incident_dir / "bot_tail.txt", bot_tail)
+    _write_text(incident_dir / "player_tail.txt", player_tail)
     # Register in the shared signature machinery so recurring stalls dedupe and
-    # accumulate known guidance across sessions (same registry the supervisor uses).
+    # accumulate known guidance across sessions.
     try:
         ensure_tracking_file(incident_dir, created_at=stamp, trigger=reason)
         with (incident_dir / "related_incidents.json").open("w", encoding="utf-8") as handle:
@@ -420,7 +516,7 @@ def _check_stall(state: dict, status: dict, thresholds: _Thresholds) -> str | No
     cooldown suppressed the bundle write) so the caller can skip the home-idle
     check when an in-game stall already explains the freeze."""
     try:
-        reason = detect_stuck_reason(status, thresholds)
+        reason = _detect_stuck_reason(status, thresholds)
     except Exception:
         reason = None
     if not reason:
@@ -436,7 +532,7 @@ def _check_stall(state: dict, status: dict, thresholds: _Thresholds) -> str | No
 def _check_home_idle(state: dict, status: dict) -> None:
     """Catch a hang OUTSIDE a game: no activity of any kind for too long.
 
-    The in-game detector (detect_stuck_reason) only fires while IN_GAME, so a
+    The in-game detector only fires while IN_GAME, so a
     freeze at home / post-account-switch (like the overnight milo hang that idled
     3.5h until disconnection) left no trace. Here we track the newest of the
     bot's activity timestamps; if none advances for HOME_IDLE_THRESHOLD_SEC we
