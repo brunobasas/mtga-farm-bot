@@ -15,6 +15,7 @@ class DummyAI(AIKernel):
     def __init__(self):
         self.__current_turn_num = 0
         self.__has_land_been_played_this_turn = False
+        self.__known_battlefield_zones = set()
         # AI debug lines go into the shared bot.log; without this assignment
         # _debug silently dropped every message (open() raised AttributeError).
         try:
@@ -28,6 +29,7 @@ class DummyAI(AIKernel):
         self._debug("Resetting AI state for new game")
         self.__current_turn_num = 0
         self.__has_land_been_played_this_turn = False
+        self.__known_battlefield_zones = set()
         self._debug("AI state reset complete")
 
     def _debug(self, message):
@@ -720,7 +722,6 @@ class DummyAI(AIKernel):
                         )
                     except Exception:
                         removal_opp_life = None
-                    removal_bf_ids = RemovalLogic.battlefield_zone_ids(game_state.get_full_state()) or None
                     # Do we control a creature on the battlefield? Self-buff tricks
                     # (e.g. Fake Your Own Death) must not be cast with nothing of ours
                     # to buff -- otherwise the only legal target is an enemy, which we
@@ -738,23 +739,21 @@ class DummyAI(AIKernel):
                     #
                     # battlefield_zone_ids() only finds a zone once MTGA re-declares its
                     # ZoneType (observed: a match can go many turns with the battlefield
-                    # type declared only once, so removal_bf_ids is empty most of the
-                    # game). Rather than either bypass the filter (the old bug) or refuse
-                    # every self-buff for lack of a known battlefield zone, INFER our
-                    # battlefield zone from a permanent that can only ever live there --
-                    # our lands. Any land we control shares the battlefield zoneId, so a
-                    # creature in that same zone is genuinely on our board, while a
-                    # creature in hand/graveyard is not.
-                    _own_bf = set(removal_bf_ids or set())
-                    if not _own_bf:
-                        _own_bf = {
-                            o.get('zoneId')
-                            for o in removal_game_objects
-                            if isinstance(o, dict)
-                            and o.get('controllerSeatId') == my_seat
-                            and 'CardType_Land' in (o.get('cardTypes') or [])
-                            and o.get('zoneId') is not None
-                        }
+                    # type declared only once, so it can return empty most of the game).
+                    # Inferring the zone from lands instead is unsafe: removal_game_objects
+                    # holds objects from every zone, so a land sitting in hand/graveyard/deck
+                    # would tag that zone as "battlefield" too, letting a hand creature slip
+                    # through -- reintroducing the exact bug this guard exists to prevent.
+                    # Instead, cache every battlefield zoneId ever reported and keep using
+                    # the cached set once known zones become momentarily unavailable.
+                    _current_bf_ids = RemovalLogic.battlefield_zone_ids(game_state.get_full_state())
+                    if _current_bf_ids:
+                        self.__known_battlefield_zones.update(_current_bf_ids)
+                    _own_bf = self.__known_battlefield_zones
+                    # Reuse the cache (instead of this turn's possibly-empty lookup) for
+                    # the removal/fight target filters below too, so they don't lose all
+                    # targets on the turns battlefield_zone_ids() comes back empty.
+                    removal_bf_ids = _own_bf or None
                     have_own_creature = bool(_own_bf) and any(
                         isinstance(o, dict)
                         and o.get('controllerSeatId') == my_seat
