@@ -346,7 +346,14 @@ def get_produced_mana_from_scryfall(arena_id: int):
         else:
             _mark_transient_failure(cache_key)
         return None
-    except (urllib.error.URLError, json.JSONDecodeError):
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        # A read timeout (as opposed to a connect timeout) raises a bare
+        # TimeoutError, not URLError -- urlopen only wraps failures up to
+        # establishing the connection. Without this, a slow/stalled Scryfall
+        # response escapes uncaught into the caller (get_land_produced_colors
+        # -> _score_land -> generate_move's decision loop), discarding the
+        # AI's entire move for that decision instead of degrading to "unknown
+        # color, treat as wildcard" like every other missing-data case here.
         _mark_transient_failure(cache_key)
         return None
 
@@ -381,9 +388,11 @@ def get_oracle_text_from_scryfall(arena_id: int):
         else:
             _mark_transient_failure(cache_key)
         return ""
-    except (urllib.error.URLError, json.JSONDecodeError):
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
         # Network/parse failure: transient, do not poison the persistent cache,
-        # but do avoid hammering it for a couple of minutes.
+        # but do avoid hammering it for a couple of minutes. TimeoutError is
+        # listed explicitly because a read timeout raises it bare, not wrapped
+        # in URLError -- see the identical fix in get_produced_mana_from_scryfall.
         _mark_transient_failure(cache_key)
         return ""
 

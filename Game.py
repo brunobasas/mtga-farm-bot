@@ -14,6 +14,13 @@ import runtime_status
 
 class Game:
 
+    # If the AI is handed the exact same decision context and returns the
+    # exact same move this many times in a row, the executed click(s) are not
+    # actually reaching the game (e.g. a cast whose confirmation never fires) --
+    # retrying again would just repeat the same silent failure forever. See
+    # STUCK_ACTION_RETRY_LIMIT below.
+    _STUCK_MOVE_RETRY_LIMIT = 3
+
     def __init__(self, controller: ControllerSecondary, ai: AIKernel, data_dir_prompt=None):
         self.ai = ai
         self.controller = controller
@@ -23,6 +30,11 @@ class Game:
         self._stop_requested = False
         self._timers: list[threading.Timer] = []
         self._last_action_delay_turn = -1
+        # Tracks (turn, phase, step, decisionPlayer, move_name, move_payload) of
+        # the last move actually executed, plus how many times in a row it has
+        # repeated -- see _STUCK_MOVE_RETRY_LIMIT.
+        self._last_move_signature = None
+        self._last_move_repeat_count = 0
         # Epoch when the current match actually started (first mulligan / inferred
         # live state). Used only to report match duration in the [MATCH_END]
         # marker; None until a game is under way.
@@ -480,6 +492,42 @@ class Game:
                 return
 
             move_name = list(move.keys())[0]
+            move_payload = move.get(move_name)
+            move_signature = (
+                turn_num, phase, step, decision_player, move_name,
+                tuple(move_payload) if isinstance(move_payload, list) else move_payload,
+            )
+            if move_signature == self._last_move_signature:
+                self._last_move_repeat_count += 1
+            else:
+                self._last_move_signature = move_signature
+                self._last_move_repeat_count = 1
+
+            # 'resolve'/auto_pass repeating is normal (e.g. passing priority
+            # while the opponent acts) -- only an active move (cast, attack,
+            # ...) repeating unchanged means the click(s) it drives are not
+            # actually landing in the game. 'select_target' is exempt too: the
+            # AI always returns the same sentinel payload ([-1], "target
+            # opponent avatar") for it regardless of which prompt triggered
+            # it, so an identical signature can legitimately recur across
+            # several different real target requests in one phase/step; it
+            # also already has its own retry-and-give-up handling in
+            # Controller.__schedule_target_selection.
+            _BREAKER_EXEMPT_MOVES = ('resolve', 'auto_pass', 'unconditional_auto_pass', 'select_target')
+            if (
+                move_name not in _BREAKER_EXEMPT_MOVES
+                and self._last_move_repeat_count >= self._STUCK_MOVE_RETRY_LIMIT
+            ):
+                bot_logger.log_error(
+                    f"STUCK_ACTION_RETRY_LIMIT: move {move_name}={move_payload} repeated "
+                    f"{self._last_move_repeat_count}x with no game-state progress "
+                    f"(turn={turn_num} {phase}/{step}); forcing resolve() to break the loop."
+                )
+                move = {'resolve': []}
+                move_name = 'resolve'
+                self._last_move_signature = (turn_num, phase, step, decision_player, 'resolve', ())
+                self._last_move_repeat_count = 1
+
             runtime_status.touch_decision(
                 move_name=move_name,
                 turn_info={

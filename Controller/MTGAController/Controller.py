@@ -7134,7 +7134,33 @@ class Controller(ControllerSecondary):
                 delay = 0.6
                 if not ids_in_hand:
                     delay = 1.0
-                _attempt_selection(1, delay=delay)
+                # The game keeps re-sending this SelectNReq in every GameState
+                # diff for as long as the prompt is unresolved (e.g. once per
+                # unrelated timer tick), and this handler re-runs each time.
+                # Without this guard that restarted a brand-new _attempt_selection
+                # cycle on top of one already in flight for the SAME prompt
+                # (same_pending), stacking overlapping click/submit attempts that
+                # fight each other -- observed as an endless alternating
+                # select/deselect loop on a 2-card discard prompt that never
+                # completed. Only skip when it's a genuine re-announcement of the
+                # prompt we are already working; a fresh/different prompt (or one
+                # a prior attempt already gave up on and cleared) still starts.
+                if same_pending and self.__select_n_in_progress:
+                    bot_logger.log_info(
+                        f"SelectN request re-seen for in-progress token={token}; "
+                        "not restarting selection."
+                    )
+                else:
+                    # Mark in-progress synchronously, before scheduling the
+                    # timer that actually starts clicking (_do_selection only
+                    # sets this ~0.6-1.0s later, once its delay elapses). Without
+                    # this, a second SelectNReq re-parsed for the same prompt
+                    # within that window would still see in_progress=False, slip
+                    # past the guard above, and schedule a second overlapping
+                    # cycle -- exactly the race this guard exists to close.
+                    self.__select_n_in_progress = True
+                    self.__select_n_in_progress_since = time.time()
+                    _attempt_selection(1, delay=delay)
         except Exception as e:
             bot_logger.log_error(f"Failed to handle SelectNReq: {e}")
 
@@ -9306,7 +9332,14 @@ class Controller(ControllerSecondary):
                         "target_required": self.__attack_target_required,
                     },
                 )
-                self.__arm_combat_recovery(recovery_key, delay=1.0)
+                # Give the normal decision path (settle timer -> AI.generate_move
+                # -> all_attack) a real chance to act first. A fixed 1.0s here
+                # used to fire before that settle delay (up to 2s+) resolved, so
+                # COMBAT_RECOVERY_ATTEMPT logged on almost every combat instead
+                # of only on genuine stalls, and the two all_attack() calls could
+                # overlap on the same click sequence.
+                recovery_delay = max(1.0, self.__get_effective_decision_delay() + 0.5)
+                self.__arm_combat_recovery(recovery_key, delay=recovery_delay)
                 return
         except Exception as e:
             bot_logger.log_error(f"Failed to parse DeclareAttackersReq: {e}")
@@ -9839,6 +9872,27 @@ class Controller(ControllerSecondary):
                         self.__decision_execution_thread = None
                         self.__decision_delay_key = None
                         self.__decision_delay_scheduled_at = 0.0
+                        # This timer can be armed BEFORE a scry/GroupReq prompt
+                        # appears (from an earlier priority window) and only
+                        # fires later, by which point the prompt's own Done-click
+                        # flow (see GroupReq handling, __group_req_active_until)
+                        # may still be in flight. Unlike the other three callers
+                        # of __invoke_decision_callback, this one used to fire
+                        # unconditionally, dispatching a cast/hand-scan whose
+                        # mouse movement raced the pending scry Done click --
+                        # observed as the hand-card hover-scan failing outright
+                        # ("No hover update before bounds") right after a scry.
+                        if time.time() < self.__group_req_active_until:
+                            bot_logger.log_info(
+                                "Deferring decision; scry/group prompt still active"
+                            )
+                            runtime_status.set_intentional_wait(2.0, "scry_wait")
+                            runtime_status.touch_decision()
+                            self.__decision_execution_thread = threading.Timer(0.5, _decision_if_still_my_priority)
+                            self.__decision_delay_key = delay_key
+                            self.__decision_delay_scheduled_at = time.time()
+                            self.__decision_execution_thread.start()
+                            return
                         ti = self.updated_game_state.get_turn_info() or {}
                         if self.__should_pause_for_targets():
                             bot_logger.log_info("Deferring decision; target selection still pending")

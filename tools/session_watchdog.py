@@ -73,6 +73,13 @@ ALERT_SIGNATURES: tuple[tuple[str, tuple[str, ...], float], ...] = (
     ("combat_force", ("COMBAT_RECOVERY_ATTEMPT",), 20.0),
     ("submit_img_fail", ("SUBMIT_SELECTION_IMG: image not found",), 20.0),
     ("unsupported_cast", ("not implemented yet", "chooser not implemented"), 30.0),
+    # Game.py's stuck-move breaker (_STUCK_MOVE_RETRY_LIMIT): the same active
+    # move (cast/attack/select_target/...) was returned unchanged 3x in a row
+    # with no game-state progress and got force-replaced with resolve(). The
+    # bot's own DECISION_HEARTBEAT resets the inactivity timer on every retry,
+    # so detect_stuck_reason (timer-based) never sees this as a stall -- this
+    # is the only signal that surfaces it.
+    ("stuck_action", ("STUCK_ACTION_RETRY_LIMIT",), 15.0),
     ("no_scryfall_land", ("No Scryfall data for land",), 60.0),
     ("no_card_info", ("No card info for grpId",), 60.0),
     ("timer_critical", ("MY_TIMER_CRITICAL", "TimerType_Inactivity remaining=0"), 20.0),
