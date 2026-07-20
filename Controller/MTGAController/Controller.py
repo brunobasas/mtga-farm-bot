@@ -13,6 +13,7 @@ import AI.Utilities.RemovalLogic as RemovalLogic
 import AI.Utilities.FightLogic as FightLogic
 import AI.Utilities.CounterLogic as CounterLogic
 import AI.Utilities.CardInfo as CardInfo
+import AI.Utilities.LifegainLogic as LifegainLogic
 from Controller.MTGAController.LogReader import LogReader
 from Controller.Utilities.GameState import GameState
 from Controller.Utilities.input_controller import InputControllerError, create_input_controller
@@ -8556,6 +8557,7 @@ class Controller(ControllerSecondary):
             full_state = self.updated_game_state.get_full_state()
             bf_ids = RemovalLogic.battlefield_zone_ids(full_state)
             stack_ids = CounterLogic.stack_zone_ids(full_state)
+            candidates = []  # (instanceId, is_stack_target, obj)
             for group in req.get("targets", []) or []:
                 for tgt in group.get("targets", []) or []:
                     if tgt.get("legalAction") != "SelectAction_Select":
@@ -8568,8 +8570,33 @@ class Controller(ControllerSecondary):
                         continue  # e.g. a player target -> not a card overlay
                     zid = obj.get("zoneId")
                     if zid is not None and zid not in bf_ids:
-                        return int(tid), (zid in stack_ids)
-            return None
+                        candidates.append((int(tid), zid in stack_ids, obj))
+            if not candidates:
+                return None
+            # Stack targets (what a counterspell hits) keep the original
+            # first-offered behaviour: "the best creature for us" is meaningless
+            # for a spell we want to answer, and ranking them here would silently
+            # change counterspell targeting too.
+            if any(is_stack for _, is_stack, _ in candidates):
+                tid, is_stack, _ = candidates[0]
+                return tid, is_stack
+            # Graveyard/exile: this is a reanimation-style choice, so pick the
+            # card we actually want back. Returning the first offered target made
+            # the bot revive a Hinterland Sanctifier while a Fiendish Panda and a
+            # Twinblade Paladin sat in the same graveyard (2026-07-17 19:46).
+            best = LifegainLogic.best_creature([obj for _, _, obj in candidates])
+            if best is not None:
+                best_id = int(best.get("instanceId"))
+                if best_id != candidates[0][0]:
+                    bot_logger.log_info(
+                        f"CHOOSER_RANK: picking {best_id} "
+                        f"(tier/cmc/body={LifegainLogic.creature_score(best)}) over "
+                        f"first-offered {candidates[0][0]} "
+                        f"of {[tid for tid, _, _ in candidates]}"
+                    )
+                return best_id, False
+            tid, is_stack, _ = candidates[0]
+            return tid, is_stack
         except Exception as e:
             bot_logger.log_error(f"pick_chooser_target failed: {e}")
             return None
