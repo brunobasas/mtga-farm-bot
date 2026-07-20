@@ -754,11 +754,22 @@ class DummyAI(AIKernel):
                     # the removal/fight target filters below too, so they don't lose all
                     # targets on the turns battlefield_zone_ids() comes back empty.
                     removal_bf_ids = _own_bf or None
+                    # zoneId alone is not enough: gameObjects is merged across diffs
+                    # and only pruned on an explicit diffDeletedInstanceIds, so a
+                    # creature that died keeps zoneId=<battlefield> forever. The zone's
+                    # own objectInstanceIds list is replaced on every diff, so it is the
+                    # authoritative "what is actually on the board" answer. Without this
+                    # the bot cast removal at creatures that had been dead for minutes
+                    # and then hung hunting them on screen.
+                    removal_live_ids = RemovalLogic.battlefield_instance_ids(
+                        game_state.get_full_state(), _own_bf or None
+                    )
                     have_own_creature = bool(_own_bf) and any(
                         isinstance(o, dict)
                         and o.get('controllerSeatId') == my_seat
                         and 'CardType_Creature' in (o.get('cardTypes') or [])
                         and o.get('zoneId') in _own_bf
+                        and (removal_live_ids is None or o.get('instanceId') in removal_live_ids)
                         for o in removal_game_objects
                     )
                     allow_sorcery = phase in ['Phase_Main1', 'Phase_Main2']
@@ -831,6 +842,7 @@ class DummyAI(AIKernel):
                                     my_seat,
                                     opponent_life=removal_opp_life,
                                     battlefield_zone_ids=removal_bf_ids,
+                                    live_instance_ids=removal_live_ids,
                                 )
                                 if _rm_target is None:
                                     # A non-permanent removal spell (instant/sorcery)
