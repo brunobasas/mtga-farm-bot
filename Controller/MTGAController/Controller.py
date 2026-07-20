@@ -40,6 +40,14 @@ _GUILD_COLOR_MAP = {
     "simic": "UG",
 }
 _COLOR_LETTERS = set("WUBRGC")
+# Wardens of the Cycle's Morbid trigger ("choose one -- gain 2 life / draw a card
+# and lose 1 life"). Its modal renders as two side-by-side card plates rather than
+# the vertical text-button stack the generic modal handler assumes, so it gets its
+# own geometry and its own policy (see __handle_wardens_of_the_cycle_modal).
+_WARDENS_OF_THE_CYCLE_GRP_ID = 93838
+# Below this life total we take the "gain 2 life" plate instead of the card, since
+# the draw mode costs 1 life and we are close enough to dying for that to matter.
+_WARDENS_LOW_LIFE_THRESHOLD = 5
 _MY_TIMER_TYPES = {
     "TimerType_ActivePlayer",
     "TimerType_NonActivePlayer",
@@ -6351,6 +6359,96 @@ class Controller(ControllerSecondary):
         the option count (2 options when hand/board is empty).
         """
         try:
+            n = max(1, int(n_options or 1))
+        except (TypeError, ValueError):
+            n = 1
+        group_center_y = 408
+        spacing_y = 107
+        center_x = 956
+        bottom_y = int(group_center_y + ((n - 1) / 2.0) * spacing_y)
+        self.__resolve_modal_at_point(
+            (center_x, bottom_y),
+            label="MODAL_LOSE_LIFE",
+            reason=f"{n} option(s) (source={source_id}) -> clicking bottom (lose life)",
+            move_name="choose_last",
+            move_data={"n_options": n, "source": source_id},
+        )
+
+    def __my_life_total(self):
+        """Our current life total, or None if the state does not carry it yet.
+        Mirrors the seat lookup used by the match summary."""
+        try:
+            players = self.updated_game_state.get_players() or []
+        except Exception:
+            return None
+        seat = self.__system_seat_id
+        for player in players:
+            if not isinstance(player, dict):
+                continue
+            if seat is None or player.get("systemSeatNumber") == seat:
+                life = player.get("lifeTotal")
+                return life if isinstance(life, int) else None
+        return None
+
+    def __is_wardens_of_the_cycle_source(self, source_id) -> bool:
+        """True if a modal's sourceId resolves to Wardens of the Cycle. A triggered
+        ability sits on the stack as its own object, so the originating card's grpId
+        can live on either grpId or objectSourceGrpId depending on the message."""
+        if source_id is None:
+            return False
+        try:
+            for obj in (self.updated_game_state.get_game_objects() or []):
+                if not isinstance(obj, dict) or obj.get("instanceId") != source_id:
+                    continue
+                return _WARDENS_OF_THE_CYCLE_GRP_ID in (
+                    obj.get("grpId"),
+                    obj.get("objectSourceGrpId"),
+                )
+        except Exception:
+            return False
+        return False
+
+    def __handle_wardens_of_the_cycle_modal(self, source_id=None) -> None:
+        """Pick a mode for Wardens of the Cycle's Morbid trigger.
+
+        The overlay shows two card-sized plates side by side (NOT the vertical
+        text-button stack __handle_modal_choose_last_option assumes): left is
+        "You gain 2 life", right is "You draw a card and you lose 1 life". We take
+        the card (right) by default, and only fall back to the 2 life (left) when
+        we are low enough that paying 1 life for it is a real risk. Geometry is
+        base-1920x1080, measured from a 2-option capture; the pair is centred
+        horizontally, so the plates sit symmetrically either side of centre.
+        """
+        center_x = 956
+        plate_offset_x = 216
+        plate_y = 480
+        life = self.__my_life_total()
+        if life is not None and life < _WARDENS_LOW_LIFE_THRESHOLD:
+            point = (center_x - plate_offset_x, plate_y)
+            label, mode = "MODAL_WARDENS_GAIN_LIFE", "gain_2_life"
+        else:
+            # Unknown life also lands here: drawing is the mode we want in the
+            # overwhelming majority of games, and 1 life is a cheap wrong guess.
+            point = (center_x + plate_offset_x, plate_y)
+            label, mode = "MODAL_WARDENS_DRAW", "draw_lose_1_life"
+        self.__resolve_modal_at_point(
+            point,
+            label=label,
+            reason=(
+                f"Wardens of the Cycle (source={source_id}) "
+                f"life={life if life is not None else 'unknown'} -> {mode}"
+            ),
+            move_name=f"wardens_{mode}",
+            move_data={"source": source_id, "life": life, "mode": mode},
+        )
+
+    def __resolve_modal_at_point(
+        self, base_point, label: str, reason: str, move_name: str, move_data: dict
+    ) -> None:
+        """Click one plate of a modal "Choose One" overlay at base-1920x1080
+        `base_point`, with the pause/retry plumbing every modal needs. Callers own
+        the geometry and the policy; this owns getting the click to land."""
+        try:
             if self._suppress_selections or self._stop_requested:
                 bot_logger.log_info("Modal choice ignored: selections suppressed or stop requested.")
                 return
@@ -6358,12 +6456,6 @@ class Controller(ControllerSecondary):
             if now - self.__last_modal_choice_ts < 2.0:
                 bot_logger.log_info("Modal choice ignored: duplicate within 2s window.")
                 return
-            n = max(1, int(n_options or 1))
-            group_center_y = 408
-            spacing_y = 107
-            center_x = 956
-            bottom_y = int(group_center_y + ((n - 1) / 2.0) * spacing_y)
-            base_point = (center_x, bottom_y)
             self.__last_modal_choice_ts = now
             # Pause the decision loop while we resolve the modal, so a running
             # hand/board scan does not move the mouse and race the modal click
@@ -6387,13 +6479,8 @@ class Controller(ControllerSecondary):
                 snap_ti.get("turnNumber"), snap_ti.get("phase"),
                 snap_ti.get("step"), snap_ti.get("decisionPlayer"),
             )
-            bot_logger.log_info(
-                f"MODAL_CHOICE: {n} option(s) (source={source_id}) -> clicking bottom "
-                f"(lose life) at base={base_point}"
-            )
-            self.__record_decision(
-                "modal", "choose_last", {"n_options": n, "source": source_id}
-            )
+            bot_logger.log_info(f"MODAL_CHOICE: {reason} at base={base_point}")
+            self.__record_decision("modal", move_name, move_data)
 
             def _modal_still_open() -> bool:
                 # Resolved if the turn state moved on from the modal's step.
@@ -6416,11 +6503,11 @@ class Controller(ControllerSecondary):
                             f"MODAL_CHOICE: modal resolved before retry {attempt}; stopping."
                         )
                         return
-                    target, src = self._map_abs_point_to_arena(base_point, label="MODAL_LOSE_LIFE")
+                    target, src = self._map_abs_point_to_arena(base_point, label=label)
                     bot_logger.log_info(
                         f"MODAL_CHOICE click (attempt {attempt}): base={base_point} target={target} src={src}"
                     )
-                    bot_logger.log_click(target[0], target[1], "MODAL_LOSE_LIFE")
+                    bot_logger.log_click(target[0], target[1], label)
                     self.input.move_abs(target[0], target[1])
                     time.sleep(0.3)
                     self.input.left_click(1)
@@ -6614,8 +6701,20 @@ class Controller(ControllerSecondary):
                     req.get("idType") == "IdType_PromptParameterIndex"
                     and req.get("context") == "SelectionContext_Resolution"
                 ):
+                    source_id = req.get("sourceId")
+                    # Wardens of the Cycle draws its two modes as side-by-side card
+                    # plates, so the bottom-of-a-vertical-stack geometry below would
+                    # miss. Its own handler knows the layout and the life-based
+                    # policy. The len check keeps that geometry to the capture it
+                    # was measured from.
+                    if len(ids) == 2 and self.__is_wardens_of_the_cycle_source(source_id):
+                        self.__handle_wardens_of_the_cycle_modal(source_id=source_id)
+                        self.__clear_pending_select_n_state(
+                            "Modal choice: Wardens of the Cycle mode picked."
+                        )
+                        return
                     self.__handle_modal_choose_last_option(
-                        len(ids), source_id=req.get("sourceId")
+                        len(ids), source_id=source_id
                     )
                     self.__clear_pending_select_n_state(
                         "Modal choice: clicked last option (lose life)."
