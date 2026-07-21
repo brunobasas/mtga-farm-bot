@@ -8361,7 +8361,12 @@ class Controller(ControllerSecondary):
             profile = RemovalLogic.get_removal_profile(grp_id)
             if not profile:
                 return None
-            bf_ids = RemovalLogic.battlefield_zone_ids(self.updated_game_state.get_full_state())
+            full_state = self.updated_game_state.get_full_state()
+            bf_ids = RemovalLogic.battlefield_zone_ids(full_state)
+            # See RemovalLogic.battlefield_instance_ids: a merged gameObjects list
+            # keeps dead creatures at their old zoneId, so the zone membership list
+            # is what tells us the creature is still there to be clicked.
+            live_ids = RemovalLogic.battlefield_instance_ids(full_state, bf_ids or None)
             opp_life = RemovalLogic.opponent_life_from_players(
                 self.updated_game_state.get_players(), self.__system_seat_id
             )
@@ -8371,6 +8376,7 @@ class Controller(ControllerSecondary):
                 self.__system_seat_id,
                 opponent_life=opp_life,
                 battlefield_zone_ids=(bf_ids or None),
+                live_instance_ids=live_ids,
             )
             bot_logger.log_info(
                 f"REMOVAL resolve: source={source_id} grp={grp_id} profile={profile} "
@@ -8389,6 +8395,19 @@ class Controller(ControllerSecondary):
             if isinstance(obj, dict) and obj.get("instanceId") == instance_id:
                 return obj.get("grpId")
         return None
+
+    def __is_harmful_to_target(self, source_id) -> bool:
+        """True if the spell on the stack hurts whatever it targets. Every removal
+        profile kind (destroy / exile / damage / minus_toughness) does, so having a
+        profile at all is the test. Used to refuse pointing removal at our own
+        board when the prompt offers nothing else."""
+        try:
+            grp_id = self.__grp_id_for_instance(source_id)
+            if grp_id is None:
+                return False
+            return bool(RemovalLogic.get_removal_profile(grp_id))
+        except Exception:
+            return False
 
     def __is_self_buff_source(self, source_id) -> bool:
         """True if the spell on the stack is a pump/protect trick to cast on our
@@ -8805,11 +8824,16 @@ class Controller(ControllerSecondary):
             removal_target is not None
             and removal_target != RemovalLogic.FACE_TARGET
             and not legal_creature_ids
-            and face_legal
         ):
+            # face_legal used to be required here, which left a hole: with no enemy
+            # creature AND no legal face the stale target survived and we spent the
+            # whole prompt hunting a creature that was not on the board. Observed
+            # 2026-07-20 09:27 (Mortify -> 378, legalTargets=[343,353] both OURS):
+            # three OPP_BATTLEFIELD_ITEM_TIMEOUTs and a rope-burning stall. Drop the
+            # stale target unconditionally; the paths below decide what is legal.
             bot_logger.log_info(
                 f"{reason}: profile target {removal_target} is not offered and no enemy "
-                f"creature is legal; taking the face instead."
+                f"creature is legal; dropping it (face_legal={face_legal})."
             )
             removal_target = None
 
@@ -8821,6 +8845,20 @@ class Controller(ControllerSecondary):
         # can target a creature WE control (e.g. Undying Malice), pick our best
         # creature and click our own battlefield -- never the avatar.
         if not face_legal and not legal_creature_ids and own_creature_ids:
+            # ... but ONLY for a spell that is not harmful. Every removal profile
+            # kind (destroy / exile / damage / minus_toughness) hurts whatever it
+            # points at, so aiming one at our own board is strictly worse than not
+            # resolving it. This branch was written for beneficial self-targeting
+            # spells (e.g. Undying Malice) and had no such check; once the stale
+            # target above is dropped, a Mortify with an empty enemy board would
+            # fall straight through here and destroy one of our own creatures.
+            if self.__is_harmful_to_target(source_id):
+                bot_logger.log_info(
+                    f"{reason}: harmful spell with no enemy creature and no legal face; "
+                    f"refusing to point it at our own creatures {own_creature_ids}."
+                )
+                self.__write_target_debug_bundle("harmful_spell_only_own_targets")
+                return
             own_target = self.__best_creature_among(own_creature_ids)
             if own_target is not None:
                 bot_logger.log_info(

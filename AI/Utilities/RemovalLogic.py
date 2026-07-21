@@ -399,10 +399,52 @@ def battlefield_zone_ids(full_state: dict) -> set[int]:
     return ids
 
 
+def battlefield_instance_ids(
+    full_state: dict,
+    known_zone_ids: set[int] | None = None,
+) -> set[int] | None:
+    """instanceIds that are ON a battlefield right now, read from the zone's own
+    objectInstanceIds list. None means "could not read any battlefield zone",
+    which callers must treat as "no data" rather than "the board is empty".
+
+    Why this exists: GameState.update MERGES gameObjects across diffs and only
+    drops one on an explicit diffDeletedInstanceIds. A creature that left the
+    battlefield without such a diff therefore keeps its stale `zoneId` forever,
+    so filtering on obj["zoneId"] in battlefield_zone_ids() happily returns
+    creatures that died many turns (or matches) ago. Observed 2026-07-20 09:26:
+    the AI cast Mortify at instanceId 378, an opponent creature last seen alive
+    at 09:09 -- MTGA offered only OUR two creatures as legal targets, the bot
+    hunted a card that was not on screen, and burned the rope.
+
+    Zone entries do not have that problem: `zones` merges by zoneId, and a zone's
+    objectInstanceIds is a list, which __update_dict replaces wholesale on every
+    diff that mentions the zone. So the zone list is authoritative for membership.
+    """
+    ids: set[int] = set()
+    seen_zone = False
+    try:
+        for zone in (full_state or {}).get("zones", []) or []:
+            if not isinstance(zone, dict):
+                continue
+            is_bf = zone.get("type") == "ZoneType_Battlefield" or (
+                known_zone_ids is not None and zone.get("zoneId") in known_zone_ids
+            )
+            if not is_bf:
+                continue
+            seen_zone = True
+            for inst_id in zone.get("objectInstanceIds", []) or []:
+                if isinstance(inst_id, int):
+                    ids.add(inst_id)
+    except Exception:
+        return None
+    return ids if seen_zone else None
+
+
 def opponent_creatures(
     game_objects: list[dict],
     my_seat: int,
     battlefield_zone_ids: set[int] | None = None,
+    live_instance_ids: set[int] | None = None,
 ) -> list[dict]:
     out = []
     for obj in game_objects or []:
@@ -413,6 +455,10 @@ def opponent_creatures(
         if obj.get("controllerSeatId") == my_seat:
             continue
         if battlefield_zone_ids is not None and obj.get("zoneId") not in battlefield_zone_ids:
+            continue
+        # The zoneId above can be stale (see battlefield_instance_ids); the zone's
+        # own membership list cannot. When we have it, it wins.
+        if live_instance_ids is not None and obj.get("instanceId") not in live_instance_ids:
             continue
         if obj.get("instanceId") is None:
             continue
@@ -446,6 +492,7 @@ def choose_removal_target(
     my_seat: int,
     opponent_life: int | None = None,
     battlefield_zone_ids: set[int] | None = None,
+    live_instance_ids: set[int] | None = None,
 ) -> int | None:
     """FACE_TARGET (-1) for lethal burn, a creature instanceId, or None."""
     if not profile:
@@ -464,7 +511,9 @@ def choose_removal_target(
     if kind == "damage" and not profile.get("can_hit_creature", True):
         return None
 
-    enemies = opponent_creatures(game_objects, my_seat, battlefield_zone_ids)
+    enemies = opponent_creatures(
+        game_objects, my_seat, battlefield_zone_ids, live_instance_ids
+    )
     killable = [c for c in enemies if can_kill(profile, c)]
     if not killable:
         return None
