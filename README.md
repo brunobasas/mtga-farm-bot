@@ -95,7 +95,7 @@ The bot checks GitHub for a newer version on startup and, when one is found, a d
 
 Either check is silently skipped when there's no network access. Dependencies from `requirements.txt` are reinstalled automatically if they changed as part of the update.
 
-The app's current version (`1.1.1`, sourced from `version.py`) is shown in **Settings**, above the Manage Accounts button.
+The app's current version (`1.1.3`, sourced from `version.py`) is shown in **Settings**, above the Manage Accounts button.
 
 ## Configuration
 
@@ -163,6 +163,9 @@ The bot maximizes mana usage each turn:
 - Kicker: the "Cast with Kicker?" chooser is answered automatically (always the plain, non-kicked version for now) so the bot never stalls on it
 - Client-side "Are You Sure?" confirmations are handled reactively after a failed cast attempt, avoiding speculative screen probes during normal casts
 - Decision recovery is guarded against open payment/selection prompts and resumes safely after modal, stack, or scry interruptions
+- Ties between otherwise equal casting plans favor lifegain-payoff creatures, so decks built around gaining life develop toward their game plan sooner
+- Removal only ever targets creatures still on the battlefield and never redirects a harmful spell at your own board when no valid enemy target exists
+- When a card lets you choose which creature to return from the graveyard or exile, the bot ranks candidates by their role in the deck's strategy instead of taking whatever the game offers first
 
 ### Stopping the bot
 
