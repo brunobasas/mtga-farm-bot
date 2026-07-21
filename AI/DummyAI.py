@@ -6,6 +6,7 @@ import AI.Utilities.RemovalLogic as RemovalLogic
 import AI.Utilities.CardPolicy as CardPolicy
 import AI.Utilities.CounterLogic as CounterLogic
 import AI.Utilities.FightLogic as FightLogic
+import AI.Utilities.LifegainLogic as LifegainLogic
 import traceback
 from datetime import datetime
 
@@ -442,7 +443,7 @@ class DummyAI(AIKernel):
         for i in range(len(actions) - 1, -1, -1):
             cmc_suffix[i] = cmc_suffix[i + 1] + actions[i][0]
 
-        best = None  # (spent, count, max_cmc, indices)
+        best = None  # (spent, count, max_cmc, payoffs, indices)
 
         def _better(a, b):
             if b is None:
@@ -451,9 +452,15 @@ class DummyAI(AIKernel):
                 return a[0] > b[0]
             if a[1] != b[1]:
                 return a[1] < b[1]
+            # Same mana spent on the same number of cards: prefer the plan that
+            # gets a lifegain payoff onto the board. Deliberately ranked BELOW
+            # mana efficiency -- this only breaks ties, it never trades tempo for
+            # the engine.
+            if a[3] != b[3]:
+                return a[3] > b[3]
             return a[2] > b[2]
 
-        def _dfs(idx, spent, count, max_cmc, indices, combined_costs):
+        def _dfs(idx, spent, count, max_cmc, payoffs, indices, combined_costs):
             nonlocal best
             if spent > total_mana:
                 return
@@ -464,40 +471,49 @@ class DummyAI(AIKernel):
             ):
                 return
             if count > 0:
-                cand = (spent, count, max_cmc, list(indices))
+                cand = (spent, count, max_cmc, payoffs, list(indices))
                 if _better(cand, best):
                     best = cand
             if idx >= len(actions):
                 return
 
-            paid_cost, _instance_id, _card_name, _mana_cost_str, action_mana_cost, _uses_convoke, _type_priority, _nominal_cmc, _is_discounted, _priority_removal = actions[idx]
+            paid_cost, _instance_id, _card_name, _mana_cost_str, action_mana_cost, _uses_convoke, _type_priority, _nominal_cmc, _is_discounted, _priority_removal, _lifegain_payoff = actions[idx]
             safe_action_mana_cost = list(action_mana_cost) if isinstance(action_mana_cost, list) else []
             _dfs(
                 idx + 1,
                 spent + paid_cost,
                 count + 1,
                 max(max_cmc, paid_cost),
+                payoffs + (1 if _lifegain_payoff else 0),
                 indices + [idx],
                 combined_costs + safe_action_mana_cost,
             )
-            _dfs(idx + 1, spent, count, max_cmc, indices, combined_costs)
+            _dfs(idx + 1, spent, count, max_cmc, payoffs, indices, combined_costs)
 
-        _dfs(0, 0, 0, 0, [], [])
+        _dfs(0, 0, 0, 0, 0, [], [])
 
         if not best:
             return None, None
 
-        best_spent, plan_count, plan_max, plan_indices = best
+        best_spent, plan_count, plan_max, plan_payoffs, plan_indices = best
         if plan_count == 1:
             chosen_index = plan_indices[0]
         else:
-            chosen_index = max(plan_indices, key=lambda i: (actions[i][0], actions[i][6]))
+            # The AI returns ONE cast per decision and is re-invoked for the rest of
+            # the plan, so this is really "which of the planned spells goes first".
+            # Lifegain payoffs lead: a counter is only earned by lifegain that
+            # happens while the creature is already out, so every spell resolved
+            # ahead of it is a trigger it can never get back.
+            chosen_index = max(
+                plan_indices, key=lambda i: (actions[i][10], actions[i][0], actions[i][6])
+            )
 
         chosen = actions[chosen_index]
         score = (best_spent, -plan_count, plan_max)
         self._debug(
             f"Mana plan: total_mana={total_mana}, spent={best_spent}, "
-            f"count={plan_count}, max_cmc={plan_max}, chosen={chosen[2]}"
+            f"count={plan_count}, max_cmc={plan_max}, payoffs={plan_payoffs}, "
+            f"chosen={chosen[2]}"
         )
         return chosen, score
 
@@ -891,6 +907,12 @@ class DummyAI(AIKernel):
                                     f"Fight {card_name} pairing our={_fight[0]} enemy={_fight[1]} (profile={fight_profile})."
                                 )
                             type_priority = self._card_type_priority(card_types)
+                            # "Whenever you gain life, put a +1/+1 counter on this
+                            # creature" -- the deck's engine. Every turn one of these
+                            # is not on the board is lifegain triggers (and counters)
+                            # lost for good, so it gets deployed ahead of other
+                            # creatures in the same mana plan.
+                            lifegain_payoff = LifegainLogic.is_lifegain_payoff(grp_id)
                             cast_actions.append(
                                 (
                                     paid_cost,
@@ -903,10 +925,11 @@ class DummyAI(AIKernel):
                                     nominal_cmc,
                                     is_discounted,
                                     priority_removal,
+                                    lifegain_payoff,
                                 )
                             )
                             self._debug(
-                                f"Can cast: {card_name} (cost={mana_cost_str}, paid={paid_cost}, cmc={nominal_cmc}, discounted={is_discounted}, convoke={uses_convoke})"
+                                f"Can cast: {card_name} (cost={mana_cost_str}, paid={paid_cost}, cmc={nominal_cmc}, discounted={is_discounted}, convoke={uses_convoke}, lifegain_payoff={lifegain_payoff})"
                             )
                             if is_sorcery:
                                 sorcery_found += 1
@@ -963,7 +986,7 @@ class DummyAI(AIKernel):
                                 chosen_score = convoke_score
 
                         if chosen:
-                            paid_cost, instance_id, card_name, mana_cost, _action_mana_cost, _uses_convoke, _type_priority, nominal_cmc, _is_discounted, _priority_removal = chosen
+                            paid_cost, instance_id, card_name, mana_cost, _action_mana_cost, _uses_convoke, _type_priority, nominal_cmc, _is_discounted, _priority_removal, _lifegain_payoff = chosen
                             self._debug(
                                 f"CASTING: {card_name} (instanceId={instance_id}, cost={mana_cost}, paid={paid_cost}, cmc={nominal_cmc})"
                             )
