@@ -65,6 +65,10 @@ def reset_status(*, log_path: str | None = None) -> dict[str, Any]:
         "gold_farmed": {},
         # Map screenName -> configured alias, filled in as accounts are switched.
         "account_aliases": {},
+        # Friendly alias of the account playing right now, and the one we would
+        # switch INTO next when the switch criteria are met (both "" until known).
+        "current_account": "",
+        "next_account": "",
     }
     return _write_payload(payload)
 

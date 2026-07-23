@@ -28,6 +28,10 @@ class Game:
         self.game_started = False
         self.starting_hand_logged = False
         self._stop_requested = False
+        # Guards against a match-end being signalled more than once: without it,
+        # each duplicate schedules another restart timer, spawning parallel
+        # queue/switch loops that race and break account rotation + switch criteria.
+        self._match_end_handled = False
         self._timers: list[threading.Timer] = []
         self._last_action_delay_turn = -1
         # Tracks (turn, phase, step, decisionPlayer, move_name, move_payload) of
@@ -52,6 +56,7 @@ class Game:
     def start(self):
         self._debug("Game.start() called")
         self._stop_requested = False
+        self._match_end_handled = False
         try:
             debug_recorder.start_session()
         except Exception as e:
@@ -94,6 +99,15 @@ class Game:
 
     def on_match_end(self, won: bool | None = None):
         """Called when a match ends - wait 20 seconds then start a new game"""
+        # Idempotency: the match-end can be signalled more than once for the same
+        # match. Handle only the first; duplicates must NOT re-record the match or
+        # schedule a second restart (which would spawn a parallel queue/switch loop
+        # -- the cause of broken rotation and duplicated switch attempts). Reset in
+        # _restart_game so the next match is handled normally.
+        if self._match_end_handled:
+            self._debug("Duplicate match-end signal ignored.")
+            return
+        self._match_end_handled = True
         # Finalize the debug recording first, independently of the restart
         # logic below -- otherwise stopping the bot at match end (a common case)
         # would skip the match.json footer and leave the last match unfinalized.
@@ -139,6 +153,9 @@ class Game:
             return
         runtime_status.set_mode("restarting")
         self._debug("Restarting game...")
+
+        # Re-arm the match-end handler for the next match.
+        self._match_end_handled = False
 
         # Reset Game state
         self.last_logged_turn = -1
